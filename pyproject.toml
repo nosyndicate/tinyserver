@@ -1,0 +1,16 @@
+[project]
+name = "inference-server"
+version = "0.0.1"
+requires-python = ">=3.11"
+dependencies = [
+  "requests>=2.31",
+  "fastapi>=0.110",
+  "uvicorn>=0.27",
+  "pydantic>=2.0",
+  "torch",
+  "transformers>=4.40",
+  "accelerate",  # optional but helpful
+]
+
+[tool.uvicorn]
+factory = false
