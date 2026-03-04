@@ -12,7 +12,7 @@ def health():
 
 
 @router.post("/generate", response_model=GenerateResponse)
-def generate(req: GenerateRequest) -> GenerateResponse:
+def generate(_req: GenerateRequest) -> GenerateResponse:
     """Generate text based on the input prompt."""
 
     log_event(
