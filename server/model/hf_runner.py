@@ -30,9 +30,10 @@ class ModelRunner:
             config.model_name_or_path,
             torch_dtype=config.dtype,
             device_map="auto" if config.device == "cuda" else None,
-        ).to(
-            config.device  # type: ignore[arg-type]
         )
+
+        if config.device == "cuda":
+            self.model = self.model.to(config.device)  # type: ignore[arg-type]
 
         self.model.eval()  # Set the model to evaluation mode
         log_event("model_init_done", model=config.model_name_or_path)
@@ -66,10 +67,11 @@ class ModelRunner:
             pad_token_id=self.tokenizer.pad_token_id,
         )
 
-        full_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        out_text = full_text
+        generated_ids = outputs[0][prompt_tokens:]
+        generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        out_text = generated_text
         if sampling_params.stops:
-            out_text = _apply_stop_strings(full_text, sampling_params.stops)  # type: ignore[arg-type]
+            out_text = _apply_stop_strings(generated_text, sampling_params.stops)  # type: ignore[arg-type]
 
         output_tokens = int(outputs.shape[1]) - prompt_tokens
         return out_text, prompt_tokens, output_tokens  # type: ignore[return-value]
