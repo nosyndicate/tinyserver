@@ -1,6 +1,11 @@
 import time
 from contextlib import contextmanager
-from typing import Any, Generator
+from typing import Generator, TypedDict
+
+
+class TimerDict(TypedDict):
+    start_ns: int
+    end_ns: int | None
 
 
 def now_ns() -> int:
@@ -12,14 +17,14 @@ def ns_to_ms(ns: int) -> float:
 
 
 @contextmanager
-def timed() -> Generator[dict[str, Any], None, None]:
+def timed() -> Generator[TimerDict, None, None]:
     """
     Context manager to measure elapsed time.
 
     Returns:
         dict with 'start_ns' and 'end_ns' filled after exit.
     """
-    t = {"start_ns": now_ns(), "end_ns": None}
+    t: TimerDict = {"start_ns": now_ns(), "end_ns": None}
     try:
         yield t
     finally:
