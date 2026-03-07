@@ -1,7 +1,8 @@
 from dataclasses import dataclass
+from typing import Generator
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
 from server.metrics.logging import log_event
 from server.model.sampling import SamplingParams
@@ -75,6 +76,133 @@ class ModelRunner:
 
         output_tokens = int(outputs.shape[1]) - prompt_tokens
         return out_text, prompt_tokens, output_tokens  # type: ignore[return-value]
+
+    @torch.inference_mode()
+    def generate_text_two_stage(
+        self, prompt: str, sampling_params: SamplingParams
+    ) -> tuple[str, int, int]:
+        """Generate text using a two-stage approach with prefill and decode loop."""
+        if sampling_params.seed is not None:
+            torch.manual_seed(sampling_params.seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(sampling_params.seed)
+
+        all_logits, past_key_values, prompt_tokens = self.prefill(prompt)
+
+        token_counter = 0
+        tokens = []
+        for next_token, _, is_done in self.decode_loop(
+            all_logits, past_key_values, sampling_params
+        ):
+            if next_token:
+                tokens.append(next_token)
+                token_counter += 1
+
+            if is_done:
+                break
+
+        out_text = "".join(tokens)
+        return out_text, prompt_tokens, token_counter
+
+    def prefill(self, prompt: str) -> tuple[torch.Tensor, DynamicCache, int]:
+        """Run the model on the prompt to get initial logits and past_key_values for decoding.
+
+        This method processes the input prompt by applying the chat template and tokenizing it,
+        then runs a forward pass through the model to obtain the initial logits and past_key_values
+        needed for the decoding loop.
+
+        Args:
+            prompt: The input prompt string.
+
+        Returns:
+            all_logits: Tensor of shape [1, prompt_len, vocab_size] containing the logits from the model for the input prompt.
+            past_key_values: The past key values returned by the model, used for efficient decoding.
+            prompt_tokens: The number of tokens in the input prompt after tokenization.
+        """
+        message = [{"role": "user", "content": prompt}]
+        formatted = self.tokenizer.apply_chat_template(
+            message, tokenize=False, add_generation_prompt=True, enable_thinking=False
+        )
+        inputs = self.tokenizer([formatted], return_tensors="pt").to(self.config.device)
+        outputs = self.model(**inputs, use_cache=True)
+
+        past_key_values: DynamicCache = outputs.past_key_values
+        all_logits: torch.Tensor = outputs.logits  # shape [1, prompt_len, vocab_size]
+        prompt_tokens = int(inputs["input_ids"].shape[1])
+        return all_logits, past_key_values, prompt_tokens
+
+    def sample_token(
+        self, logits: torch.Tensor, sampling_params: SamplingParams
+    ) -> int:
+        """Sample a token ID from the logits using the provided sampling parameters.
+
+        Args:
+            logits: Tensor of shape [1, vocab_size] containing the logits for the next token
+            sampling_params: SamplingParams object containing temperature, top_p, etc.
+
+        Returns:
+            The sampled token ID as an integer.
+        """
+        # For simplicity, this placeholder implementation just returns the argmax token ID.
+        next_token_id = logits.argmax(dim=-1)
+
+        # TODO implement sampling logic here, including temperature scaling, top-p filtering, and multinomial sampling.
+        return next_token_id.item()  # type: ignore[return-value]
+
+    def decode_loop(
+        self,
+        all_logits: torch.Tensor,
+        past_key_values: DynamicCache,
+        sampling_params: SamplingParams,
+    ) -> Generator[tuple[str, bool, bool], None, None]:
+        token_counter = 0
+        token_buffer = ""
+
+        last_logits = all_logits[:, -1, :]  # shape [1, vocab_size]
+
+        for _ in range(sampling_params.max_new_tokens):
+            # 1. sample the next token ID from the logits
+            next_token_id = self.sample_token(last_logits, sampling_params)
+
+            # 2. if the next token is EOS, we stop generation
+            if next_token_id == self.tokenizer.eos_token_id:
+                yield "", token_counter == 0, True
+                return
+
+            # 3. decode the next token and add it to the buffer
+            next_token = self.tokenizer.decode(
+                [next_token_id], skip_special_tokens=True
+            )
+            token_buffer += next_token
+
+            # 4. if the next token id is in the stop strings, we stop generation
+            if sampling_params.stops and any(
+                stop in token_buffer for stop in sampling_params.stops
+            ):
+                yield next_token, token_counter == 0, True
+                return
+
+            # 5. if we don't stop then we yield the current buffer and continue
+            is_last = token_counter == sampling_params.max_new_tokens - 1
+            yield next_token, token_counter == 0, is_last  # type: ignore[misc]
+
+            if is_last:
+                return
+
+            next_input_ids = torch.tensor(
+                [[next_token_id]], device=self.model.device
+            )  # shape [1, 1]
+            output = self.model(
+                input_ids=next_input_ids,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            last_logits = output.logits[:, -1, :]  # shape [1, vocab_size]
+            past_key_values = output.past_key_values
+            token_counter += 1
+
+        # max tokens reached, we stop generation
+        yield "", token_counter == 0, True
 
 
 def _apply_stop_strings(text: str, stop_strings: list[str]) -> str:
