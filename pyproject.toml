@@ -12,5 +12,14 @@ dependencies = [
   "accelerate",  # optional but helpful
 ]
 
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
 [tool.uvicorn]
 factory = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
