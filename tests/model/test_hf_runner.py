@@ -16,9 +16,15 @@ class FakeTokenizer:
     eos_token_id = 0
     pad_token_id = 0
 
-    def __init__(self, input_ids: list[int], decode_map: dict[int, str]):
+    def __init__(
+        self,
+        input_ids: list[int],
+        decode_map: dict[int, str],
+        text_token_ids: dict[str, list[int]] | None = None,
+    ):
         self._input_ids = input_ids
         self._decode_map = decode_map
+        self._text_token_ids = text_token_ids or {}
 
     def apply_chat_template(
         self,
@@ -32,9 +38,16 @@ class FakeTokenizer:
         assert enable_thinking is False
         return "formatted-prompt"
 
-    def __call__(self, _texts, return_tensors: str) -> FakeBatch:
+    def __call__(
+        self, texts, return_tensors: str, add_special_tokens: bool | None = None
+    ) -> FakeBatch:
         assert return_tensors == "pt"
-        return FakeBatch({"input_ids": torch.tensor([self._input_ids], dtype=torch.long)})
+        text = texts[0]
+        if add_special_tokens is False:
+            token_ids = self._text_token_ids.get(text, [])
+        else:
+            token_ids = self._input_ids
+        return FakeBatch({"input_ids": torch.tensor([token_ids], dtype=torch.long)})
 
     def decode(self, token_ids, skip_special_tokens: bool = True) -> str:
         assert skip_special_tokens is True
@@ -101,11 +114,16 @@ def build_runner(
     sequence: list[int],
     decode_map: dict[int, str] | None = None,
     input_ids: list[int] | None = None,
+    text_token_ids: dict[str, list[int]] | None = None,
 ) -> ModelRunner:
     decode_map = decode_map or {}
     input_ids = input_ids or [11, 12, 13]
 
-    fake_tokenizer = FakeTokenizer(input_ids=input_ids, decode_map=decode_map)
+    fake_tokenizer = FakeTokenizer(
+        input_ids=input_ids,
+        decode_map=decode_map,
+        text_token_ids=text_token_ids,
+    )
     fake_model = FakeModel(sequence=sequence)
 
     monkeypatch.setattr(
@@ -150,7 +168,12 @@ def test_decode_loop_stops_immediately_on_eos(monkeypatch: pytest.MonkeyPatch):
 def test_generate_text_two_stage_concatenates_and_counts_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    runner = build_runner(monkeypatch, sequence=[1, 2, 0], decode_map={1: "A", 2: "B"})
+    runner = build_runner(
+        monkeypatch,
+        sequence=[1, 2, 0],
+        decode_map={1: "A", 2: "B"},
+        text_token_ids={"AB": [1, 2]},
+    )
 
     out_text, prompt_tokens, output_tokens = runner.generate_text_two_stage(
         "hello",
@@ -184,6 +207,7 @@ def test_generate_text_two_stage_stops_early_on_stop_string(
         monkeypatch,
         sequence=[1, 2, 3, 0],
         decode_map={1: "Hi", 2: "<END>", 3: "after"},
+        text_token_ids={"Hi": [1]},
     )
 
     out_text, _prompt_tokens, output_tokens = runner.generate_text_two_stage(
@@ -191,14 +215,10 @@ def test_generate_text_two_stage_stops_early_on_stop_string(
         SamplingParams(max_new_tokens=10, temperature=0.0, top_p=1.0, stops=["<END>"]),
     )
 
-    assert out_text == "Hi<END>"
-    assert output_tokens == 2
+    assert out_text == "Hi"
+    assert output_tokens == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="two-stage path currently emits the stop token instead of trimming to pre-stop text",
-)
 def test_generate_text_two_stage_trims_stop_string_from_output(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -206,6 +226,7 @@ def test_generate_text_two_stage_trims_stop_string_from_output(
         monkeypatch,
         sequence=[1, 2, 0],
         decode_map={1: "Hello", 2: "<END>"},
+        text_token_ids={"Hello": [1]},
     )
 
     out_text, _prompt_tokens, _output_tokens = runner.generate_text_two_stage(

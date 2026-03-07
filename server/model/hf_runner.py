@@ -96,14 +96,21 @@ class ModelRunner:
         ):
             if next_token:
                 tokens.append(next_token)
-                token_counter += 1
 
             if is_done:
                 break
 
         out_text = "".join(tokens)
+        if sampling_params.stops:
+            out_text = _apply_stop_strings(out_text, sampling_params.stops)  # type: ignore[arg-type]
+
+        out_ids = self.tokenizer(
+            [out_text], return_tensors="pt", add_special_tokens=False
+        )["input_ids"]
+        token_counter = int(out_ids.shape[1])
         return out_text, prompt_tokens, token_counter
 
+    @torch.inference_mode()
     def prefill(self, prompt: str) -> tuple[torch.Tensor, DynamicCache, int]:
         """Run the model on the prompt to get initial logits and past_key_values for decoding.
 
