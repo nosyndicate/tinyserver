@@ -178,7 +178,7 @@ class ModelRunner:
                 yield "", token_counter == 0, True
                 return
 
-            # 3. decode the next token and add it to the buffer
+            # 3. decode the next token ID to text
             next_token = self.tokenizer.decode(
                 [next_token_id], skip_special_tokens=True
             )
