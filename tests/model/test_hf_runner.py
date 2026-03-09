@@ -236,3 +236,22 @@ def test_generate_text_two_stage_trims_stop_string_from_output(
 
     # Match generate_text contract: stop strings should not appear in returned output.
     assert out_text == "Hello"
+
+
+def test_generate_text_two_stage_detects_cross_token_stop_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runner = build_runner(
+        monkeypatch,
+        sequence=[1, 2, 3, 0],
+        decode_map={1: "ab", 2: "c", 3: "after"},
+        text_token_ids={"a": [1]},
+    )
+
+    out_text, _prompt_tokens, output_tokens = runner.generate_text_two_stage(
+        "hello",
+        SamplingParams(max_new_tokens=10, temperature=0.0, top_p=1.0, stops=["bc"]),
+    )
+
+    assert out_text == "a"
+    assert output_tokens == 1

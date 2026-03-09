@@ -163,7 +163,9 @@ class ModelRunner:
         sampling_params: SamplingParams,
     ) -> Generator[tuple[str, bool, bool], None, None]:
         token_counter = 0
-        token_buffer = ""
+        stops = sampling_params.stops or []
+        max_stop_len = max((len(stop) for stop in stops), default=0)
+        tail = ""
 
         last_logits = all_logits[:, -1, :]  # shape [1, vocab_size]
 
@@ -176,20 +178,24 @@ class ModelRunner:
                 yield "", token_counter == 0, True
                 return
 
-            # 3. decode the next token and add it to the buffer
+            # 3. decode the next token ID to text
             next_token = self.tokenizer.decode(
                 [next_token_id], skip_special_tokens=True
             )
-            token_buffer += next_token
 
-            # 4. if the next token id is in the stop strings, we stop generation
-            if sampling_params.stops and any(
-                stop in token_buffer for stop in sampling_params.stops
-            ):
-                yield next_token, token_counter == 0, True
-                return
+            # 4. stop detection only needs the previous suffix + current token.
+            if stops:
+                candidate = tail + next_token
+                if any(stop in candidate for stop in stops):
+                    yield next_token, token_counter == 0, True
+                    return
 
-            # 5. if we don't stop then we yield the current buffer and continue
+                if max_stop_len > 1:
+                    tail = candidate[-(max_stop_len - 1) :]
+                else:
+                    tail = ""
+
+            # 5. if we don't stop then we yield the next token and continue
             is_last = token_counter == sampling_params.max_new_tokens - 1
             yield next_token, token_counter == 0, is_last  # type: ignore[misc]
 
