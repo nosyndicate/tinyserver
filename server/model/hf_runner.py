@@ -162,6 +162,24 @@ class ModelRunner:
         past_key_values: DynamicCache,
         sampling_params: SamplingParams,
     ) -> Generator[tuple[str, bool, bool], None, None]:
+        """
+        A generator that yields the next token, whether it's the first token, and whether generation is done.
+
+        Args:
+            all_logits: Tensor of shape [1, seq_len, vocab_size] containing the logits for the current sequence.
+            past_key_values: The past key values from the model, used for efficient decoding.
+            sampling_params: SamplingParams object containing the parameters for sampling.
+
+        Yields:
+            A tuple of (next_token: str, is_first_token: bool, is_done: bool) where:
+                - next_token is the decoded text of the next token ID. (Maybe empty string if the token
+                  is a special token or if generation is done.)
+                - is_first_token indicates if this is the first generated token (after the prompt).
+                - is_done indicates if generation should stop (either due to EOS token, stop strings, or max tokens reached).
+
+        Returns:
+            None
+        """
         token_counter = 0
         stops = sampling_params.stops or []
         max_stop_len = max((len(stop) for stop in stops), default=0)
