@@ -195,7 +195,7 @@ class ModelRunner:
                 else:
                     tail = ""
 
-            # 5. if we don't stop then we yield the current buffer and continue
+            # 5. if we don't stop then we yield the next token and continue
             is_last = token_counter == sampling_params.max_new_tokens - 1
             yield next_token, token_counter == 0, is_last  # type: ignore[misc]
 
