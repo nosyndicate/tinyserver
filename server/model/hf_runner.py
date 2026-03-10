@@ -86,7 +86,13 @@ class ModelRunner:
         self, prompt: str, sampling_params: SamplingParams
     ) -> tuple[str, int, int]:
         """Generate text using a two-stage approach with prefill and decode loop."""
-        generator = make_generator(sampling_params.seed, self.config.device)
+        if (
+            sampling_params.temperature is not None
+            and sampling_params.temperature > LOWEST_TEMPERATURE
+        ):
+            generator = make_generator(sampling_params.seed, self.config.device)
+        else:
+            generator = None
 
         all_logits, past_key_values, prompt_tokens = self.prefill(prompt)
 
