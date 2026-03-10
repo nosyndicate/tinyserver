@@ -1,9 +1,8 @@
 from dataclasses import dataclass
 
-import pytest
 import torch
 
-from server.model.hf_runner import ModelConfig, ModelRunner
+from server.model.hf_runner import ModelRunner
 from server.model.sampling import SamplingParams
 
 
@@ -109,7 +108,6 @@ class FakeModel:
 
 
 def build_runner(
-    monkeypatch: pytest.MonkeyPatch,
     *,
     sequence: list[int],
     decode_map: dict[int, str] | None = None,
@@ -126,22 +124,11 @@ def build_runner(
     )
     fake_model = FakeModel(sequence=sequence)
 
-    monkeypatch.setattr(
-        "server.model.hf_runner.AutoTokenizer.from_pretrained",
-        lambda _name: fake_tokenizer,
-    )
-    monkeypatch.setattr(
-        "server.model.hf_runner.AutoModelForCausalLM.from_pretrained",
-        lambda _name, torch_dtype, device_map: fake_model,
-    )
-
-    return ModelRunner(
-        ModelConfig(model_name_or_path="fake/model", device="cpu", dtype=torch.float32)
-    )
+    return ModelRunner(model=fake_model, tokenizer=fake_tokenizer, device="cpu")
 
 
-def test_prefill_returns_logits_cache_and_prompt_tokens(monkeypatch: pytest.MonkeyPatch):
-    runner = build_runner(monkeypatch, sequence=[1, 2, 0], decode_map={1: "A", 2: "B"})
+def test_prefill_returns_logits_cache_and_prompt_tokens():
+    runner = build_runner(sequence=[1, 2, 0], decode_map={1: "A", 2: "B"})
 
     all_logits, past_key_values, prompt_tokens = runner.prefill("hello")
 
@@ -150,8 +137,8 @@ def test_prefill_returns_logits_cache_and_prompt_tokens(monkeypatch: pytest.Monk
     assert prompt_tokens == 3
 
 
-def test_decode_loop_stops_immediately_on_eos(monkeypatch: pytest.MonkeyPatch):
-    runner = build_runner(monkeypatch, sequence=[0])
+def test_decode_loop_stops_immediately_on_eos():
+    runner = build_runner(sequence=[0])
     all_logits, past_key_values, _ = runner.prefill("hello")
 
     chunks = list(
@@ -165,11 +152,8 @@ def test_decode_loop_stops_immediately_on_eos(monkeypatch: pytest.MonkeyPatch):
     assert chunks == [("", True, True)]
 
 
-def test_generate_text_two_stage_concatenates_and_counts_tokens(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_generate_text_two_stage_concatenates_and_counts_tokens():
     runner = build_runner(
-        monkeypatch,
         sequence=[1, 2, 0],
         decode_map={1: "A", 2: "B"},
         text_token_ids={"AB": [1, 2]},
@@ -185,10 +169,8 @@ def test_generate_text_two_stage_concatenates_and_counts_tokens(
     assert output_tokens == 2
 
 
-def test_generate_text_two_stage_handles_max_new_tokens_zero(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    runner = build_runner(monkeypatch, sequence=[1, 2, 0], decode_map={1: "A", 2: "B"})
+def test_generate_text_two_stage_handles_max_new_tokens_zero():
+    runner = build_runner(sequence=[1, 2, 0], decode_map={1: "A", 2: "B"})
 
     out_text, prompt_tokens, output_tokens = runner.generate_text_two_stage(
         "hello",
@@ -200,11 +182,8 @@ def test_generate_text_two_stage_handles_max_new_tokens_zero(
     assert output_tokens == 0
 
 
-def test_generate_text_two_stage_stops_early_on_stop_string(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_generate_text_two_stage_stops_early_on_stop_string():
     runner = build_runner(
-        monkeypatch,
         sequence=[1, 2, 3, 0],
         decode_map={1: "Hi", 2: "<END>", 3: "after"},
         text_token_ids={"Hi": [1]},
@@ -219,11 +198,8 @@ def test_generate_text_two_stage_stops_early_on_stop_string(
     assert output_tokens == 1
 
 
-def test_generate_text_two_stage_trims_stop_string_from_output(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_generate_text_two_stage_trims_stop_string_from_output():
     runner = build_runner(
-        monkeypatch,
         sequence=[1, 2, 0],
         decode_map={1: "Hello", 2: "<END>"},
         text_token_ids={"Hello": [1]},
@@ -238,11 +214,8 @@ def test_generate_text_two_stage_trims_stop_string_from_output(
     assert out_text == "Hello"
 
 
-def test_generate_text_two_stage_detects_cross_token_stop_boundary(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_generate_text_two_stage_detects_cross_token_stop_boundary():
     runner = build_runner(
-        monkeypatch,
         sequence=[1, 2, 3, 0],
         decode_map={1: "ab", 2: "c", 3: "after"},
         text_token_ids={"a": [1]},
