@@ -20,7 +20,7 @@ class FakeTokenizer:
         input_ids: list[int],
         decode_map: dict[int, str],
         text_token_ids: dict[str, list[int]] | None = None,
-    ):
+    ) -> None:
         self._input_ids = input_ids
         self._decode_map = decode_map
         self._text_token_ids = text_token_ids or {}
@@ -64,7 +64,7 @@ class FakeOutput:
 
 
 class FakeModel:
-    def __init__(self, sequence: list[int], vocab_size: int = 128):
+    def __init__(self, sequence: list[int], vocab_size: int = 128) -> None:
         self.sequence = sequence
         self.vocab_size = vocab_size
         self.decode_index = 0
@@ -81,7 +81,9 @@ class FakeModel:
         logits[:, -1, token_id] = 1e9
         return logits
 
-    def __call__(self, input_ids: torch.Tensor, use_cache: bool, past_key_values=None):
+    def __call__(
+        self, input_ids: torch.Tensor, use_cache: bool, past_key_values=None
+    ) -> FakeOutput:
         assert use_cache is True
         seq_len = int(input_ids.shape[1])
 
@@ -127,7 +129,7 @@ def build_runner(
     return ModelRunner(model=fake_model, tokenizer=fake_tokenizer, device="cpu")
 
 
-def test_prefill_returns_logits_cache_and_prompt_tokens():
+def test_prefill_returns_logits_cache_and_prompt_tokens() -> None:
     runner = build_runner(sequence=[1, 2, 0], decode_map={1: "A", 2: "B"})
 
     all_logits, past_key_values, prompt_tokens = runner.prefill("hello")
@@ -137,7 +139,7 @@ def test_prefill_returns_logits_cache_and_prompt_tokens():
     assert prompt_tokens == 3
 
 
-def test_decode_loop_stops_immediately_on_eos():
+def test_decode_loop_stops_immediately_on_eos() -> None:
     runner = build_runner(sequence=[0])
     all_logits, past_key_values, _ = runner.prefill("hello")
 
@@ -152,7 +154,7 @@ def test_decode_loop_stops_immediately_on_eos():
     assert chunks == [("", True, True)]
 
 
-def test_generate_text_two_stage_concatenates_and_counts_tokens():
+def test_generate_text_two_stage_concatenates_and_counts_tokens() -> None:
     runner = build_runner(
         sequence=[1, 2, 0],
         decode_map={1: "A", 2: "B"},
@@ -169,7 +171,7 @@ def test_generate_text_two_stage_concatenates_and_counts_tokens():
     assert output_tokens == 2
 
 
-def test_generate_text_two_stage_handles_max_new_tokens_zero():
+def test_generate_text_two_stage_handles_max_new_tokens_zero() -> None:
     runner = build_runner(sequence=[1, 2, 0], decode_map={1: "A", 2: "B"})
 
     out_text, prompt_tokens, output_tokens = runner.generate_text_two_stage(
@@ -182,7 +184,7 @@ def test_generate_text_two_stage_handles_max_new_tokens_zero():
     assert output_tokens == 0
 
 
-def test_generate_text_two_stage_stops_early_on_stop_string():
+def test_generate_text_two_stage_stops_early_on_stop_string() -> None:
     runner = build_runner(
         sequence=[1, 2, 3, 0],
         decode_map={1: "Hi", 2: "<END>", 3: "after"},
@@ -198,7 +200,7 @@ def test_generate_text_two_stage_stops_early_on_stop_string():
     assert output_tokens == 1
 
 
-def test_generate_text_two_stage_trims_stop_string_from_output():
+def test_generate_text_two_stage_trims_stop_string_from_output() -> None:
     runner = build_runner(
         sequence=[1, 2, 0],
         decode_map={1: "Hello", 2: "<END>"},
@@ -214,7 +216,7 @@ def test_generate_text_two_stage_trims_stop_string_from_output():
     assert out_text == "Hello"
 
 
-def test_generate_text_two_stage_detects_cross_token_stop_boundary():
+def test_generate_text_two_stage_detects_cross_token_stop_boundary() -> None:
     runner = build_runner(
         sequence=[1, 2, 3, 0],
         decode_map={1: "ab", 2: "c", 3: "after"},

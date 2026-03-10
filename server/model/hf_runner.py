@@ -2,7 +2,13 @@ from dataclasses import dataclass
 from typing import Generator
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    DynamicCache,
+    PreTrainedModel,
+    PreTrainedTokenizerFast,
+)
 
 from server.metrics.logging import log_event
 from server.model.determinism import make_generator
@@ -21,7 +27,9 @@ LOWEST_TEMPERATURE = 1e-5
 
 class ModelRunner:
 
-    def __init__(self, model, tokenizer, device: str):
+    def __init__(
+        self, model: PreTrainedModel, tokenizer: PreTrainedTokenizerFast, device: str
+    ) -> None:
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -284,8 +292,10 @@ def load_hf_model(config: ModelConfig) -> ModelRunner:
         dtype=str(config.dtype),
     )
 
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name_or_path)
-    model = AutoModelForCausalLM.from_pretrained(
+    tokenizer: PreTrainedTokenizerFast = AutoTokenizer.from_pretrained(
+        config.model_name_or_path, use_fast=True
+    )
+    model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
         config.model_name_or_path,
         torch_dtype=config.dtype,
         device_map="auto" if config.device == "cuda" else None,
