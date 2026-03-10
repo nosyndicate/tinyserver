@@ -5,6 +5,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
 from server.metrics.logging import log_event
+from server.model.determinism import make_generator
 from server.model.sampling import SamplingParams
 
 
@@ -85,17 +86,20 @@ class ModelRunner:
         self, prompt: str, sampling_params: SamplingParams
     ) -> tuple[str, int, int]:
         """Generate text using a two-stage approach with prefill and decode loop."""
-        if sampling_params.seed is not None:
-            torch.manual_seed(sampling_params.seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(sampling_params.seed)
+        if (
+            sampling_params.temperature is not None
+            and sampling_params.temperature > LOWEST_TEMPERATURE
+        ):
+            generator = make_generator(sampling_params.seed, self.config.device)
+        else:
+            generator = None
 
         all_logits, past_key_values, prompt_tokens = self.prefill(prompt)
 
         token_counter = 0
         tokens = []
         for next_token, _, is_done in self.decode_loop(
-            all_logits, past_key_values, sampling_params
+            all_logits, past_key_values, sampling_params, generator=generator
         ):
             if next_token:
                 tokens.append(next_token)
@@ -142,13 +146,17 @@ class ModelRunner:
         return all_logits, past_key_values, prompt_tokens
 
     def sample_token(
-        self, logits: torch.Tensor, sampling_params: SamplingParams
+        self,
+        logits: torch.Tensor,
+        sampling_params: SamplingParams,
+        generator: torch.Generator | None = None,
     ) -> int:
         """Sample a token ID from the logits using the provided sampling parameters.
 
         Args:
             logits: Tensor of shape [1, vocab_size] containing the logits for the next token
             sampling_params: SamplingParams object containing temperature, top_p, etc.
+            generator: Optional torch.Generator for reproducible sampling. If None, sampling will be non-deterministic.
 
         Returns:
             The sampled token ID as an integer.
@@ -197,7 +205,7 @@ class ModelRunner:
             scaled_logits = scaled_logits.masked_fill(remove_mask, float("-inf"))
 
         probs = torch.softmax(scaled_logits, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1)
+        next_token = torch.multinomial(probs, num_samples=1, generator=generator)
         return int(next_token.item())
 
     def decode_loop(
@@ -205,6 +213,7 @@ class ModelRunner:
         all_logits: torch.Tensor,
         past_key_values: DynamicCache,
         sampling_params: SamplingParams,
+        generator: torch.Generator | None = None,
     ) -> Generator[tuple[str, bool, bool], None, None]:
         """
         A generator that yields the next token, whether it's the first token, and whether generation is done.
@@ -213,6 +222,7 @@ class ModelRunner:
             all_logits: Tensor of shape [1, seq_len, vocab_size] containing the logits for the current sequence.
             past_key_values: The past key values from the model, used for efficient decoding.
             sampling_params: SamplingParams object containing the parameters for sampling.
+            generator: Optional torch.Generator for reproducible sampling. If None, sampling will be non-deterministic.
 
         Yields:
             A tuple of (next_token: str, is_first_token: bool, is_done: bool) where:
@@ -233,7 +243,9 @@ class ModelRunner:
 
         for _ in range(sampling_params.max_new_tokens):
             # 1. sample the next token ID from the logits
-            next_token_id = self.sample_token(last_logits, sampling_params)
+            next_token_id = self.sample_token(
+                last_logits, sampling_params, generator=generator
+            )
 
             # 2. if the next token is EOS, we stop generation
             if next_token_id == self.tokenizer.eos_token_id:
