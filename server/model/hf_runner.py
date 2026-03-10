@@ -2,7 +2,13 @@ from dataclasses import dataclass
 from typing import Generator
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    DynamicCache,
+    PreTrainedModel,
+    PreTrainedTokenizerFast,
+)
 
 from server.metrics.logging import log_event
 from server.model.determinism import make_generator
@@ -21,27 +27,12 @@ LOWEST_TEMPERATURE = 1e-5
 
 class ModelRunner:
 
-    def __init__(self, config: ModelConfig):
-        self.config = config
-        log_event(
-            "model_init_start",
-            model=config.model_name_or_path,
-            device=config.device,
-            dtype=str(config.dtype),
-        )
-
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model_name_or_path)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            config.model_name_or_path,
-            torch_dtype=config.dtype,
-            device_map="auto" if config.device == "cuda" else None,
-        )
-
-        if config.device == "cuda":
-            self.model = self.model.to(config.device)  # type: ignore[arg-type]
-
-        self.model.eval()  # Set the model to evaluation mode
-        log_event("model_init_done", model=config.model_name_or_path)
+    def __init__(
+        self, model: PreTrainedModel, tokenizer: PreTrainedTokenizerFast, device: str
+    ) -> None:
+        self.model = model
+        self.tokenizer = tokenizer
+        self.device = device
 
     @torch.inference_mode()
     def generate_text(
@@ -58,7 +49,7 @@ class ModelRunner:
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
         )
 
-        inputs = self.tokenizer([text], return_tensors="pt").to(self.config.device)
+        inputs = self.tokenizer([text], return_tensors="pt").to(self.device)
         prompt_tokens = int(inputs["input_ids"].shape[1])
 
         do_sample = sampling_params.temperature > 0
@@ -90,7 +81,7 @@ class ModelRunner:
             sampling_params.temperature is not None
             and sampling_params.temperature > LOWEST_TEMPERATURE
         ):
-            generator = make_generator(sampling_params.seed, self.config.device)
+            generator = make_generator(sampling_params.seed, self.device)
         else:
             generator = None
 
@@ -137,7 +128,7 @@ class ModelRunner:
         formatted = self.tokenizer.apply_chat_template(
             message, tokenize=False, add_generation_prompt=True, enable_thinking=False
         )
-        inputs = self.tokenizer([formatted], return_tensors="pt").to(self.config.device)
+        inputs = self.tokenizer([formatted], return_tensors="pt").to(self.device)
         outputs = self.model(**inputs, use_cache=True)
 
         past_key_values: DynamicCache = outputs.past_key_values
@@ -290,6 +281,29 @@ class ModelRunner:
 
         # max tokens reached, we stop generation
         yield "", token_counter == 0, True
+
+
+def load_hf_model(config: ModelConfig) -> ModelRunner:
+    """Load HF model/tokenizer and return a ready ModelRunner."""
+    log_event(
+        "model_init_start",
+        model=config.model_name_or_path,
+        device=config.device,
+        dtype=str(config.dtype),
+    )
+
+    tokenizer: PreTrainedTokenizerFast = AutoTokenizer.from_pretrained(
+        config.model_name_or_path, use_fast=True
+    )
+    model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
+        config.model_name_or_path,
+        torch_dtype=config.dtype,
+        device_map="auto" if config.device == "cuda" else None,
+    )
+
+    model.eval()
+    log_event("model_init_done", model=config.model_name_or_path)
+    return ModelRunner(model=model, tokenizer=tokenizer, device=config.device)
 
 
 def _apply_stop_strings(text: str, stop_strings: list[str]) -> str:

@@ -3,12 +3,12 @@ from fastapi import APIRouter
 from server.api.schema import GenerateRequest, GenerateResponse
 from server.metrics.logging import log_event
 from server.metrics.timers import ns_to_ms, timed
-from server.model.hf_runner import ModelConfig, ModelRunner
+from server.model.hf_runner import ModelConfig, load_hf_model
 from server.model.sampling import build_sampling_params
 
 router = APIRouter()
 
-_runner = ModelRunner(ModelConfig())
+_runner = load_hf_model(ModelConfig())
 
 
 @router.get("/health")
