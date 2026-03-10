@@ -150,6 +150,7 @@ class ModelRunner:
         Args:
             logits: Tensor of shape [1, vocab_size] containing the logits for the next token
             sampling_params: SamplingParams object containing temperature, top_p, etc.
+            generator: Optional torch.Generator for reproducible sampling. If None, sampling will be non-deterministic.
 
         Returns:
             The sampled token ID as an integer.
@@ -215,6 +216,7 @@ class ModelRunner:
             all_logits: Tensor of shape [1, seq_len, vocab_size] containing the logits for the current sequence.
             past_key_values: The past key values from the model, used for efficient decoding.
             sampling_params: SamplingParams object containing the parameters for sampling.
+            generator: Optional torch.Generator for reproducible sampling. If None, sampling will be non-deterministic.
 
         Yields:
             A tuple of (next_token: str, is_first_token: bool, is_done: bool) where:
@@ -235,7 +237,9 @@ class ModelRunner:
 
         for _ in range(sampling_params.max_new_tokens):
             # 1. sample the next token ID from the logits
-            next_token_id = self.sample_token(last_logits, sampling_params, generator=generator)
+            next_token_id = self.sample_token(
+                last_logits, sampling_params, generator=generator
+            )
 
             # 2. if the next token is EOS, we stop generation
             if next_token_id == self.tokenizer.eos_token_id:
