@@ -301,9 +301,6 @@ def load_hf_model(config: ModelConfig) -> ModelRunner:
         device_map="auto" if config.device == "cuda" else None,
     )
 
-    if config.device == "cuda":
-        model = model.to(config.device)
-
     model.eval()
     log_event("model_init_done", model=config.model_name_or_path)
     return ModelRunner(model=model, tokenizer=tokenizer, device=config.device)
