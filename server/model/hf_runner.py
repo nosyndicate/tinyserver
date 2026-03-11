@@ -108,7 +108,6 @@ class ModelRunner:
         token_counter = int(out_ids.shape[1])
         return out_text, prompt_tokens, token_counter
 
-    @torch.inference_mode()
     def generate_stream(
         self, prompt: str, sampling_params: SamplingParams
     ) -> Generator[tuple[str, bool, bool], None, None]:
@@ -123,9 +122,11 @@ class ModelRunner:
 
         all_logits, past_key_values, _ = self.prefill(prompt)
 
-        yield from self.decode_loop(
-            all_logits, past_key_values, sampling_params, generator=generator
-        )
+        # Cannot put inference_mode since the context will exit once the generator object is created.
+        with torch.inference_mode():
+            yield from self.decode_loop(
+                all_logits, past_key_values, sampling_params, generator=generator
+            )
 
     @torch.inference_mode()
     def prefill(self, prompt: str) -> tuple[torch.Tensor, DynamicCache, int]:

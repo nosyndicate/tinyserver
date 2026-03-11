@@ -88,6 +88,9 @@ def generate_stream(req: GenerateRequest) -> StreamingResponse:
             if is_first_token:
                 ttft_ms = ns_to_ms(now_ns() - start_ns)
 
+            if token_str:
+                index += 1
+
             chunk = StreamChunk(
                 token_str=token_str,
                 is_first=is_first_token,
