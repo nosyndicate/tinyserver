@@ -49,3 +49,37 @@ def test_smoke_generate_text_two_stage_end_to_end(
     assert isinstance(output_tokens, int)
     assert prompt_tokens > 0
     assert 0 <= output_tokens <= 5
+
+
+_DETERMINISM_ROUNDS = 5
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "temperature,seed",
+    [
+        (0.0, None),   # greedy: deterministic without a seed
+        (0.8, 123),    # stochastic: deterministic with the same seed
+    ],
+)
+def test_smoke_generate_text_two_stage_deterministic(
+    gpt2_runner: ModelRunner, temperature: float, seed: int | None
+) -> None:
+    """Calling generate_text_two_stage N times with the same seed must produce identical output."""
+    params = SamplingParams(
+        max_new_tokens=5, temperature=temperature, top_p=0.9, seed=seed
+    )
+
+    results = [
+        gpt2_runner.generate_text_two_stage("hello", params)
+        for _ in range(_DETERMINISM_ROUNDS)
+    ]
+    assert all(r == results[0] for r in results[1:])
+
+    # For the seeded stochastic case, verify a different seed gives different output.
+    if seed is not None:
+        alt_params = SamplingParams(
+            max_new_tokens=5, temperature=temperature, top_p=0.9, seed=seed + 876
+        )
+        alt_result = gpt2_runner.generate_text_two_stage("hello", alt_params)
+        assert alt_result != results[0], "different seeds should produce different output"
