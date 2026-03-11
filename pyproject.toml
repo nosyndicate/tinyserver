@@ -23,3 +23,6 @@ factory = false
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+markers = [
+    "smoke: end-to-end tests using a real randomly-initialized model (slower)",
+]

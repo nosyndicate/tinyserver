@@ -2,59 +2,9 @@ from dataclasses import dataclass
 
 import torch
 
+from conftest import FakeBatch, FakeTokenizer
 from server.model.hf_runner import ModelRunner
 from server.model.sampling import SamplingParams
-
-
-class FakeBatch(dict):
-    def to(self, _device: str) -> "FakeBatch":
-        return self
-
-
-class FakeTokenizer:
-    eos_token_id = 0
-    pad_token_id = 0
-
-    def __init__(
-        self,
-        input_ids: list[int],
-        decode_map: dict[int, str],
-        text_token_ids: dict[str, list[int]] | None = None,
-    ) -> None:
-        self._input_ids = input_ids
-        self._decode_map = decode_map
-        self._text_token_ids = text_token_ids or {}
-
-    def apply_chat_template(
-        self,
-        _messages,
-        tokenize: bool,
-        add_generation_prompt: bool,
-        enable_thinking: bool,
-    ) -> str:
-        assert not tokenize
-        assert add_generation_prompt
-        assert enable_thinking is False
-        return "formatted-prompt"
-
-    def __call__(
-        self, texts, return_tensors: str, add_special_tokens: bool | None = None
-    ) -> FakeBatch:
-        assert return_tensors == "pt"
-        text = texts[0]
-        if add_special_tokens is False:
-            token_ids = self._text_token_ids.get(text, [])
-        else:
-            token_ids = self._input_ids
-        return FakeBatch({"input_ids": torch.tensor([token_ids], dtype=torch.long)})
-
-    def decode(self, token_ids, skip_special_tokens: bool = True) -> str:
-        assert skip_special_tokens is True
-        if isinstance(token_ids, torch.Tensor):
-            ids = token_ids.tolist()
-        else:
-            ids = list(token_ids)
-        return "".join(self._decode_map.get(int(tid), f"<{int(tid)}>") for tid in ids)
 
 
 @dataclass
