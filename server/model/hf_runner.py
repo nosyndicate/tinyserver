@@ -124,9 +124,13 @@ class ModelRunner:
 
         # Cannot put inference_mode since the context will exit once the generator object is created.
         with torch.inference_mode():
-            yield from self.decode_loop(
+            for token_str, is_first, is_done in self.decode_loop(
                 all_logits, past_key_values, sampling_params, generator=generator
-            )
+            ):
+                if sampling_params.stops and is_done:
+                    token_str = _apply_stop_strings(token_str, sampling_params.stops)  # type: ignore[arg-type]
+
+                yield token_str, is_first, is_done
 
     @torch.inference_mode()
     def prefill(self, prompt: str) -> tuple[torch.Tensor, DynamicCache, int]:
