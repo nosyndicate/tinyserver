@@ -8,7 +8,8 @@ from server.model.sampling import SamplingParams
 def test_smoke_prefill_shapes(gpt2_runner: ModelRunner) -> None:
     all_logits, past_key_values, prompt_tokens = gpt2_runner.prefill("hello")
 
-    assert all_logits.shape == (1, prompt_tokens, 128)
+    vocab_size = gpt2_runner.model.config.vocab_size
+    assert all_logits.shape == (1, prompt_tokens, vocab_size)
     assert past_key_values is not None
     assert prompt_tokens > 0
 
@@ -26,7 +27,7 @@ def test_smoke_decode_loop_kv_cache_path(gpt2_runner: ModelRunner) -> None:
     )
 
     assert 1 <= len(chunks) <= 3
-    assert chunks[0][1] is True   # is_first
+    assert chunks[0][1] is True  # is_first
     assert chunks[-1][2] is True  # is_done
     assert all(isinstance(token_str, str) for token_str, _, _ in chunks)
 
@@ -58,8 +59,8 @@ _DETERMINISM_ROUNDS = 5
 @pytest.mark.parametrize(
     "temperature,seed",
     [
-        (0.0, None),   # greedy: deterministic without a seed
-        (0.8, 123),    # stochastic: deterministic with the same seed
+        (0.0, None),  # greedy: deterministic without a seed
+        (0.8, 123),  # stochastic: deterministic with the same seed
     ],
 )
 def test_smoke_generate_text_two_stage_deterministic(
@@ -82,4 +83,6 @@ def test_smoke_generate_text_two_stage_deterministic(
             max_new_tokens=5, temperature=temperature, top_p=0.9, seed=seed + 876
         )
         alt_result = gpt2_runner.generate_text_two_stage("hello", alt_params)
-        assert alt_result != results[0], "different seeds should produce different output"
+        assert (
+            alt_result != results[0]
+        ), "different seeds should produce different output"
