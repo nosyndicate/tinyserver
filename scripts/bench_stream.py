@@ -18,22 +18,22 @@ def one() -> tuple[float, float]:
     """Return (ttft_ms, total_ms)."""
     t0 = time.perf_counter()
     ttft = None
-    r = requests.post(URL, json=PAYLOAD, timeout=120, stream=True)
-    r.raise_for_status()
-    for line in r.iter_lines():
-        if not line:
-            continue
-        decoded = line.decode("utf-8") if isinstance(line, bytes) else line
-        if not decoded.startswith("data: "):
-            continue
-        chunk = json.loads(decoded[len("data: "):])
-        if chunk.get("is_first") and ttft is None:
-            ttft = (time.perf_counter() - t0) * 1000
-        if chunk.get("is_done"):
+    with requests.post(URL, json=PAYLOAD, timeout=120, stream=True) as r:
+        r.raise_for_status()
+        for line in r.iter_lines():
+            if not line:
+                continue
+            decoded = line.decode("utf-8") if isinstance(line, bytes) else line
+            if not decoded.startswith("data: "):
+                continue
+            chunk = json.loads(decoded[len("data: ") :])
+            if chunk.get("is_first") and ttft is None:
+                ttft = (time.perf_counter() - t0) * 1000
+            if chunk.get("is_done"):
+                total = (time.perf_counter() - t0) * 1000
+                break
+        else:
             total = (time.perf_counter() - t0) * 1000
-            break
-    else:
-        total = (time.perf_counter() - t0) * 1000
     if ttft is None:
         ttft = total
     return ttft, total
