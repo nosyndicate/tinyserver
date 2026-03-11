@@ -35,3 +35,15 @@ class GenerateResponse(BaseModel):
     tokens_per_s: float = Field(
         ..., ge=0.0, description="Generation speed in tokens per second"
     )
+
+
+class StreamChunk(BaseModel):
+    """A chunk of generated text for streaming responses."""
+
+    token_str: str = Field(..., description="The generated token string")
+    is_first: bool = Field(
+        ..., description="Whether this is the first token in the output"
+    )
+    is_done: bool = Field(
+        ..., description="Whether this is the last token in the output"
+    )

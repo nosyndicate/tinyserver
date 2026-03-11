@@ -108,6 +108,33 @@ class ModelRunner:
         token_counter = int(out_ids.shape[1])
         return out_text, prompt_tokens, token_counter
 
+    def generate_stream(
+        self, prompt: str, sampling_params: SamplingParams
+    ) -> Generator[tuple[str, bool, bool], None, None]:
+        """Generate text as a stream of tokens using the two-stage approach."""
+        if (
+            sampling_params.temperature is not None
+            and sampling_params.temperature > LOWEST_TEMPERATURE
+        ):
+            generator = make_generator(sampling_params.seed, self.device)
+        else:
+            generator = None
+
+        all_logits, past_key_values, _ = self.prefill(prompt)
+
+        # We cannot use @torch.inference_mode() on this generator function, because a decorator
+        # would only wrap creation of the generator object, not the subsequent iteration.
+        # Using a context manager here keeps inference_mode active while we iterate and yield tokens.
+        with torch.inference_mode():
+            for token_str, is_first, is_done in self.decode_loop(
+                all_logits, past_key_values, sampling_params, generator=generator
+            ):
+                # TODO The stop string logic is not correct, consider removing the support for stop string in all modes and add the test
+                if sampling_params.stops and is_done:
+                    token_str = _apply_stop_strings(token_str, sampling_params.stops)  # type: ignore[arg-type]
+
+                yield token_str, is_first, is_done
+
     @torch.inference_mode()
     def prefill(self, prompt: str) -> tuple[torch.Tensor, DynamicCache, int]:
         """Run the model on the prompt to get initial logits and past_key_values for decoding.

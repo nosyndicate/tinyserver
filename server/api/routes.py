@@ -1,8 +1,11 @@
-from fastapi import APIRouter
+from typing import Generator
 
-from server.api.schema import GenerateRequest, GenerateResponse
+from fastapi import APIRouter
+from fastapi.responses import StreamingResponse
+
+from server.api.schema import GenerateRequest, GenerateResponse, StreamChunk
 from server.metrics.logging import log_event
-from server.metrics.timers import ns_to_ms, timed
+from server.metrics.timers import now_ns, ns_to_ms, timed
 from server.model.hf_runner import ModelConfig, load_hf_model
 from server.model.sampling import build_sampling_params
 
@@ -62,3 +65,42 @@ def generate(req: GenerateRequest) -> GenerateResponse:
         total_ms=total_ms,
         tokens_per_s=tokens_per_s,
     )
+
+
+@router.post("/generate/stream")
+def generate_stream(req: GenerateRequest) -> StreamingResponse:
+    sampling_params = build_sampling_params(
+        max_new_tokens=req.max_new_tokens,
+        temperature=req.temperature,
+        top_p=req.top_p,
+        stops=req.stops,
+        seed=req.seed,
+    )
+
+    def _event_stream() -> Generator[str, None, None]:
+        start_ns = now_ns()
+        ttft_ms = None
+        index = 0
+
+        for token_str, is_first_token, is_done in _runner.generate_stream(
+            req.prompt, sampling_params
+        ):
+            if is_first_token:
+                ttft_ms = ns_to_ms(now_ns() - start_ns)
+
+            if token_str:
+                index += 1
+
+            chunk = StreamChunk(
+                token_str=token_str,
+                is_first=is_first_token,
+                is_done=is_done,
+            )
+
+            yield f"data: {chunk.model_dump_json()}\n\n"
+
+            if is_done:
+                log_event("stream_done", output_tokens=index, ttft_ms=ttft_ms)
+                return
+
+    return StreamingResponse(_event_stream(), media_type="text/event-stream")
