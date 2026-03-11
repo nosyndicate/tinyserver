@@ -122,7 +122,9 @@ class ModelRunner:
 
         all_logits, past_key_values, _ = self.prefill(prompt)
 
-        # Cannot put inference_mode since the context will exit once the generator object is created.
+        # We cannot use @torch.inference_mode() on this generator function, because a decorator
+        # would only wrap creation of the generator object, not the subsequent iteration.
+        # Using a context manager here keeps inference_mode active while we iterate and yield tokens.
         with torch.inference_mode():
             for token_str, is_first, is_done in self.decode_loop(
                 all_logits, past_key_values, sampling_params, generator=generator
