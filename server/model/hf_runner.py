@@ -129,6 +129,7 @@ class ModelRunner:
             for token_str, is_first, is_done in self.decode_loop(
                 all_logits, past_key_values, sampling_params, generator=generator
             ):
+                # TODO The stop string logic is not correct, consider removing the support for stop string in all modes and add the test
                 if sampling_params.stops and is_done:
                     token_str = _apply_stop_strings(token_str, sampling_params.stops)  # type: ignore[arg-type]
 
