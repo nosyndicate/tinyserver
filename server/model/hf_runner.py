@@ -109,6 +109,25 @@ class ModelRunner:
         return out_text, prompt_tokens, token_counter
 
     @torch.inference_mode()
+    def generate_stream(
+        self, prompt: str, sampling_params: SamplingParams
+    ) -> Generator[tuple[str, bool, bool], None, None]:
+        """Generate text as a stream of tokens using the two-stage approach."""
+        if (
+            sampling_params.temperature is not None
+            and sampling_params.temperature > LOWEST_TEMPERATURE
+        ):
+            generator = make_generator(sampling_params.seed, self.device)
+        else:
+            generator = None
+
+        all_logits, past_key_values, _ = self.prefill(prompt)
+
+        yield from self.decode_loop(
+            all_logits, past_key_values, sampling_params, generator=generator
+        )
+
+    @torch.inference_mode()
     def prefill(self, prompt: str) -> tuple[torch.Tensor, DynamicCache, int]:
         """Run the model on the prompt to get initial logits and past_key_values for decoding.
 
