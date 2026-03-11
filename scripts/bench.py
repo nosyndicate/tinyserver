@@ -38,9 +38,12 @@ def main(concurrency: int = 4, n: int = 20) -> None:
     summary = {
         "n": n,
         "concurrency": concurrency,
-        "p50_ms": pct(0.50),
-        "p90_ms": pct(0.90),
-        "p99_ms": pct(0.99),
+        "ttft_p50_ms": pct(0.50),
+        "ttft_p90_ms": pct(0.90),
+        "ttft_p99_ms": pct(0.99),
+        "total_p50_ms": pct(0.50),
+        "total_p90_ms": pct(0.90),
+        "total_p99_ms": pct(0.99),
     }
     print(json.dumps(summary, indent=2))
 
