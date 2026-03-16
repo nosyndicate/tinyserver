@@ -1,8 +1,8 @@
 from dataclasses import dataclass
 
 import torch
-
 from conftest import FakeBatch, FakeTokenizer
+
 from server.model.hf_runner import ModelRunner
 from server.model.sampling import SamplingParams
 
@@ -104,14 +104,14 @@ def test_decode_loop_stops_immediately_on_eos() -> None:
     assert chunks == [("", True, True)]
 
 
-def test_generate_text_two_stage_concatenates_and_counts_tokens() -> None:
+def test_generate_text_concatenates_and_counts_tokens() -> None:
     runner = build_runner(
         sequence=[1, 2, 0],
         decode_map={1: "A", 2: "B"},
         text_token_ids={"AB": [1, 2]},
     )
 
-    out_text, prompt_tokens, output_tokens = runner.generate_text_two_stage(
+    out_text, prompt_tokens, output_tokens = runner.generate_text(
         "hello",
         SamplingParams(max_new_tokens=8, temperature=0.0, top_p=1.0),
     )
@@ -121,10 +121,10 @@ def test_generate_text_two_stage_concatenates_and_counts_tokens() -> None:
     assert output_tokens == 2
 
 
-def test_generate_text_two_stage_handles_max_new_tokens_zero() -> None:
+def test_generate_text_handles_max_new_tokens_zero() -> None:
     runner = build_runner(sequence=[1, 2, 0], decode_map={1: "A", 2: "B"})
 
-    out_text, prompt_tokens, output_tokens = runner.generate_text_two_stage(
+    out_text, prompt_tokens, output_tokens = runner.generate_text(
         "hello",
         SamplingParams(max_new_tokens=0, temperature=0.0, top_p=1.0),
     )
@@ -132,5 +132,3 @@ def test_generate_text_two_stage_handles_max_new_tokens_zero() -> None:
     assert out_text == ""
     assert prompt_tokens == 3
     assert output_tokens == 0
-
-

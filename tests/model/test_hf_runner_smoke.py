@@ -37,10 +37,10 @@ def test_smoke_decode_loop_kv_cache_path(gpt2_runner: ModelRunner) -> None:
     "temperature,seed",
     [(0.0, None), (1.0, 42)],
 )
-def test_smoke_generate_text_two_stage_end_to_end(
+def test_smoke_generate_text_end_to_end(
     gpt2_runner: ModelRunner, temperature: float, seed: int | None
 ) -> None:
-    out_text, prompt_tokens, output_tokens = gpt2_runner.generate_text_two_stage(
+    out_text, prompt_tokens, output_tokens = gpt2_runner.generate_text(
         "hello",
         SamplingParams(max_new_tokens=5, temperature=temperature, top_p=0.9, seed=seed),
     )
@@ -63,17 +63,16 @@ _DETERMINISM_ROUNDS = 5
         (0.8, 123),  # stochastic: deterministic with the same seed
     ],
 )
-def test_smoke_generate_text_two_stage_deterministic(
+def test_smoke_generate_text_deterministic(
     gpt2_runner: ModelRunner, temperature: float, seed: int | None
 ) -> None:
-    """Calling generate_text_two_stage N times with the same seed must produce identical output."""
+    """Calling generate_text N times with the same seed must produce identical output."""
     params = SamplingParams(
         max_new_tokens=5, temperature=temperature, top_p=0.9, seed=seed
     )
 
     results = [
-        gpt2_runner.generate_text_two_stage("hello", params)
-        for _ in range(_DETERMINISM_ROUNDS)
+        gpt2_runner.generate_text("hello", params) for _ in range(_DETERMINISM_ROUNDS)
     ]
     assert all(r == results[0] for r in results[1:])
 
@@ -82,7 +81,7 @@ def test_smoke_generate_text_two_stage_deterministic(
         alt_params = SamplingParams(
             max_new_tokens=5, temperature=temperature, top_p=0.9, seed=seed + 876
         )
-        alt_result = gpt2_runner.generate_text_two_stage("hello", alt_params)
+        alt_result = gpt2_runner.generate_text("hello", alt_params)
         assert (
             alt_result != results[0]
         ), "different seeds should produce different output"

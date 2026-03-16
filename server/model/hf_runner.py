@@ -38,41 +38,6 @@ class ModelRunner:
     def generate_text(
         self, prompt: str, sampling_params: SamplingParams
     ) -> tuple[str, int, int]:
-
-        if sampling_params.seed is not None:
-            torch.manual_seed(sampling_params.seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(sampling_params.seed)
-
-        messages = [{"role": "user", "content": prompt}]
-        text = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
-        )
-
-        inputs = self.tokenizer([text], return_tensors="pt").to(self.device)
-        prompt_tokens = int(inputs["input_ids"].shape[1])
-
-        do_sample = sampling_params.temperature > 0
-        outputs = self.model.generate(
-            **inputs,
-            max_new_tokens=sampling_params.max_new_tokens,
-            temperature=max(sampling_params.temperature, 1e-5) if do_sample else None,
-            top_p=sampling_params.top_p if do_sample else None,
-            do_sample=do_sample,
-            eos_token_id=self.tokenizer.eos_token_id,
-            pad_token_id=self.tokenizer.pad_token_id,
-        )
-
-        generated_ids = outputs[0][prompt_tokens:]
-        generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-
-        output_tokens = int(outputs.shape[1]) - prompt_tokens
-        return generated_text, prompt_tokens, output_tokens  # type: ignore[return-value]
-
-    @torch.inference_mode()
-    def generate_text_two_stage(
-        self, prompt: str, sampling_params: SamplingParams
-    ) -> tuple[str, int, int]:
         """Generate text using a two-stage approach with prefill and decode loop."""
         if (
             sampling_params.temperature is not None
