@@ -10,9 +10,6 @@ class GenerateRequest(BaseModel):
     top_p: float = Field(
         0.95, ge=0.0, le=1.0, description="Nucleus sampling top-p value"
     )
-    stops: list[str] | None = Field(
-        default=None, description="Optional list of stop sequences"
-    )
     seed: int | None = Field(
         default=None, ge=0, description="Optional random seed for reproducibility"
     )

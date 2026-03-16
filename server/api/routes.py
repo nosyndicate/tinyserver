@@ -27,7 +27,6 @@ def generate(req: GenerateRequest) -> GenerateResponse:
         max_new_tokens=req.max_new_tokens,
         temperature=req.temperature,
         top_p=req.top_p,
-        stops=req.stops,
         seed=req.seed,
     )
 
@@ -73,7 +72,6 @@ def generate_stream(req: GenerateRequest) -> StreamingResponse:
         max_new_tokens=req.max_new_tokens,
         temperature=req.temperature,
         top_p=req.top_p,
-        stops=req.stops,
         seed=req.seed,
     )
 

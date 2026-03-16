@@ -65,12 +65,9 @@ class ModelRunner:
 
         generated_ids = outputs[0][prompt_tokens:]
         generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-        out_text = generated_text
-        if sampling_params.stops:
-            out_text = _apply_stop_strings(generated_text, sampling_params.stops)  # type: ignore[arg-type]
 
         output_tokens = int(outputs.shape[1]) - prompt_tokens
-        return out_text, prompt_tokens, output_tokens  # type: ignore[return-value]
+        return generated_text, prompt_tokens, output_tokens  # type: ignore[return-value]
 
     @torch.inference_mode()
     def generate_text_two_stage(
@@ -99,8 +96,6 @@ class ModelRunner:
                 break
 
         out_text = "".join(tokens)
-        if sampling_params.stops:
-            out_text = _apply_stop_strings(out_text, sampling_params.stops)  # type: ignore[arg-type]
 
         out_ids = self.tokenizer(
             [out_text], return_tensors="pt", add_special_tokens=False
@@ -129,10 +124,6 @@ class ModelRunner:
             for token_str, is_first, is_done in self.decode_loop(
                 all_logits, past_key_values, sampling_params, generator=generator
             ):
-                # TODO The stop string logic is not correct, consider removing the support for stop string in all modes and add the test
-                if sampling_params.stops and is_done:
-                    token_str = _apply_stop_strings(token_str, sampling_params.stops)  # type: ignore[arg-type]
-
                 yield token_str, is_first, is_done
 
     @torch.inference_mode()
@@ -247,15 +238,12 @@ class ModelRunner:
                 - next_token is the decoded text of the next token ID. (Maybe empty string if the token
                   is a special token or if generation is done.)
                 - is_first_token indicates if this is the first generated token (after the prompt).
-                - is_done indicates if generation should stop (either due to EOS token, stop strings, or max tokens reached).
+                - is_done indicates if generation should stop (either due to EOS token or max tokens reached).
 
         Returns:
             None
         """
         token_counter = 0
-        stops = sampling_params.stops or []
-        max_stop_len = max((len(stop) for stop in stops), default=0)
-        tail = ""
 
         last_logits = all_logits[:, -1, :]  # shape [1, vocab_size]
 
@@ -275,19 +263,7 @@ class ModelRunner:
                 [next_token_id], skip_special_tokens=True
             )
 
-            # 4. stop detection only needs the previous suffix + current token.
-            if stops:
-                candidate = tail + next_token
-                if any(stop in candidate for stop in stops):
-                    yield next_token, token_counter == 0, True
-                    return
-
-                if max_stop_len > 1:
-                    tail = candidate[-(max_stop_len - 1) :]
-                else:
-                    tail = ""
-
-            # 5. if we don't stop then we yield the next token and continue
+            # 4. yield the next token and continue
             is_last = token_counter == sampling_params.max_new_tokens - 1
             yield next_token, token_counter == 0, is_last  # type: ignore[misc]
 
@@ -333,11 +309,3 @@ def load_hf_model(config: ModelConfig) -> ModelRunner:
     return ModelRunner(model=model, tokenizer=tokenizer, device=config.device)
 
 
-def _apply_stop_strings(text: str, stop_strings: list[str]) -> str:
-    """Apply stop strings to the generated text."""
-    cut = None
-    for s in stop_strings:
-        idx = text.find(s)
-        if idx != -1:
-            cut = idx if cut is None else min(cut, idx)
-    return text if cut is None else text[:cut]
