@@ -13,6 +13,7 @@ from transformers import (
 from server.metrics.logging import log_event
 from server.model.determinism import make_generator
 from server.model.sampling import SamplingParams
+from server.model.triton_sampling import sample_token_triton
 
 
 @dataclass
@@ -124,6 +125,7 @@ class ModelRunner:
         logits: torch.Tensor,
         sampling_params: SamplingParams,
         generator: torch.Generator | None = None,
+        seq_pos: int = 0,
     ) -> int:
         """Sample a token ID from the logits using the provided sampling parameters.
 
@@ -131,6 +133,7 @@ class ModelRunner:
             logits: Tensor of shape [1, vocab_size] containing the logits for the next token
             sampling_params: SamplingParams object containing temperature, top_p, etc.
             generator: Optional torch.Generator for reproducible sampling. If None, sampling will be non-deterministic.
+            seq_pos: Sequence position for RNG variation (used by Triton kernel).
 
         Returns:
             The sampled token ID as an integer.
@@ -146,6 +149,19 @@ class ModelRunner:
         if not (0.0 < sampling_params.top_p <= 1.0):
             raise ValueError(f"top_p must be in (0, 1], got {sampling_params.top_p}")
 
+        # Try Triton kernel first for optimized sampling
+        triton_result = sample_token_triton(
+            logits=logits[0],  # Remove batch dim
+            temperature=sampling_params.temperature,
+            top_p=sampling_params.top_p,
+            seed=sampling_params.seed,
+            seq_pos=seq_pos,
+        )
+
+        if triton_result is not None:
+            return triton_result
+
+        # Fallback to PyTorch implementation
         # Work in float32 for more stable sampling math.
         scaled_logits = logits.float() / max(
             sampling_params.temperature, LOWEST_TEMPERATURE
@@ -215,7 +231,7 @@ class ModelRunner:
         for _ in range(sampling_params.max_new_tokens):
             # 1. sample the next token ID from the logits
             next_token_id = self.sample_token(
-                last_logits, sampling_params, generator=generator
+                last_logits, sampling_params, generator=generator, seq_pos=token_counter
             )
 
             # 2. if the next token is EOS, we stop generation
