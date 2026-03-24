@@ -119,6 +119,7 @@ class ModelRunner:
         prompt_tokens = int(inputs["input_ids"].shape[1])
         return all_logits, past_key_values, prompt_tokens
 
+    @torch.inference_mode()
     def sample_token(
         self,
         logits: torch.Tensor,

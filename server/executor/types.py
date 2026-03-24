@@ -41,7 +41,7 @@ class DoneEvent:
     Attributes:
         text: The full decoded text for the sequence, including all tokens.
         num_output: The number of tokens in the output sequence.
-        ttft: The total time taken for the sequence generation.
+        ttft: The time to first token in milliseconds.
         total_ms: The total time taken for the sequence generation in milliseconds.
 
     """
@@ -56,7 +56,7 @@ class DoneEvent:
 @dataclass(frozen=True)
 class ErrorEvent:
     """
-    Indicate the generation is failed.
+    Indicates that the generation has failed.
 
     Attributes:
         request_id: The unique identifier for the request, used for logging and tracking.
@@ -73,8 +73,8 @@ class ExecutorConfig:
     The configuration for the executor, controls the backpressure.
 
     Attributes:
-        max_queue_size: Max number of request that can wait in the queue. If the queue is full, new requests will get HTTP 503 error.
-        max_active_requests: Max number of requests that the worker can process concurrently.
+        max_queue_size: The maximum number of requests that can wait in the queue. If the queue is full, new requests will get an HTTP 503 error.
+        max_active_requests: The maximum number of requests that the worker can process concurrently.
             If there are already max_active_requests in processing, new requests will wait in the queue until there is an available slot.
     """
 
@@ -115,15 +115,21 @@ class GenerationRequestState:
     Attributes:
         request_id: A unique identifier for the request, used for logging and tracking.
         sampling_params: The sampling parameters for the request.
+        prompt: The input prompt text for the generation.
         status: The current lifecycle status of the request.
 
         all_logits: The tensor we will sample the next token id from. It is updated after prefill and each decoding step.
         past_key_values: The cached key values for the transformer model, updated after prefill and each decoding step.
-        output_tokens: The number of tokens generated so far, used for enforcing max_new_tokens limit
+        num_output_tokens: The decoded tokens generated so far.
+        first_token_ns: The timestamp in nanoseconds when the first token is generated, used for TTFT calculation.
+        start_ns: The timestamp in nanoseconds when the prefill starts, used for total time calculation.
+        output_tokens: The list of decoded tokens generated so far.
 
         finished_reason: Why generation stopped: 'eos', 'max_length' or None (not finished yet).
         error: The error message if the request failed, None otherwise.
 
+        output_queue: The communication channel to send TokenEvent, DoneEvent or ErrorEvent back to the HTTP handler.
+        generator: The random generator for sampling, initialized in prefill and used in decoding steps.
     """
 
     request_id: str

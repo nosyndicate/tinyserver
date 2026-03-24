@@ -43,6 +43,7 @@ class Executor:
                 ErrorEvent(request_id=request_state.request_id, error=str(e))
             )
 
+    @torch.inference_mode()
     def decode_one_step(self, request_state: GenerationRequestState) -> None:
         try:
             assert (
