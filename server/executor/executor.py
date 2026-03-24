@@ -21,8 +21,8 @@ class Executor:
         Run the prefill step for the given request state.
         This will update the request state with the initial logits and past key values.
         """
-
         request_state.status = RequestStatus.PREFILLING
+        request_state.start_ns = now_ns()
         try:
             all_logits, past_key_values, num_input_toks = self._runner.prefill(
                 request_state.prompt
