@@ -2,6 +2,8 @@
 Define the various dataclasses for the executor.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from enum import Enum
 from queue import Queue
@@ -137,9 +139,10 @@ class GenerationRequestState:
     num_prompt_tokens: int | None = None
 
     # Decoding related states
-    output_tokens: int = 0
+    num_output_tokens: int = 0
     first_token_ns: int | None = None
     start_ns: int | None = None
+    output_tokens: list[str] = field(default_factory=list)
 
     # Final results
     finished_reason: str | None = None

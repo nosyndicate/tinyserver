@@ -29,7 +29,9 @@ class Executor:
             )
             request_state.all_logits = all_logits
             request_state.past_key_values = past_key_values
-            request_state.output_tokens = num_input_toks
+            request_state.num_prompt_tokens = num_input_toks
+            request_state.num_output_tokens = 0
+            request_state.output_tokens = []
 
             request_state.status = RequestStatus.DECODING
         except Exception as e:
@@ -52,7 +54,7 @@ class Executor:
             )
 
             if next_token_id == self._runner.eos_token_id:
-                is_first = request_state.output_tokens == 0
+                is_first = request_state.num_output_tokens == 0
                 if is_first:
                     request_state.first_token_ns = now_ns()
 
@@ -61,7 +63,7 @@ class Executor:
                         token="",  # no more token, but we can still send an empty event to indicate eos
                         is_first=is_first,
                         is_last=True,
-                        index=request_state.output_tokens,
+                        index=request_state.num_output_tokens,
                     )
                 )
 
@@ -74,24 +76,25 @@ class Executor:
                 [next_token_id], skip_special_tokens=True
             )
 
-            is_first = request_state.output_tokens == 0
+            is_first = request_state.num_output_tokens == 0
             if is_first:
                 request_state.first_token_ns = now_ns()
 
             is_last = (
-                request_state.output_tokens + 1
+                request_state.num_output_tokens + 1
                 >= request_state.sampling_params.max_new_tokens
             )
 
+            request_state.output_tokens.append(next_token)
             request_state.output_queue.put(
                 TokenEvent(
                     token=next_token,
                     is_first=is_first,
                     is_last=is_last,
-                    index=request_state.output_tokens,
+                    index=request_state.num_output_tokens,
                 )
             )
-            request_state.output_tokens += 1
+            request_state.num_output_tokens += 1
 
             if is_last:
                 request_state.finished_reason = "max_length"
@@ -137,8 +140,8 @@ class Executor:
 
         request_state.output_queue.put(
             DoneEvent(
-                text="",  # TODO: add the text here
-                num_output=request_state.output_tokens,
+                text="".join(request_state.output_tokens),
+                num_output=request_state.num_output_tokens,
                 ttft=ttft_ms,
                 total_ms=total_ms,
             )
