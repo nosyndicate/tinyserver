@@ -1,7 +1,7 @@
 import logging
 import threading
-from queue import Empty, Queue
 import time
+from queue import Empty, Queue
 
 from server.executor.executor import Executor
 from server.executor.types import (
@@ -33,8 +33,9 @@ class Worker:
         self._executor = executor
         self._config = config
 
-        # Inbound queue, HTTP handlers put the new request here
-        # If the queue is full, new requests will be rejected with a 503 error
+        # Inbound queue, HTTP handlers put the new request here.
+        # If the queue is full, submit() raises queue.Full; callers (e.g., HTTP
+        # handlers) should translate that condition into an HTTP 503 response.
         self._inbound: Queue[GenerationRequestState] = Queue(
             maxsize=self._config.max_queue_size
         )
@@ -54,7 +55,8 @@ class Worker:
                 # Fetch all the new requests from the inbound queue and add them to the active list
                 new_requests: list[GenerationRequestState] = []
                 while (
-                    len(self._active) + len(new_requests) < self._config.max_active_requests
+                    len(self._active) + len(new_requests)
+                    < self._config.max_active_requests
                 ):
                     try:
                         request_state = self._inbound.get_nowait()
@@ -63,15 +65,26 @@ class Worker:
                         break
 
                 # Process the new requests: run prefill and move to active if successful
-                for req in new_requests:
+                for i, req in enumerate(new_requests):
                     # If the worker is shutting down, reject the new request with an error event
                     if self._shutdown_event.is_set():
-                        req.output_queue.put(
-                            ErrorEvent(
-                                request_id=req.request_id,
-                                error="Worker is shutting down, request rejected",
-                            )
-                        )
+                        # Cancel this request and all remaining new + active requests
+                        for pending in new_requests[i:] + self._active:
+                            pending.status = RequestStatus.FAILED
+                            pending.error = "Worker is shutting down, request rejected"
+                            try:
+                                pending.output_queue.put(
+                                    ErrorEvent(
+                                        request_id=pending.request_id,
+                                        error=pending.error,
+                                    )
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "Failed to emit error event for request %s",
+                                    pending.request_id,
+                                )
+                        self._active.clear()
                         return
 
                     self._executor.prefill(req)
@@ -81,6 +94,23 @@ class Worker:
                 # Decode one step for each active request
                 for req in self._active:
                     if self._shutdown_event.is_set():
+                        # Cancel all active requests before exiting
+                        for pending in self._active:
+                            pending.status = RequestStatus.FAILED
+                            pending.error = "Worker is shutting down, request cancelled"
+                            try:
+                                pending.output_queue.put(
+                                    ErrorEvent(
+                                        request_id=pending.request_id,
+                                        error=pending.error,
+                                    )
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "Failed to emit error event for request %s",
+                                    pending.request_id,
+                                )
+                        self._active.clear()
                         return
 
                     if req.status == RequestStatus.DECODING:
@@ -97,14 +127,53 @@ class Worker:
                 if not self._active:
                     time.sleep(0.01)
         except Exception as e:
+            # This is a background thread, no other thread is expected to catch this exception, so we log it here.
+            # We also attempt to cancel all active and pending requests with an error event.
             logger.exception("Worker thread crashed with unexpected exception: %s", e)
-            raise
+            # Cancel all active requests
+            for pending in self._active:
+                try:
+                    pending.status = RequestStatus.FAILED
+                    pending.error = f"Worker encountered an unexpected error: {e}"
+                    pending.output_queue.put(
+                        ErrorEvent(
+                            request_id=pending.request_id,
+                            error=pending.error,
+                        )
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to emit error event for active request %s",
+                        getattr(pending, "request_id", "<unknown>"),
+                    )
+            self._active.clear()
+            # Drain the inbound queue
+            while True:
+                try:
+                    pending = self._inbound.get_nowait()
+                except Empty:
+                    break
+                try:
+                    pending.status = RequestStatus.FAILED
+                    pending.error = f"Worker encountered an unexpected error: {e}"
+                    pending.output_queue.put(
+                        ErrorEvent(
+                            request_id=pending.request_id,
+                            error=pending.error,
+                        )
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to emit error event for pending request %s",
+                        getattr(pending, "request_id", "<unknown>"),
+                    )
 
     def start(self) -> None:
         """Create the thread and start the main loop."""
         if self._thread is not None and self._thread.is_alive():
             logger.warning("Worker thread is already running")
             return
+        self._shutdown_event.clear()
         self._thread = threading.Thread(
             target=self._run_loop, name="inference-worker", daemon=True
         )
@@ -119,10 +188,12 @@ class Worker:
         while True:
             try:
                 req = self._inbound.get_nowait()
+                req.status = RequestStatus.FAILED
+                req.error = "Worker is shutting down, request rejected"
                 req.output_queue.put(
                     ErrorEvent(
                         request_id=req.request_id,
-                        error="Worker is shutting down, request rejected",
+                        error=req.error,
                     )
                 )
             except Empty:
@@ -131,6 +202,25 @@ class Worker:
         if self._thread is not None:
             self._thread.join()
             logger.info("Worker thread stopped")
+
+        # Since thread stopped, cancel any active requests that were still in-flight
+        for pending in self._active:
+            try:
+                pending.status = RequestStatus.FAILED
+                pending.error = "Worker is shutting down, request cancelled"
+                pending.output_queue.put(
+                    ErrorEvent(
+                        request_id=pending.request_id,
+                        error=pending.error,
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to emit error event for active request %s",
+                    pending.request_id,
+                )
+
+        self._active.clear()
 
     def submit(self, request_state: GenerationRequestState) -> None:
         """Submit a new request to the worker.
