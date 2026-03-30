@@ -3,6 +3,7 @@ import torch
 from server.executor.types import (
     DoneEvent,
     ErrorEvent,
+    FinishReason,
     GenerationRequestState,
     RequestStatus,
     TokenEvent,
@@ -17,10 +18,6 @@ class Executor:
         self._runner = runner
 
     def prefill(self, request_state: GenerationRequestState) -> None:
-        """
-        Run the prefill step for the given request state.
-        This will update the request state with the initial logits and past key values.
-        """
         request_state.status = RequestStatus.PREFILLING
         request_state.start_ns = now_ns()
         try:
@@ -30,56 +27,41 @@ class Executor:
             request_state.all_logits = all_logits
             request_state.past_key_values = past_key_values
             request_state.num_prompt_tokens = num_input_toks
-            request_state.num_output_tokens = 0
-            request_state.output_tokens = []
-
             request_state.status = RequestStatus.DECODING
         except Exception as e:
-            # if any error happens during prefill, we mark the request as failed
-            # and notify the handler via ErrorEvent
-            request_state.status = RequestStatus.FAILED
-            request_state.error = str(e)
-            request_state.output_queue.put(
-                ErrorEvent(request_id=request_state.request_id, error=str(e))
-            )
+            self._handle_error(request_state, e)
 
     @torch.inference_mode()
     def decode_one_step(self, request_state: GenerationRequestState) -> None:
         try:
-            assert (
-                request_state.all_logits is not None
-            ), "all_logits should not be None during decoding"
+            if request_state.all_logits is None:
+                raise ValueError("No logits available for decoding step")
+
             logits = request_state.all_logits[:, -1, :]
             next_token_id = self._runner.sample_token(
                 logits, request_state.sampling_params, request_state.generator
             )
 
-            if next_token_id == self._runner.eos_token_id:
-                is_first = request_state.num_output_tokens == 0
-                if is_first:
-                    request_state.first_token_ns = now_ns()
+            is_first = request_state.num_output_tokens == 0
+            if is_first:
+                request_state.first_token_ns = now_ns()
 
+            if next_token_id == self._runner.eos_token_id:
                 request_state.output_queue.put(
                     TokenEvent(
-                        token="",  # no more token, but we can still send an empty event to indicate eos
+                        token="",
                         is_first=is_first,
                         is_last=True,
                         index=request_state.num_output_tokens,
                     )
                 )
-
-                request_state.finished_reason = "eos"
+                request_state.finished_reason = FinishReason.EOS
                 self._finish(request_state)
                 return
 
-            # decode the token
             next_token = self._runner.tokenizer.decode(
                 [next_token_id], skip_special_tokens=True
             )
-
-            is_first = request_state.num_output_tokens == 0
-            if is_first:
-                request_state.first_token_ns = now_ns()
 
             is_last = (
                 request_state.num_output_tokens + 1
@@ -95,14 +77,12 @@ class Executor:
                     index=request_state.num_output_tokens,
                 )
             )
-            request_state.num_output_tokens += 1
 
             if is_last:
-                request_state.finished_reason = "max_length"
+                request_state.finished_reason = FinishReason.MAX_LENGTH
                 self._finish(request_state)
                 return
 
-            # update the request state for the next decoding step
             next_input_id = torch.tensor([[next_token_id]], device=logits.device)
             output = self._runner.model(
                 next_input_id,
@@ -114,31 +94,31 @@ class Executor:
             request_state.past_key_values = output.past_key_values
 
         except Exception as e:
-            # if any error happens during decoding, we mark the request as failed
-            # and notify the handler via ErrorEvent
-            request_state.status = RequestStatus.FAILED
-            request_state.error = str(e)
-            request_state.output_queue.put(
-                ErrorEvent(request_id=request_state.request_id, error=str(e))
-            )
+            self._handle_error(request_state, e)
+
+    def _handle_error(
+        self, request_state: GenerationRequestState, error: Exception
+    ) -> None:
+        request_state.status = RequestStatus.FAILED
+        request_state.error = str(error)
+        request_state.output_queue.put(
+            ErrorEvent(request_id=request_state.request_id, error=str(error))
+        )
 
     def _finish(self, request_state: GenerationRequestState) -> None:
-        """Finalize a completed request: compute metrics and send Done Event"""
-
         request_state.status = RequestStatus.DONE
         end_ns = now_ns()
         total_ms = (
             ns_to_ms(end_ns - request_state.start_ns)
-            if request_state.start_ns
+            if request_state.start_ns is not None
             else -1.0
         )
-
         ttft_ms = (
             ns_to_ms(request_state.first_token_ns - request_state.start_ns)
-            if request_state.first_token_ns and request_state.start_ns
+            if request_state.first_token_ns is not None
+            and request_state.start_ns is not None
             else -1.0
         )
-
         request_state.output_queue.put(
             DoneEvent(
                 text="".join(request_state.output_tokens),

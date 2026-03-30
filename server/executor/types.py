@@ -1,7 +1,3 @@
-"""
-Define the various dataclasses for the executor.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -83,19 +79,6 @@ class ExecutorConfig:
 
 
 class RequestStatus(Enum):
-    """
-    The lifecycle status of a generation request.
-
-    State machine:
-    QUEUED -> PREFILLING -> DECODING -> DONE
-                     |            |
-                     v            v
-                 FAILED        FAILED
-                     |            |
-                     v            v
-                 CANCELLED     CANCELLED
-    """
-
     QUEUED = "queued"
     PREFILLING = "prefilling"
     DECODING = "decoding"
@@ -104,59 +87,41 @@ class RequestStatus(Enum):
     CANCELLED = "cancelled"
 
 
+class FinishReason(Enum):
+    EOS = "eos"
+    MAX_LENGTH = "max_length"
+
+
 @dataclass
 class GenerationRequestState:
-    """
-    Mutable state for a single in-flight generation request.
-
-    This object is created by the HTTP handler, submitted to the worker queue.
-    And then updated exclusively by the worker until the request is done, failed or cancelled.
-
-    Attributes:
-        request_id: A unique identifier for the request, used for logging and tracking.
-        sampling_params: The sampling parameters for the request.
-        prompt: The input prompt text for the generation.
-        status: The current lifecycle status of the request.
-
-        all_logits: The tensor we will sample the next token id from. It is updated after prefill and each decoding step.
-        past_key_values: The cached key values for the transformer model, updated after prefill and each decoding step.
-        num_output_tokens: The decoded tokens generated so far.
-        first_token_ns: The timestamp in nanoseconds when the first token is generated, used for TTFT calculation.
-        start_ns: The timestamp in nanoseconds when the prefill starts, used for total time calculation.
-        output_tokens: The list of decoded tokens generated so far.
-
-        finished_reason: Why generation stopped: 'eos', 'max_length' or None (not finished yet).
-        error: The error message if the request failed, None otherwise.
-
-        output_queue: The communication channel to send TokenEvent, DoneEvent or ErrorEvent back to the HTTP handler.
-        generator: The random generator for sampling, initialized in prefill and used in decoding steps.
-    """
+    """Mutable state for a single in-flight generation request."""
 
     request_id: str
     sampling_params: SamplingParams
     prompt: str
 
-    # LifeCycle status of the request, used for scheduling and monitoring
     status: RequestStatus = RequestStatus.QUEUED
 
-    # Prefill related states
+    # Prefill state
     all_logits: Tensor | None = None
     past_key_values: DynamicCache | None = None
     num_prompt_tokens: int | None = None
 
-    # Decoding related states
-    num_output_tokens: int = 0
+    # Decoding state
     first_token_ns: int | None = None
     start_ns: int | None = None
     output_tokens: list[str] = field(default_factory=list)
 
     # Final results
-    finished_reason: str | None = None
+    finished_reason: FinishReason | None = None
     error: str | None = None
 
-    # Communication channel to send events back to the HTTP handler
     output_queue: Queue[TokenEvent | DoneEvent | ErrorEvent] = field(
         default_factory=Queue
     )
 
     generator: torch.Generator | None = None
+
+    @property
+    def num_output_tokens(self) -> int:
+        return len(self.output_tokens)
