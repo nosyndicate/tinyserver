@@ -119,6 +119,7 @@ class ModelRunner:
         prompt_tokens = int(inputs["input_ids"].shape[1])
         return all_logits, past_key_values, prompt_tokens
 
+    @torch.inference_mode()
     def sample_token(
         self,
         logits: torch.Tensor,
@@ -219,7 +220,7 @@ class ModelRunner:
             )
 
             # 2. if the next token is EOS, we stop generation
-            if next_token_id == self.tokenizer.eos_token_id:
+            if next_token_id == self.eos_token_id:
                 yield "", token_counter == 0, True
                 return
 
@@ -250,6 +251,10 @@ class ModelRunner:
         # max tokens reached, we stop generation
         yield "", token_counter == 0, True
 
+    @property
+    def eos_token_id(self) -> int:
+        return self.tokenizer.eos_token_id
+
 
 def load_hf_model(config: ModelConfig) -> ModelRunner:
     """Load HF model/tokenizer and return a ready ModelRunner."""
@@ -272,5 +277,3 @@ def load_hf_model(config: ModelConfig) -> ModelRunner:
     model.eval()
     log_event("model_init_done", model=config.model_name_or_path)
     return ModelRunner(model=model, tokenizer=tokenizer, device=config.device)
-
-
