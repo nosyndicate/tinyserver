@@ -1,6 +1,5 @@
 import logging
 import threading
-import time
 from queue import Empty, Queue
 
 from server.executor.executor import Executor
@@ -71,7 +70,7 @@ class Worker:
         except Exception as e:
             logger.exception(
                 "Failed to emit error event for request %s",
-                getattr(request_state, "request_id", "<unknown>"),
+                request_state.request_id,
             )
             raise e
 
@@ -169,9 +168,10 @@ class Worker:
 
                 # If there are still active, we directly continue to the next loop iteration without
                 # sleeping, to maximize throughput and minimize latency. Otherwise, we sleep for a
-                # short while to avoid busy loop.
+                # short while to avoid busy loop. Use the sleep on _shutdown_event so when shutdown
+                # signal is set, it can break the sleep immediately and exit the loop.
                 if not self._active:
-                    time.sleep(0.01)
+                    self._shutdown_event.wait(timeout=0.01)
         except Exception as e:
             # This is a background thread, no other thread is expected to catch this exception, so we log it here.
             # We also attempt to cancel all active and pending requests with an error event.
