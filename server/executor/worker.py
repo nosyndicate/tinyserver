@@ -1,4 +1,5 @@
 import logging
+import re
 import threading
 import time
 from queue import Empty, Queue
@@ -49,6 +50,32 @@ class Worker:
         # The worker thread that runs the main loop
         self._thread: threading.Thread | None = None
 
+    def _cancel_request(
+        self, request_state: GenerationRequestState, error_message: str
+    ) -> None:
+        """
+        Helper method to cancel a request with a given error message.
+        It updates the request state and emits an error event.
+
+        Raises:
+            Exception: If putting the error event into the output queue fails, the exception is propagated to the caller.
+        """
+        try:
+            request_state.status = RequestStatus.FAILED
+            request_state.error = error_message
+            request_state.output_queue.put(
+                ErrorEvent(
+                    request_id=request_state.request_id,
+                    error=request_state.error,
+                )
+            )
+        except Exception as e:
+            logger.exception(
+                "Failed to emit error event for request %s",
+                request_state.request_id,
+            )
+            raise e
+
     def _run_loop(self) -> None:
         try:
             while not self._shutdown_event.is_set():
@@ -70,18 +97,14 @@ class Worker:
                     if self._shutdown_event.is_set():
                         # Cancel this request and all remaining new + active requests
                         for pending in new_requests[i:] + self._active:
-                            pending.status = RequestStatus.FAILED
-                            pending.error = "Worker is shutting down, request rejected"
                             try:
-                                pending.output_queue.put(
-                                    ErrorEvent(
-                                        request_id=pending.request_id,
-                                        error=pending.error,
-                                    )
+                                self._cancel_request(
+                                    pending,
+                                    "Worker is shutting down, request cancelled",
                                 )
                             except Exception:
                                 logger.exception(
-                                    "Failed to emit error event for request %s",
+                                    "Failed to clean up request %s during prefill",
                                     pending.request_id,
                                 )
                         self._active.clear()
@@ -96,18 +119,14 @@ class Worker:
                     if self._shutdown_event.is_set():
                         # Cancel all active requests before exiting
                         for pending in self._active:
-                            pending.status = RequestStatus.FAILED
-                            pending.error = "Worker is shutting down, request cancelled"
                             try:
-                                pending.output_queue.put(
-                                    ErrorEvent(
-                                        request_id=pending.request_id,
-                                        error=pending.error,
-                                    )
+                                self._cancel_request(
+                                    pending,
+                                    "Worker is shutting down, request cancelled",
                                 )
                             except Exception:
                                 logger.exception(
-                                    "Failed to emit error event for request %s",
+                                    "Failed to clean up request %s during decoding",
                                     pending.request_id,
                                 )
                         self._active.clear()
