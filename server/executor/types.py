@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from queue import Queue
+from typing import Protocol
 
 import torch
 from torch import Tensor
@@ -125,3 +126,11 @@ class GenerationRequestState:
     @property
     def num_output_tokens(self) -> int:
         return len(self.output_tokens)
+
+
+class BaseExecutor(Protocol):
+    def prefill(self, request_state: GenerationRequestState) -> None: 
+        ...
+
+    def decode_one_step(self, request_state: GenerationRequestState) -> None: 
+        ...
