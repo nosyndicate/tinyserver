@@ -54,25 +54,15 @@ class Worker:
         """
         Helper method to cancel a request with a given error message.
         It updates the request state and emits an error event.
-
-        Raises:
-            Exception: If putting the error event into the output queue fails, the exception is propagated to the caller.
         """
-        try:
-            request_state.status = RequestStatus.FAILED
-            request_state.error = error_message
-            request_state.output_queue.put(
-                ErrorEvent(
-                    request_id=request_state.request_id,
-                    error=request_state.error,
-                )
+        request_state.status = RequestStatus.FAILED
+        request_state.error = error_message
+        request_state.output_queue.put(
+            ErrorEvent(
+                request_id=request_state.request_id,
+                error=request_state.error,
             )
-        except Exception as e:
-            logger.exception(
-                "Failed to emit error event for request %s",
-                request_state.request_id,
-            )
-            raise e
+        )
 
     def _handle_fatal_error(self, error: Exception) -> None:
         """Cancel all active and pending requests after an unrecoverable error."""
@@ -85,7 +75,7 @@ class Worker:
             except Exception:
                 logger.exception(
                     "Failed to emit error event for active request %s",
-                    getattr(pending, "request_id", "<unknown>"),
+                    pending.request_id,
                 )
         self._active.clear()
         # Drain the inbound queue
@@ -99,7 +89,7 @@ class Worker:
             except Exception:
                 logger.exception(
                     "Failed to emit error event for pending request %s",
-                    getattr(pending, "request_id", "<unknown>"),
+                    pending.request_id,
                 )
 
     def _run_loop(self) -> None:
@@ -225,4 +215,7 @@ class Worker:
         Raises:
             queue.Full: If the worker's inbound queue is full, indicating that the worker is overloaded.
         """
+        if self._shutdown_event.is_set():
+            raise RuntimeError("Cannot submit new request, worker is shutting down")
+
         self._inbound.put_nowait(request_state)
