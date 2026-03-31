@@ -1,5 +1,4 @@
 import logging
-import re
 import threading
 import time
 from queue import Empty, Queue
@@ -72,9 +71,37 @@ class Worker:
         except Exception as e:
             logger.exception(
                 "Failed to emit error event for request %s",
-                request_state.request_id,
+                getattr(request_state, "request_id", "<unknown>"),
             )
             raise e
+
+    def _handle_fatal_error(self, error: Exception) -> None:
+        """Cancel all active and pending requests after an unrecoverable error."""
+        logger.exception("Worker thread crashed with unexpected exception: %s", error)
+        error_message = f"Worker encountered an unexpected error: {error}"
+        # Cancel all active requests
+        for pending in self._active:
+            try:
+                self._cancel_request(pending, error_message)
+            except Exception:
+                logger.exception(
+                    "Failed to emit error event for active request %s",
+                    getattr(pending, "request_id", "<unknown>"),
+                )
+        self._active.clear()
+        # Drain the inbound queue
+        while True:
+            try:
+                pending = self._inbound.get_nowait()
+            except Empty:
+                break
+            try:
+                self._cancel_request(pending, error_message)
+            except Exception:
+                logger.exception(
+                    "Failed to emit error event for pending request %s",
+                    getattr(pending, "request_id", "<unknown>"),
+                )
 
     def _run_loop(self) -> None:
         try:
@@ -148,44 +175,7 @@ class Worker:
         except Exception as e:
             # This is a background thread, no other thread is expected to catch this exception, so we log it here.
             # We also attempt to cancel all active and pending requests with an error event.
-            logger.exception("Worker thread crashed with unexpected exception: %s", e)
-            # Cancel all active requests
-            for pending in self._active:
-                try:
-                    pending.status = RequestStatus.FAILED
-                    pending.error = f"Worker encountered an unexpected error: {e}"
-                    pending.output_queue.put(
-                        ErrorEvent(
-                            request_id=pending.request_id,
-                            error=pending.error,
-                        )
-                    )
-                except Exception:
-                    logger.exception(
-                        "Failed to emit error event for active request %s",
-                        getattr(pending, "request_id", "<unknown>"),
-                    )
-            self._active.clear()
-            # Drain the inbound queue
-            while True:
-                try:
-                    pending = self._inbound.get_nowait()
-                except Empty:
-                    break
-                try:
-                    pending.status = RequestStatus.FAILED
-                    pending.error = f"Worker encountered an unexpected error: {e}"
-                    pending.output_queue.put(
-                        ErrorEvent(
-                            request_id=pending.request_id,
-                            error=pending.error,
-                        )
-                    )
-                except Exception:
-                    logger.exception(
-                        "Failed to emit error event for pending request %s",
-                        getattr(pending, "request_id", "<unknown>"),
-                    )
+            self._handle_fatal_error(e)
 
     def start(self) -> None:
         """Create the thread and start the main loop."""
@@ -207,14 +197,7 @@ class Worker:
         while True:
             try:
                 req = self._inbound.get_nowait()
-                req.status = RequestStatus.FAILED
-                req.error = "Worker is shutting down, request rejected"
-                req.output_queue.put(
-                    ErrorEvent(
-                        request_id=req.request_id,
-                        error=req.error,
-                    )
-                )
+                self._cancel_request(req, "Worker is shutting down, request rejected")
             except Empty:
                 break
 
@@ -225,13 +208,8 @@ class Worker:
         # Since thread stopped, cancel any active requests that were still in-flight
         for pending in self._active:
             try:
-                pending.status = RequestStatus.FAILED
-                pending.error = "Worker is shutting down, request cancelled"
-                pending.output_queue.put(
-                    ErrorEvent(
-                        request_id=pending.request_id,
-                        error=pending.error,
-                    )
+                self._cancel_request(
+                    pending, "Worker is shutting down, request cancelled"
                 )
             except Exception:
                 logger.exception(
