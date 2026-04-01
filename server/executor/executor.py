@@ -122,7 +122,8 @@ class Executor(BaseExecutor):
         request_state.output_queue.put(
             DoneEvent(
                 text="".join(request_state.output_tokens),
-                num_output=request_state.num_output_tokens,
+                num_prompt_tokens=request_state.num_prompt_tokens,  # type: ignore[arg-type]
+                num_output_tokens=request_state.num_output_tokens,
                 ttft=ttft_ms,
                 total_ms=total_ms,
             )

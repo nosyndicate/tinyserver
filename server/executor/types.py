@@ -37,14 +37,16 @@ class DoneEvent:
 
     Attributes:
         text: The full decoded text for the sequence, including all tokens.
-        num_output: The number of tokens in the output sequence.
+        num_prompt_tokens: The number of tokens in the prompt.
+        num_output_tokens: The number of tokens in the output sequence.
         ttft: The time to first token in milliseconds.
         total_ms: The total time taken for the sequence generation in milliseconds.
 
     """
 
     text: str
-    num_output: int
+    num_prompt_tokens: int
+    num_output_tokens: int
 
     ttft: float
     total_ms: float
@@ -62,6 +64,9 @@ class ErrorEvent:
 
     request_id: str
     error: str
+
+
+Event = TokenEvent | DoneEvent | ErrorEvent
 
 
 @dataclass(frozen=True)
@@ -117,9 +122,7 @@ class GenerationRequestState:
     finished_reason: FinishReason | None = None
     error: str | None = None
 
-    output_queue: Queue[TokenEvent | DoneEvent | ErrorEvent] = field(
-        default_factory=Queue
-    )
+    output_queue: Queue[Event] = field(default_factory=Queue)
 
     generator: torch.Generator | None = None
 
