@@ -1,7 +1,7 @@
 """App Entrypoint"""
 
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+from typing import AsyncIterator
 
 from fastapi import FastAPI
 
@@ -13,7 +13,7 @@ from server.model.hf_runner import ModelConfig, load_hf_model
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
     Manage the lifecycle of the model, executor and worker.
     """
@@ -38,7 +38,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="LLM Inference Server (Phase 2)")
+    app = FastAPI(title="LLM Inference Server (Phase 2)", lifespan=lifespan)
     app.include_router(api_router)
     return app
 

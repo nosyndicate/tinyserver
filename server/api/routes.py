@@ -6,7 +6,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from server.api.schema import GenerateRequest, GenerateResponse, StreamChunk
-from server.executor.types import DoneEvent, ErrorEvent, Event, GenerationRequestState
+from server.executor.types import DoneEvent, ErrorEvent, Event, GenerationRequestState, TokenEvent
 from server.executor.worker import Worker
 from server.metrics.logging import log_event
 from server.metrics.timers import now_ns, ns_to_ms, timed
@@ -176,6 +176,55 @@ def generate_stream(req: GenerateRequest) -> StreamingResponse:
 
             if is_done:
                 log_event("stream_done", output_tokens=index, ttft_ms=ttft_ms)
+                return
+
+    return StreamingResponse(_event_stream(), media_type="text/event-stream")
+
+
+@router.post("/generate_stream_v2")
+def generate_stream_v2(req: GenerateRequest, request: Request) -> StreamingResponse | JSONResponse:
+    worker = _get_worker(request)
+    state = _build_request_state(req, device=request.app.state.device)
+
+    try:
+        worker.submit(state)
+    except Full:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Server at capacity. Please try again later."},
+        )
+
+    def _event_stream() -> Generator[str, None, None]:
+        while True:
+            event: Event = state.output_queue.get()  # block until there is an event
+
+            if isinstance(event, TokenEvent):
+                chunk = StreamChunk(
+                    token_str=event.token,
+                    is_first=event.is_first,
+                    is_done=event.is_last,
+                )
+                yield f"data: {chunk.model_dump_json()}\n\n"
+
+                if event.is_last:
+                    done_event = state.output_queue.get()  # Expect a DoneEvent next
+                    if isinstance(done_event, DoneEvent):
+                        log_event(
+                            "stream_done",
+                            output_tokens=done_event.num_output_tokens,
+                            ttft_ms=done_event.ttft,
+                        )
+                    
+                    return
+
+            elif isinstance(event, ErrorEvent):
+                # In case of error, we send a final chunk with is_done=True to indicate the stream is ending.
+                chunk = StreamChunk(
+                    token_str="",
+                    is_first=False,
+                    is_done=True,
+                )
+                yield f"data: {chunk.model_dump_json()}\n\n"
                 return
 
     return StreamingResponse(_event_stream(), media_type="text/event-stream")
