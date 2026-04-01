@@ -14,7 +14,6 @@ from server.model.hf_runner import ModelRunner
 
 
 class Executor(BaseExecutor):
-
     def __init__(self, runner: ModelRunner) -> None:
         self._runner = runner
 

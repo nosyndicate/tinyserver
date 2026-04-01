@@ -7,7 +7,7 @@ from server.executor.types import (
     ExecutorConfig,
     GenerationRequestState,
     RequestStatus,
-    BaseExecutor
+    BaseExecutor,
 )
 
 logger = logging.getLogger(__name__)

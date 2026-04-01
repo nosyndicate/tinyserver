@@ -26,7 +26,6 @@ LOWEST_TEMPERATURE = 1e-5
 
 
 class ModelRunner:
-
     def __init__(
         self, model: PreTrainedModel, tokenizer: PreTrainedTokenizerFast, device: str
     ) -> None:

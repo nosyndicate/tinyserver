@@ -82,6 +82,6 @@ def test_smoke_generate_text_deterministic(
             max_new_tokens=5, temperature=temperature, top_p=0.9, seed=seed + 876
         )
         alt_result = gpt2_runner.generate_text("hello", alt_params)
-        assert (
-            alt_result != results[0]
-        ), "different seeds should produce different output"
+        assert alt_result != results[0], (
+            "different seeds should produce different output"
+        )

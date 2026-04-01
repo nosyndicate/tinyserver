@@ -79,7 +79,11 @@ class _SmokeTokenizer:
         return FakeBatch({"input_ids": torch.tensor([ids], dtype=torch.long)})
 
     def decode(self, token_ids, skip_special_tokens=True):
-        ids = token_ids.tolist() if isinstance(token_ids, torch.Tensor) else list(token_ids)
+        ids = (
+            token_ids.tolist()
+            if isinstance(token_ids, torch.Tensor)
+            else list(token_ids)
+        )
         return " ".join(f"w{i}" for i in ids if i != _EOS_TOKEN_ID)
 
 

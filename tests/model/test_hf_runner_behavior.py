@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 
 import torch
-from conftest import FakeBatch, FakeTokenizer
+from conftest import FakeTokenizer
 
 from server.model.hf_runner import ModelRunner
 from server.model.sampling import SamplingParams
