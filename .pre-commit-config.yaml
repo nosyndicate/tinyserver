@@ -1,31 +1,30 @@
 default_stages: [pre-commit]
+default_install_hook_types: [pre-commit, pre-push]
 
 repos:
-  - repo: local
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.8
     hooks:
       # Auto-format code first
       - id: ruff-format
-        name: ruff format
-        entry: ruff format
-        language: system
         types_or: [python, pyi]
         stages: [pre-commit]
 
       # Lint and auto-fix issues
-      - id: ruff-check
-        name: ruff check
-        entry: ruff check --fix
-        language: system
+      - id: ruff
+        args: [--fix]
         types_or: [python, pyi]
         stages: [pre-commit]
 
+  - repo: local
+    hooks:
       # Fast test subset on commit
       - id: pytest-fast
         name: pytest fast checks
         entry: python -m pytest tests/executor/test_worker.py -v --override-ini="addopts="
         language: system
         pass_filenames: false
-        types: [python]
+        always_run: true
         stages: [pre-commit]
 
       # Full test suite on push
@@ -34,5 +33,5 @@ repos:
         entry: python -m pytest tests/ -v --override-ini="addopts="
         language: system
         pass_filenames: false
-        types: [python]
+        always_run: true
         stages: [pre-push]
