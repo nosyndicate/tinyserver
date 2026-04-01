@@ -191,7 +191,7 @@ def generate_stream(req: GenerateRequest, request: Request) -> StreamingResponse
     return StreamingResponse(_event_stream(), media_type="text/event-stream")
 
 
-@router.post("/generate_stream_v2", response_model=None)
+@router.post("/generate/stream_v2", response_model=None)
 def generate_stream_v2(
     req: GenerateRequest, request: Request
 ) -> StreamingResponse | JSONResponse:
