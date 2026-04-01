@@ -291,7 +291,9 @@ def test_submit_full_queue_raises_with_running_worker() -> None:
     try:
         worker.start()
         worker.submit(r0)
-        decode_hook.wait(timeout=2.0)  # r0 is now being decoded (active slot taken)
+        assert decode_hook.wait(
+            timeout=2.0
+        )  # r0 is now being decoded (active slot taken)
         worker.submit(r1)  # fills the single inbound queue slot
         with pytest.raises(queue.Full):
             worker.submit(r2)
@@ -543,7 +545,7 @@ def test_shutdown_between_prefill_calls_cancels_remaining() -> None:
     worker.submit(r1)
     worker.start()
 
-    first_prefill_done.wait(timeout=2.0)
+    assert first_prefill_done.wait(timeout=2.0)
     # Worker has completed r0's prefill (r0 is now in active) and is blocked.
     worker._shutdown_event.set()
     test_can_proceed.set()
@@ -795,7 +797,7 @@ def test_max_active_requests_never_exceeded() -> None:
         worker.start()
         for i in range(5):
             worker.submit(make_req(f"r{i}"))
-        decode_hook.wait(timeout=2.0)
+        assert decode_hook.wait(timeout=2.0)
         # The worker is now blocked inside decode_one_step; active list is frozen.
         assert len(worker._active) <= 2
     finally:
@@ -900,7 +902,7 @@ def test_idle_worker_with_empty_queue_does_not_crash() -> None:
     worker = make_worker()
     try:
         worker.start()
-        time.sleep(0.05)  # let the worker spin through several idle 
+        time.sleep(0.05)  # let the worker spin through several idle
         assert worker._thread is not None
         assert worker._thread.is_alive()
     finally:
