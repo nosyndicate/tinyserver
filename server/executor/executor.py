@@ -1,6 +1,7 @@
 import torch
 
 from server.executor.types import (
+    BaseExecutor,
     DoneEvent,
     ErrorEvent,
     FinishReason,
@@ -12,7 +13,7 @@ from server.metrics.timers import now_ns, ns_to_ms
 from server.model.hf_runner import ModelRunner
 
 
-class Executor:
+class Executor(BaseExecutor):
 
     def __init__(self, runner: ModelRunner) -> None:
         self._runner = runner

@@ -2,12 +2,12 @@ import logging
 import threading
 from queue import Empty, Queue
 
-from server.executor.executor import Executor
 from server.executor.types import (
     ErrorEvent,
     ExecutorConfig,
     GenerationRequestState,
     RequestStatus,
+    BaseExecutor
 )
 
 logger = logging.getLogger(__name__)
@@ -23,7 +23,7 @@ class Worker:
         worker.stop()
     """
 
-    def __init__(self, executor: Executor, config: ExecutorConfig) -> None:
+    def __init__(self, executor: BaseExecutor, config: ExecutorConfig) -> None:
         if config.max_queue_size <= 0:
             raise ValueError("max_queue_size must be positive")
         if config.max_active_requests <= 0:
@@ -64,10 +64,30 @@ class Worker:
             )
         )
 
-    def _handle_fatal_error(self, error: Exception) -> None:
-        """Cancel all active and pending requests after an unrecoverable error."""
+    def _handle_fatal_error(
+        self,
+        error: Exception,
+        extra_requests: list[GenerationRequestState] | None = None,
+    ) -> None:
+        """Cancel all active and pending requests after an unrecoverable error.
+
+        Args:
+            error: The exception that caused the fatal error.
+            extra_requests: Any additional requests that are not yet in
+                self._active or self._inbound (e.g. new_requests[i:] when a
+                prefill call raises).
+        """
         logger.exception("Worker thread crashed with unexpected exception: %s", error)
         error_message = f"Worker encountered an unexpected error: {error}"
+        # Cancel any batch-local requests that are not yet in self._active
+        for pending in extra_requests or []:
+            try:
+                self._cancel_request(pending, error_message)
+            except Exception:
+                logger.exception(
+                    "Failed to emit error event for extra request %s",
+                    pending.request_id,
+                )
         # Cancel all active requests
         for pending in self._active:
             try:
@@ -126,7 +146,11 @@ class Worker:
                         self._active.clear()
                         return
 
-                    self._executor.prefill(req)
+                    try:
+                        self._executor.prefill(req)
+                    except Exception as e:
+                        self._handle_fatal_error(e, extra_requests=new_requests[i:])
+                        return
                     if req.status == RequestStatus.DECODING:
                         self._active.append(req)
 
