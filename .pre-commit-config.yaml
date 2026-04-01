@@ -1,0 +1,38 @@
+default_stages: [pre-commit]
+
+repos:
+  - repo: local
+    hooks:
+      # Auto-format code first
+      - id: ruff-format
+        name: ruff format
+        entry: ruff format
+        language: system
+        types_or: [python, pyi]
+        stages: [pre-commit]
+
+      # Lint and auto-fix issues
+      - id: ruff-check
+        name: ruff check
+        entry: ruff check --fix
+        language: system
+        types_or: [python, pyi]
+        stages: [pre-commit]
+
+      # Fast test subset on commit
+      - id: pytest-fast
+        name: pytest fast checks
+        entry: python -m pytest tests/executor/test_worker.py -v --override-ini="addopts="
+        language: system
+        pass_filenames: false
+        types: [python]
+        stages: [pre-commit]
+
+      # Full test suite on push
+      - id: pytest-all
+        name: pytest all tests (pre-push)
+        entry: python -m pytest tests/ -v --override-ini="addopts="
+        language: system
+        pass_filenames: false
+        types: [python]
+        stages: [pre-push]
