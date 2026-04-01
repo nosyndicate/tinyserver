@@ -337,9 +337,9 @@ def test_three_concurrent_requests_all_complete() -> None:
         for req in reqs:
             worker.submit(req)
         for req in reqs:
-            assert wait_for_status(
-                req, RequestStatus.DONE
-            ), f"{req.request_id} did not complete"
+            assert wait_for_status(req, RequestStatus.DONE), (
+                f"{req.request_id} did not complete"
+            )
     finally:
         worker.stop()
 
@@ -353,9 +353,9 @@ def test_more_requests_than_max_active_all_complete() -> None:
         for req in reqs:
             worker.submit(req)
         for req in reqs:
-            assert wait_for_status(
-                req, RequestStatus.DONE
-            ), f"{req.request_id} did not complete"
+            assert wait_for_status(req, RequestStatus.DONE), (
+                f"{req.request_id} did not complete"
+            )
     finally:
         worker.stop()
 
@@ -840,9 +840,9 @@ def test_queue_drains_into_active_as_slots_free() -> None:
         for req in reqs:
             worker.submit(req)
         for req in reqs:
-            assert wait_for_status(
-                req, RequestStatus.DONE
-            ), f"{req.request_id} did not complete"
+            assert wait_for_status(req, RequestStatus.DONE), (
+                f"{req.request_id} did not complete"
+            )
     finally:
         worker.stop()
 
@@ -883,9 +883,9 @@ def test_active_list_pruned_after_iteration() -> None:
         # After the first decode loop finishes and cleanup runs, the worker starts
         # the second loop with only r2 active.  r2's second decode call signals us
         # and then blocks, freezing _active so we can safely inspect it.
-        assert r2_second_decode_started.wait(
-            timeout=2.0
-        ), "r2's second decode never started"
+        assert r2_second_decode_started.wait(timeout=2.0), (
+            "r2's second decode never started"
+        )
         active_ids = {req.request_id for req in worker._active}
         assert "r0" not in active_ids
         assert "r1" not in active_ids
@@ -957,9 +957,9 @@ def test_concurrent_submits_from_multiple_threads() -> None:
         for t in threads:
             t.join()
         for req in submitted:
-            assert wait_for_status(
-                req, RequestStatus.DONE
-            ), f"{req.request_id} did not finish"
+            assert wait_for_status(req, RequestStatus.DONE), (
+                f"{req.request_id} did not finish"
+            )
     finally:
         worker.stop()
 
