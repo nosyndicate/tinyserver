@@ -1,3 +1,4 @@
+import uuid
 from queue import Full
 from typing import Generator
 
@@ -5,7 +6,13 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from server.api.schema import GenerateRequest, GenerateResponse, StreamChunk
-from server.executor.types import DoneEvent, ErrorEvent, Event, GenerationRequestState, TokenEvent
+from server.executor.types import (
+    DoneEvent,
+    ErrorEvent,
+    Event,
+    GenerationRequestState,
+    TokenEvent,
+)
 from server.executor.worker import Worker
 from server.metrics.logging import log_event
 from server.metrics.timers import now_ns, ns_to_ms, timed
@@ -41,7 +48,7 @@ def _build_request_state(req: GenerateRequest, device: str) -> GenerationRequest
     generator = make_generator(req.seed, device)
 
     return GenerationRequestState(
-        request_id="TODO",  # Generate a unique ID for this request
+        request_id=str(uuid.uuid4()),
         sampling_params=sampling_params,
         prompt=req.prompt,
         generator=generator,
@@ -185,7 +192,9 @@ def generate_stream(req: GenerateRequest, request: Request) -> StreamingResponse
 
 
 @router.post("/generate_stream_v2", response_model=None)
-def generate_stream_v2(req: GenerateRequest, request: Request) -> StreamingResponse | JSONResponse:
+def generate_stream_v2(
+    req: GenerateRequest, request: Request
+) -> StreamingResponse | JSONResponse:
     worker = _get_worker(request)
     state = _build_request_state(req, device=request.app.state.device)
 
@@ -217,7 +226,7 @@ def generate_stream_v2(req: GenerateRequest, request: Request) -> StreamingRespo
                             output_tokens=done_event.num_output_tokens,
                             ttft_ms=done_event.ttft,
                         )
-                    
+
                     return
 
             elif isinstance(event, ErrorEvent):
