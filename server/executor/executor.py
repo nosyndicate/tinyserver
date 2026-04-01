@@ -119,12 +119,15 @@ class Executor(BaseExecutor):
             and request_state.start_ns is not None
             else -1.0
         )
-        request_state.output_queue.put(
-            DoneEvent(
-                text="".join(request_state.output_tokens),
-                num_prompt_tokens=request_state.num_prompt_tokens,  # type: ignore[arg-type]
-                num_output_tokens=request_state.num_output_tokens,
-                ttft=ttft_ms,
-                total_ms=total_ms,
-            )
+
+        assert (
+            request_state.num_prompt_tokens is not None
+        ), "num_prompt_tokens should be set by prefill"
+        done_event = DoneEvent(
+            text="".join(request_state.output_tokens),
+            num_prompt_tokens=request_state.num_prompt_tokens,
+            num_output_tokens=request_state.num_output_tokens,
+            ttft=ttft_ms,
+            total_ms=total_ms,
         )
+        request_state.output_queue.put(done_event)

@@ -108,7 +108,7 @@ def generate(req: GenerateRequest, request: Request) -> GenerateResponse:
     )
 
 
-@router.post("/generate_v2", response_model=None)
+@router.post("/generate_v2", response_model=GenerateResponse)
 def generate_v2(
     req: GenerateRequest, request: Request
 ) -> GenerateResponse | JSONResponse:
@@ -226,6 +226,23 @@ def generate_stream_v2(
                             output_tokens=done_event.num_output_tokens,
                             ttft_ms=done_event.ttft,
                         )
+                    elif isinstance(done_event, ErrorEvent):
+                        error_chunk = StreamChunk(
+                            token_str="",
+                            is_first=False,
+                            is_done=True,
+                            error=done_event.error,
+                        )
+                        yield f"data: {error_chunk.model_dump_json()}\n\n"
+                    else:
+                        # Unexpected event type after last token, yield a generic error
+                        error_chunk = StreamChunk(
+                            token_str="",
+                            is_first=False,
+                            is_done=True,
+                            error="Unexpected event type after last token",
+                        )
+                        yield f"data: {error_chunk.model_dump_json()}\n\n"
 
                     return
 
