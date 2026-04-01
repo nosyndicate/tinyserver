@@ -44,3 +44,6 @@ class StreamChunk(BaseModel):
     is_done: bool = Field(
         ..., description="Whether this is the last token in the output"
     )
+    error: str | None = Field(
+        default=None, description="Error message if generation failed, otherwise None"
+    )

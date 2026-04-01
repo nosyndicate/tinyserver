@@ -27,6 +27,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     worker = Worker(executor, executor_config)
     worker.start()
 
+    app.state.runner = runner
     app.state.worker = worker
     app.state.device = config.device
 

@@ -1,7 +1,6 @@
 from queue import Full
 from typing import Generator
 
-import torch
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -10,12 +9,15 @@ from server.executor.types import DoneEvent, ErrorEvent, Event, GenerationReques
 from server.executor.worker import Worker
 from server.metrics.logging import log_event
 from server.metrics.timers import now_ns, ns_to_ms, timed
-from server.model.hf_runner import LOWEST_TEMPERATURE, ModelConfig, load_hf_model
+from server.model.determinism import make_generator
+from server.model.hf_runner import ModelRunner
 from server.model.sampling import build_sampling_params
 
 router = APIRouter()
 
-_runner = load_hf_model(ModelConfig())
+
+def _get_runner(request: Request) -> ModelRunner:
+    return request.app.state.runner
 
 
 def _get_worker(request: Request) -> Worker:
@@ -23,7 +25,8 @@ def _get_worker(request: Request) -> Worker:
     Retrieve the worker instance from the request's app state.
     """
     worker = request.app.state.worker
-    assert worker is not None, "Worker not found in app state"
+    if worker is None:
+        raise RuntimeError("Worker not found in app state")
     return worker
 
 
@@ -35,11 +38,7 @@ def _build_request_state(req: GenerateRequest, device: str) -> GenerationRequest
         seed=req.seed,
     )
 
-    # Create a per-request random generator if temperature > 0 and seed is provided
-    if req.temperature is not None and req.temperature > LOWEST_TEMPERATURE:
-        generator = torch.Generator(req.seed, device=device)
-    else:
-        generator = None
+    generator = make_generator(req.seed, device)
 
     return GenerationRequestState(
         request_id="TODO",  # Generate a unique ID for this request
@@ -55,9 +54,10 @@ def health() -> dict[str, bool]:
 
 
 @router.post("/generate", response_model=GenerateResponse)
-def generate(req: GenerateRequest) -> GenerateResponse:
+def generate(req: GenerateRequest, request: Request) -> GenerateResponse:
     """Generate text based on the input prompt."""
 
+    runner = _get_runner(request)
     sampling_params = build_sampling_params(
         max_new_tokens=req.max_new_tokens,
         temperature=req.temperature,
@@ -73,7 +73,7 @@ def generate(req: GenerateRequest) -> GenerateResponse:
     )
 
     with timed() as total_timer:
-        text, prompt_tokens, output_tokens = _runner.generate_text(
+        text, prompt_tokens, output_tokens = runner.generate_text(
             req.prompt, sampling_params
         )
 
@@ -101,7 +101,7 @@ def generate(req: GenerateRequest) -> GenerateResponse:
     )
 
 
-@router.post("/generate_v2", response_model=GenerateResponse)
+@router.post("/generate_v2", response_model=None)
 def generate_v2(
     req: GenerateRequest, request: Request
 ) -> GenerateResponse | JSONResponse:
@@ -119,9 +119,11 @@ def generate_v2(
     while True:
         event: Event = state.output_queue.get()  # block until there is an event
 
-        # Since this is the non-streaming endpoint, we expect either a
-        # DoneEvent or an ErrorEvent as the final event.
-        if isinstance(event, DoneEvent):
+        # Since this is the non-streaming endpoint, discard intermediate tokens
+        # and wait for the terminal DoneEvent or ErrorEvent.
+        if isinstance(event, TokenEvent):
+            continue
+        elif isinstance(event, DoneEvent):
             tokens_per_s = (
                 (event.num_output_tokens / (event.total_ms / 1000.0))
                 if event.total_ms > 0
@@ -144,7 +146,8 @@ def generate_v2(
 
 
 @router.post("/generate/stream")
-def generate_stream(req: GenerateRequest) -> StreamingResponse:
+def generate_stream(req: GenerateRequest, request: Request) -> StreamingResponse:
+    runner = _get_runner(request)
     sampling_params = build_sampling_params(
         max_new_tokens=req.max_new_tokens,
         temperature=req.temperature,
@@ -157,7 +160,7 @@ def generate_stream(req: GenerateRequest) -> StreamingResponse:
         ttft_ms = None
         index = 0
 
-        for token_str, is_first_token, is_done in _runner.generate_stream(
+        for token_str, is_first_token, is_done in runner.generate_stream(
             req.prompt, sampling_params
         ):
             if is_first_token:
@@ -181,7 +184,7 @@ def generate_stream(req: GenerateRequest) -> StreamingResponse:
     return StreamingResponse(_event_stream(), media_type="text/event-stream")
 
 
-@router.post("/generate_stream_v2")
+@router.post("/generate_stream_v2", response_model=None)
 def generate_stream_v2(req: GenerateRequest, request: Request) -> StreamingResponse | JSONResponse:
     worker = _get_worker(request)
     state = _build_request_state(req, device=request.app.state.device)
@@ -218,11 +221,11 @@ def generate_stream_v2(req: GenerateRequest, request: Request) -> StreamingRespo
                     return
 
             elif isinstance(event, ErrorEvent):
-                # In case of error, we send a final chunk with is_done=True to indicate the stream is ending.
                 chunk = StreamChunk(
                     token_str="",
                     is_first=False,
                     is_done=True,
+                    error=event.error,
                 )
                 yield f"data: {chunk.model_dump_json()}\n\n"
                 return
