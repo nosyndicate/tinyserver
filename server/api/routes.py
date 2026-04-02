@@ -1,17 +1,69 @@
+import uuid
+from queue import Empty, Full
 from typing import Generator
 
-from fastapi import APIRouter
-from fastapi.responses import StreamingResponse
+_GENERATION_TIMEOUT_S = 300  # 5 minutes
+
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from server.api.schema import GenerateRequest, GenerateResponse, StreamChunk
+from server.executor.types import (
+    DoneEvent,
+    ErrorEvent,
+    Event,
+    GenerationRequestState,
+    TokenEvent,
+)
+from server.executor.worker import Worker
 from server.metrics.logging import log_event
 from server.metrics.timers import now_ns, ns_to_ms, timed
-from server.model.hf_runner import ModelConfig, load_hf_model
+from server.model.determinism import make_generator
+from server.model.hf_runner import ModelRunner
 from server.model.sampling import build_sampling_params
 
 router = APIRouter()
 
-_runner = load_hf_model(ModelConfig())
+
+def _get_runner(request: Request) -> ModelRunner:
+    """
+    Retrieve the model runner instance from the request's app state.
+    """
+    runner = request.app.state.runner
+    if runner is None:
+        raise RuntimeError("Model runner not found in app state")
+    return runner
+
+
+def _get_worker(request: Request) -> Worker:
+    """
+    Retrieve the worker instance from the request's app state.
+    """
+    worker = request.app.state.worker
+    if worker is None:
+        raise RuntimeError("Worker not found in app state")
+    return worker
+
+
+def _build_request_state(req: GenerateRequest, device: str) -> GenerationRequestState:
+    """
+    Build a GenerationRequestState from the incoming request and device.
+    """
+    sampling_params = build_sampling_params(
+        max_new_tokens=req.max_new_tokens,
+        temperature=req.temperature,
+        top_p=req.top_p,
+        seed=req.seed,
+    )
+
+    generator = make_generator(req.seed, device)
+
+    return GenerationRequestState(
+        request_id=str(uuid.uuid4()),
+        sampling_params=sampling_params,
+        prompt=req.prompt,
+        generator=generator,
+    )
 
 
 @router.get("/health")
@@ -20,9 +72,10 @@ def health() -> dict[str, bool]:
 
 
 @router.post("/generate", response_model=GenerateResponse)
-def generate(req: GenerateRequest) -> GenerateResponse:
+def generate(req: GenerateRequest, request: Request) -> GenerateResponse:
     """Generate text based on the input prompt."""
 
+    runner = _get_runner(request)
     sampling_params = build_sampling_params(
         max_new_tokens=req.max_new_tokens,
         temperature=req.temperature,
@@ -38,7 +91,7 @@ def generate(req: GenerateRequest) -> GenerateResponse:
     )
 
     with timed() as total_timer:
-        text, prompt_tokens, output_tokens = _runner.generate_text(
+        text, prompt_tokens, output_tokens = runner.generate_text(
             req.prompt, sampling_params
         )
 
@@ -66,8 +119,59 @@ def generate(req: GenerateRequest) -> GenerateResponse:
     )
 
 
+@router.post("/generate_v2", response_model=GenerateResponse)
+def generate_v2(
+    req: GenerateRequest, request: Request
+) -> GenerateResponse | JSONResponse:
+    worker = _get_worker(request)
+    state = _build_request_state(req, device=request.app.state.device)
+
+    try:
+        worker.submit(state)
+    except Full:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Server at capacity. Please try again later."},
+        )
+
+    while True:
+        try:
+            event: Event = state.output_queue.get(timeout=_GENERATION_TIMEOUT_S)
+        except Empty:
+            return JSONResponse(
+                status_code=504,
+                content={"error": "Generation timed out."},
+            )
+
+        # Since this is the non-streaming endpoint, discard intermediate tokens
+        # and wait for the terminal DoneEvent or ErrorEvent.
+        if isinstance(event, TokenEvent):
+            continue
+        elif isinstance(event, DoneEvent):
+            tokens_per_s = (
+                (event.num_output_tokens / (event.total_ms / 1000.0))
+                if event.total_ms > 0
+                else 0.0
+            )
+
+            return GenerateResponse(
+                text=event.text,
+                prompt_tokens=event.num_prompt_tokens,
+                output_tokens=event.num_output_tokens,
+                ttft_ms=event.ttft,
+                total_ms=event.total_ms,
+                tokens_per_s=tokens_per_s,
+            )
+        elif isinstance(event, ErrorEvent):
+            return JSONResponse(
+                status_code=500,
+                content={"error": f"Generation failed: {event.error}"},
+            )
+
+
 @router.post("/generate/stream")
-def generate_stream(req: GenerateRequest) -> StreamingResponse:
+def generate_stream(req: GenerateRequest, request: Request) -> StreamingResponse:
+    runner = _get_runner(request)
     sampling_params = build_sampling_params(
         max_new_tokens=req.max_new_tokens,
         temperature=req.temperature,
@@ -80,7 +184,7 @@ def generate_stream(req: GenerateRequest) -> StreamingResponse:
         ttft_ms = None
         index = 0
 
-        for token_str, is_first_token, is_done in _runner.generate_stream(
+        for token_str, is_first_token, is_done in runner.generate_stream(
             req.prompt, sampling_params
         ):
             if is_first_token:
@@ -99,6 +203,97 @@ def generate_stream(req: GenerateRequest) -> StreamingResponse:
 
             if is_done:
                 log_event("stream_done", output_tokens=index, ttft_ms=ttft_ms)
+                return
+
+    return StreamingResponse(_event_stream(), media_type="text/event-stream")
+
+
+@router.post("/generate/stream_v2", response_model=None)
+def generate_stream_v2(
+    req: GenerateRequest, request: Request
+) -> StreamingResponse | JSONResponse:
+    worker = _get_worker(request)
+    state = _build_request_state(req, device=request.app.state.device)
+
+    try:
+        worker.submit(state)
+    except Full:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Server at capacity. Please try again later."},
+        )
+
+    def _event_stream() -> Generator[str, None, None]:
+        while True:
+            try:
+                event: Event = state.output_queue.get(timeout=_GENERATION_TIMEOUT_S)
+            except Empty:
+                error_chunk = StreamChunk(
+                    token_str="",
+                    is_first=False,
+                    is_done=True,
+                    error="Generation timed out.",
+                )
+                yield f"data: {error_chunk.model_dump_json()}\n\n"
+                return
+
+            if isinstance(event, TokenEvent):
+                chunk = StreamChunk(
+                    token_str=event.token,
+                    is_first=event.is_first,
+                    is_done=event.is_last,
+                )
+                yield f"data: {chunk.model_dump_json()}\n\n"
+
+                # If this is the last token, we expect a DoneEvent or ErrorEvent to follow
+                if event.is_last:
+                    try:
+                        done_event = state.output_queue.get(
+                            timeout=_GENERATION_TIMEOUT_S
+                        )
+                    except Empty:
+                        error_chunk = StreamChunk(
+                            token_str="",
+                            is_first=False,
+                            is_done=True,
+                            error="Generation timed out waiting for final event.",
+                        )
+                        yield f"data: {error_chunk.model_dump_json()}\n\n"
+                        return
+                    if isinstance(done_event, DoneEvent):
+                        log_event(
+                            "stream_done",
+                            output_tokens=done_event.num_output_tokens,
+                            ttft_ms=done_event.ttft,
+                        )
+                    elif isinstance(done_event, ErrorEvent):
+                        error_chunk = StreamChunk(
+                            token_str="",
+                            is_first=False,
+                            is_done=True,
+                            error=done_event.error,
+                        )
+                        yield f"data: {error_chunk.model_dump_json()}\n\n"
+                    else:
+                        # Unexpected event type after last token, yield a generic error
+                        error_chunk = StreamChunk(
+                            token_str="",
+                            is_first=False,
+                            is_done=True,
+                            error="Unexpected event type after last token",
+                        )
+                        yield f"data: {error_chunk.model_dump_json()}\n\n"
+
+                    return
+
+            elif isinstance(event, ErrorEvent):
+                chunk = StreamChunk(
+                    token_str="",
+                    is_first=False,
+                    is_done=True,
+                    error=event.error,
+                )
+                yield f"data: {chunk.model_dump_json()}\n\n"
                 return
 
     return StreamingResponse(_event_stream(), media_type="text/event-stream")
