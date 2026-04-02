@@ -2,10 +2,8 @@ import uuid
 from queue import Empty, Full
 from typing import Generator
 
-_GENERATION_TIMEOUT_S = 300  # 5 minutes
-
-from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse
 
 from server.api.schema import GenerateRequest, GenerateResponse, StreamChunk
 from server.executor.types import (
@@ -21,6 +19,9 @@ from server.metrics.timers import now_ns, ns_to_ms, timed
 from server.model.determinism import make_generator
 from server.model.hf_runner import ModelRunner
 from server.model.sampling import build_sampling_params
+
+_GENERATION_TIMEOUT_S = 300  # 5 minutes
+
 
 router = APIRouter()
 
@@ -120,27 +121,25 @@ def generate(req: GenerateRequest, request: Request) -> GenerateResponse:
 
 
 @router.post("/generate_v2", response_model=GenerateResponse)
-def generate_v2(
-    req: GenerateRequest, request: Request
-) -> GenerateResponse | JSONResponse:
+def generate_v2(req: GenerateRequest, request: Request) -> GenerateResponse:
     worker = _get_worker(request)
     state = _build_request_state(req, device=request.app.state.device)
 
     try:
         worker.submit(state)
     except Full:
-        return JSONResponse(
+        raise HTTPException(
             status_code=503,
-            content={"error": "Server at capacity. Please try again later."},
+            detail="Server at capacity. Please try again later.",
         )
 
     while True:
         try:
             event: Event = state.output_queue.get(timeout=_GENERATION_TIMEOUT_S)
         except Empty:
-            return JSONResponse(
+            raise HTTPException(
                 status_code=504,
-                content={"error": "Generation timed out."},
+                detail="Generation timed out.",
             )
 
         # Since this is the non-streaming endpoint, discard intermediate tokens
@@ -163,9 +162,9 @@ def generate_v2(
                 tokens_per_s=tokens_per_s,
             )
         elif isinstance(event, ErrorEvent):
-            return JSONResponse(
+            raise HTTPException(
                 status_code=500,
-                content={"error": f"Generation failed: {event.error}"},
+                detail=f"Generation failed: {event.error}",
             )
 
 
@@ -209,18 +208,16 @@ def generate_stream(req: GenerateRequest, request: Request) -> StreamingResponse
 
 
 @router.post("/generate/stream_v2", response_model=None)
-def generate_stream_v2(
-    req: GenerateRequest, request: Request
-) -> StreamingResponse | JSONResponse:
+def generate_stream_v2(req: GenerateRequest, request: Request) -> StreamingResponse:
     worker = _get_worker(request)
     state = _build_request_state(req, device=request.app.state.device)
 
     try:
         worker.submit(state)
     except Full:
-        return JSONResponse(
+        raise HTTPException(
             status_code=503,
-            content={"error": "Server at capacity. Please try again later."},
+            detail="Server at capacity. Please try again later.",
         )
 
     def _event_stream() -> Generator[str, None, None]:
