@@ -106,32 +106,42 @@ class Executor(BaseExecutor):
         )
 
     def _finish(self, request_state: GenerationRequestState) -> None:
+        """
+        Finalize the request and emit a DoneEvent.
+
+        Precondition: start_ns must be set (set in prefill() before decode_one_step() is called).
+        """
         request_state.status = RequestStatus.DONE
         end_ns = now_ns()
-        total_ms = (
-            ns_to_ms(end_ns - request_state.start_ns)
-            if request_state.start_ns is not None
-            else -1.0
-        )
+
+        # start_ns is always set by prefill() before _finish() can be called.
+        if request_state.start_ns is None:
+            raise RuntimeError("start_ns must be set before _finish()")
+
+        if request_state.enqueued_ns is None:
+            raise RuntimeError("enqueued_ns must be set before _finish()")
+
+        total_ms = ns_to_ms(end_ns - request_state.start_ns)
+        # queue_wait_ms is the time from when the request was enqueued to when execution started.
+        # We max with 0 to avoid negative queue wait time in cases where the clock is not perfectly
+        # monotonic or if there are any timing anomalies.
         queue_wait_ms = max(
-            ns_to_ms(request_state.start_ns - request_state.enqueued_ns)
-            if request_state.start_ns is not None
-            and request_state.enqueued_ns is not None
-            else 0.0,
+            (
+                ns_to_ms(request_state.start_ns - request_state.enqueued_ns)
+                if request_state.enqueued_ns is not None
+                else 0.0
+            ),
             0.0,
         )
         ttft_ms = (
             ns_to_ms(request_state.first_token_ns - request_state.start_ns)
             if request_state.first_token_ns is not None
-            and request_state.start_ns is not None
             else -1.0
         )
         # execution_ms is the time spent executing (total_ms - queue_wait_ms).
-        # Propagate the -1.0 sentinel if total_ms is invalid.
-        if total_ms < 0:
-            execution_ms = total_ms
-        else:
-            execution_ms = total_ms - queue_wait_ms
+        # We max with 0 to avoid negative execution time in cases where the clock
+        # is not perfectly monotonic or if there are any timing anomalies.
+        execution_ms = max(total_ms - queue_wait_ms, 0.0)
 
         if request_state.num_prompt_tokens is None:
             raise RuntimeError("num_prompt_tokens is required to finish the request")
