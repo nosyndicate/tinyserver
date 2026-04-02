@@ -43,8 +43,6 @@ class DoneEvent:
         total_ms: The total time from the start of prefill to completion in milliseconds.
         queue_wait_ms: The time spent waiting in the queue before prefill started, in milliseconds.
         execution_ms: Time spent executing after leaving the queue (total_ms - queue_wait_ms).
-            Equals -1.0 if total_ms is invalid.
-
     """
 
     text: str

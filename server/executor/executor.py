@@ -126,11 +126,7 @@ class Executor(BaseExecutor):
         # We max with 0 to avoid negative queue wait time in cases where the clock is not perfectly
         # monotonic or if there are any timing anomalies.
         queue_wait_ms = max(
-            (
-                ns_to_ms(request_state.start_ns - request_state.enqueued_ns)
-                if request_state.enqueued_ns is not None
-                else 0.0
-            ),
+            ns_to_ms(request_state.start_ns - request_state.enqueued_ns),
             0.0,
         )
         ttft_ms = (
