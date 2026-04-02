@@ -64,7 +64,6 @@ def _build_request_state(req: GenerateRequest, device: str) -> GenerationRequest
         sampling_params=sampling_params,
         prompt=req.prompt,
         generator=generator,
-        enqueued_ns=now_ns(),
     )
 
 

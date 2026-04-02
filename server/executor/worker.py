@@ -9,6 +9,7 @@ from server.executor.types import (
     RequestStatus,
     BaseExecutor,
 )
+from server.metrics.timers import now_ns
 
 logger = logging.getLogger(__name__)
 
@@ -242,4 +243,5 @@ class Worker:
         if self._shutdown_event.is_set():
             raise RuntimeError("Cannot submit new request, worker is shutting down")
 
+        request_state.enqueued_ns = now_ns()
         self._inbound.put_nowait(request_state)
