@@ -42,7 +42,8 @@ class DoneEvent:
         ttft: The time to first token in milliseconds (from start of prefill to first token).
         total_ms: The total time from the start of prefill to completion in milliseconds.
         queue_wait_ms: The time spent waiting in the queue before prefill started, in milliseconds.
-        execution_ms: The total execution time (same as total_ms, clamped to non-negative).
+        execution_ms: Time spent executing after leaving the queue (total_ms - queue_wait_ms).
+            Equals -1.0 if total_ms is invalid.
 
     """
 
@@ -120,6 +121,8 @@ class GenerationRequestState:
     # Decoding state
     first_token_ns: int | None = None
     start_ns: int | None = None
+    # Set in routes.py before submit(), read in executor._finish().
+    # Queue.put/get provides happens-before guarantee, no extra sync needed.
     enqueued_ns: int | None = None
     output_tokens: list[str] = field(default_factory=list)
 

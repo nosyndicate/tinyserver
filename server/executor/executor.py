@@ -126,7 +126,12 @@ class Executor(BaseExecutor):
             and request_state.start_ns is not None
             else -1.0
         )
-        execution_ms = max(total_ms, 0.0)
+        # execution_ms is the time spent executing (total_ms - queue_wait_ms).
+        # Propagate the -1.0 sentinel if total_ms is invalid.
+        if total_ms < 0:
+            execution_ms = total_ms
+        else:
+            execution_ms = total_ms - queue_wait_ms
 
         if request_state.num_prompt_tokens is None:
             raise RuntimeError("num_prompt_tokens is required to finish the request")

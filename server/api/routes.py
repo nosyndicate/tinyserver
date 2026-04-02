@@ -23,6 +23,11 @@ from server.model.sampling import build_sampling_params
 _GENERATION_TIMEOUT_S = 300  # 5 minutes
 
 
+def _compute_tokens_per_s(num_output_tokens: int, total_ms: float) -> float:
+    """Compute tokens per second from output token count and total time."""
+    return (num_output_tokens / (total_ms / 1000.0)) if total_ms > 0 else 0.0
+
+
 router = APIRouter()
 
 
@@ -100,7 +105,7 @@ def generate(req: GenerateRequest, request: Request) -> GenerateResponse:
 
     # We don't have streaming right now, so ttft_ms is the same as total_ms.
     ttft_ms = total_ms
-    tokens_per_s = (output_tokens / (total_ms / 1000.0)) if total_ms > 0 else 0.0
+    tokens_per_s = _compute_tokens_per_s(output_tokens, total_ms)
 
     log_event(
         "request_done",
@@ -118,7 +123,7 @@ def generate(req: GenerateRequest, request: Request) -> GenerateResponse:
         total_ms=total_ms,
         tokens_per_s=tokens_per_s,
         queue_wait_ms=0.0,
-        execution_ms=total_ms,
+        execution_ms=total_ms,  # V1 doesn't queue, so execution_ms == total_ms
     )
 
 
@@ -149,10 +154,8 @@ def generate_v2(req: GenerateRequest, request: Request) -> GenerateResponse:
         if isinstance(event, TokenEvent):
             continue
         elif isinstance(event, DoneEvent):
-            tokens_per_s = (
-                (event.num_output_tokens / (event.total_ms / 1000.0))
-                if event.total_ms > 0
-                else 0.0
+            tokens_per_s = _compute_tokens_per_s(
+                event.num_output_tokens, event.total_ms
             )
 
             return GenerateResponse(
@@ -235,12 +238,14 @@ def generate_stream_v2(req: GenerateRequest, request: Request) -> StreamingRespo
                     is_done=True,
                     error="Generation timed out.",
                 )
-                yield f"data: {error_chunk.model_dump_json()}\n\n"
+                yield f"data: {error_chunk.model_dump_json(exclude_none=True)}\n\n"
                 return
 
             if isinstance(event, TokenEvent):
                 # For the final token, wait for the terminal DoneEvent so the last SSE
                 # payload can carry the same timing metadata as /generate_v2.
+                # Note: this introduces a small latency for the final token as it's
+                # held until the executor finishes cleanup and emits DoneEvent.
                 if event.is_last:
                     try:
                         done_event = state.output_queue.get(
@@ -253,16 +258,11 @@ def generate_stream_v2(req: GenerateRequest, request: Request) -> StreamingRespo
                             is_done=True,
                             error="Generation timed out waiting for final event.",
                         )
-                        yield f"data: {error_chunk.model_dump_json()}\n\n"
+                        yield f"data: {error_chunk.model_dump_json(exclude_none=True)}\n\n"
                         return
                     if isinstance(done_event, DoneEvent):
-                        tokens_per_s = (
-                            (
-                                done_event.num_output_tokens
-                                / (done_event.total_ms / 1000.0)
-                            )
-                            if done_event.total_ms > 0
-                            else 0.0
+                        tokens_per_s = _compute_tokens_per_s(
+                            done_event.num_output_tokens, done_event.total_ms
                         )
                         chunk = StreamChunk(
                             token_str=event.token,
@@ -276,7 +276,7 @@ def generate_stream_v2(req: GenerateRequest, request: Request) -> StreamingRespo
                             queue_wait_ms=done_event.queue_wait_ms,
                             execution_ms=done_event.execution_ms,
                         )
-                        yield f"data: {chunk.model_dump_json()}\n\n"
+                        yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
                         log_event(
                             "stream_done",
                             output_tokens=done_event.num_output_tokens,
@@ -289,7 +289,7 @@ def generate_stream_v2(req: GenerateRequest, request: Request) -> StreamingRespo
                             is_done=True,
                             error=done_event.error,
                         )
-                        yield f"data: {error_chunk.model_dump_json()}\n\n"
+                        yield f"data: {error_chunk.model_dump_json(exclude_none=True)}\n\n"
                     else:
                         # Unexpected event type after last token, yield a generic error
                         error_chunk = StreamChunk(
@@ -298,7 +298,7 @@ def generate_stream_v2(req: GenerateRequest, request: Request) -> StreamingRespo
                             is_done=True,
                             error="Unexpected event type after last token",
                         )
-                        yield f"data: {error_chunk.model_dump_json()}\n\n"
+                        yield f"data: {error_chunk.model_dump_json(exclude_none=True)}\n\n"
 
                     return
                 chunk = StreamChunk(
@@ -306,7 +306,7 @@ def generate_stream_v2(req: GenerateRequest, request: Request) -> StreamingRespo
                     is_first=event.is_first,
                     is_done=False,
                 )
-                yield f"data: {chunk.model_dump_json()}\n\n"
+                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
             elif isinstance(event, ErrorEvent):
                 chunk = StreamChunk(
@@ -315,7 +315,7 @@ def generate_stream_v2(req: GenerateRequest, request: Request) -> StreamingRespo
                     is_done=True,
                     error=event.error,
                 )
-                yield f"data: {chunk.model_dump_json()}\n\n"
+                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
                 return
 
     return StreamingResponse(_event_stream(), media_type="text/event-stream")
