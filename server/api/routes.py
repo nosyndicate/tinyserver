@@ -64,6 +64,7 @@ def _build_request_state(req: GenerateRequest, device: str) -> GenerationRequest
         sampling_params=sampling_params,
         prompt=req.prompt,
         generator=generator,
+        enqueued_ns=now_ns(),
     )
 
 
@@ -117,6 +118,8 @@ def generate(req: GenerateRequest, request: Request) -> GenerateResponse:
         ttft_ms=ttft_ms,
         total_ms=total_ms,
         tokens_per_s=tokens_per_s,
+        queue_wait_ms=0.0,
+        execution_ms=total_ms,
     )
 
 
@@ -160,6 +163,8 @@ def generate_v2(req: GenerateRequest, request: Request) -> GenerateResponse:
                 ttft_ms=event.ttft,
                 total_ms=event.total_ms,
                 tokens_per_s=tokens_per_s,
+                queue_wait_ms=event.queue_wait_ms,
+                execution_ms=event.execution_ms,
             )
         elif isinstance(event, ErrorEvent):
             raise HTTPException(
@@ -235,14 +240,8 @@ def generate_stream_v2(req: GenerateRequest, request: Request) -> StreamingRespo
                 return
 
             if isinstance(event, TokenEvent):
-                chunk = StreamChunk(
-                    token_str=event.token,
-                    is_first=event.is_first,
-                    is_done=event.is_last,
-                )
-                yield f"data: {chunk.model_dump_json()}\n\n"
-
-                # If this is the last token, we expect a DoneEvent or ErrorEvent to follow
+                # For the final token, wait for the terminal DoneEvent so the last SSE
+                # payload can carry the same timing metadata as /generate_v2.
                 if event.is_last:
                     try:
                         done_event = state.output_queue.get(
@@ -258,6 +257,27 @@ def generate_stream_v2(req: GenerateRequest, request: Request) -> StreamingRespo
                         yield f"data: {error_chunk.model_dump_json()}\n\n"
                         return
                     if isinstance(done_event, DoneEvent):
+                        tokens_per_s = (
+                            (
+                                done_event.num_output_tokens
+                                / (done_event.total_ms / 1000.0)
+                            )
+                            if done_event.total_ms > 0
+                            else 0.0
+                        )
+                        chunk = StreamChunk(
+                            token_str=event.token,
+                            is_first=event.is_first,
+                            is_done=True,
+                            prompt_tokens=done_event.num_prompt_tokens,
+                            output_tokens=done_event.num_output_tokens,
+                            ttft_ms=done_event.ttft,
+                            total_ms=done_event.total_ms,
+                            tokens_per_s=tokens_per_s,
+                            queue_wait_ms=done_event.queue_wait_ms,
+                            execution_ms=done_event.execution_ms,
+                        )
+                        yield f"data: {chunk.model_dump_json()}\n\n"
                         log_event(
                             "stream_done",
                             output_tokens=done_event.num_output_tokens,
@@ -282,6 +302,12 @@ def generate_stream_v2(req: GenerateRequest, request: Request) -> StreamingRespo
                         yield f"data: {error_chunk.model_dump_json()}\n\n"
 
                     return
+                chunk = StreamChunk(
+                    token_str=event.token,
+                    is_first=event.is_first,
+                    is_done=False,
+                )
+                yield f"data: {chunk.model_dump_json()}\n\n"
 
             elif isinstance(event, ErrorEvent):
                 chunk = StreamChunk(

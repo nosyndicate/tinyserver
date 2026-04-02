@@ -113,12 +113,19 @@ class Executor(BaseExecutor):
             if request_state.start_ns is not None
             else -1.0
         )
+        queue_wait_ms = (
+            ns_to_ms(request_state.start_ns - request_state.enqueued_ns)
+            if request_state.start_ns is not None
+            and request_state.enqueued_ns is not None
+            else 0.0
+        )
         ttft_ms = (
             ns_to_ms(request_state.first_token_ns - request_state.start_ns)
             if request_state.first_token_ns is not None
             and request_state.start_ns is not None
             else -1.0
         )
+        execution_ms = max(total_ms, 0.0)
 
         if request_state.num_prompt_tokens is None:
             raise RuntimeError("num_prompt_tokens is required to finish the request")
@@ -129,5 +136,7 @@ class Executor(BaseExecutor):
             num_output_tokens=request_state.num_output_tokens,
             ttft=ttft_ms,
             total_ms=total_ms,
+            queue_wait_ms=queue_wait_ms,
+            execution_ms=execution_ms,
         )
         request_state.output_queue.put(done_event)

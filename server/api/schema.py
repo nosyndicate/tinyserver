@@ -32,6 +32,16 @@ class GenerateResponse(BaseModel):
     tokens_per_s: float = Field(
         ..., ge=0.0, description="Generation speed in tokens per second"
     )
+    queue_wait_ms: float = Field(
+        0.0,
+        ge=0.0,
+        description="Time spent waiting in the server queue before execution",
+    )
+    execution_ms: float = Field(
+        0.0,
+        ge=0.0,
+        description="Time spent executing after the request left the queue",
+    )
 
 
 class StreamChunk(BaseModel):
@@ -46,4 +56,29 @@ class StreamChunk(BaseModel):
     )
     error: str | None = Field(
         default=None, description="Error message if generation failed, otherwise None"
+    )
+    prompt_tokens: int | None = Field(
+        default=None, ge=0, description="Prompt token count when known"
+    )
+    output_tokens: int | None = Field(
+        default=None, ge=0, description="Output token count when known"
+    )
+    ttft_ms: float | None = Field(
+        default=None, ge=0.0, description="Time to first token in milliseconds"
+    )
+    total_ms: float | None = Field(
+        default=None, ge=0.0, description="Total generation time in milliseconds"
+    )
+    tokens_per_s: float | None = Field(
+        default=None, ge=0.0, description="Generation speed in tokens per second"
+    )
+    queue_wait_ms: float | None = Field(
+        default=None,
+        ge=0.0,
+        description="Time spent waiting in the server queue before execution",
+    )
+    execution_ms: float | None = Field(
+        default=None,
+        ge=0.0,
+        description="Time spent executing after the request left the queue",
     )

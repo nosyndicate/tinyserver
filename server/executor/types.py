@@ -50,6 +50,8 @@ class DoneEvent:
 
     ttft: float
     total_ms: float
+    queue_wait_ms: float
+    execution_ms: float
 
 
 @dataclass(frozen=True)
@@ -116,6 +118,7 @@ class GenerationRequestState:
     # Decoding state
     first_token_ns: int | None = None
     start_ns: int | None = None
+    enqueued_ns: int | None = None
     output_tokens: list[str] = field(default_factory=list)
 
     # Final results
