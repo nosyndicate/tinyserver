@@ -32,4 +32,4 @@ markers = [
 ]
 
 [tool.ruff.lint]
-select = ["I"]
+extend-select = ["I"]
