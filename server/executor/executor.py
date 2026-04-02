@@ -120,9 +120,9 @@ class Executor(BaseExecutor):
             else -1.0
         )
 
-        assert (
-            request_state.num_prompt_tokens is not None
-        ), "num_prompt_tokens should be set by prefill"
+        if request_state.num_prompt_tokens is None:
+            raise RuntimeError("num_prompt_tokens is required to finish the request")
+
         done_event = DoneEvent(
             text="".join(request_state.output_tokens),
             num_prompt_tokens=request_state.num_prompt_tokens,

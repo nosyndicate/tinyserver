@@ -1,6 +1,8 @@
 import uuid
-from queue import Full
+from queue import Empty, Full
 from typing import Generator
+
+_GENERATION_TIMEOUT_S = 300  # 5 minutes
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -24,7 +26,13 @@ router = APIRouter()
 
 
 def _get_runner(request: Request) -> ModelRunner:
-    return request.app.state.runner
+    """
+    Retrieve the model runner instance from the request's app state.
+    """
+    runner = request.app.state.runner
+    if runner is None:
+        raise RuntimeError("Model runner not found in app state")
+    return runner
 
 
 def _get_worker(request: Request) -> Worker:
@@ -38,6 +46,9 @@ def _get_worker(request: Request) -> Worker:
 
 
 def _build_request_state(req: GenerateRequest, device: str) -> GenerationRequestState:
+    """
+    Build a GenerationRequestState from the incoming request and device.
+    """
     sampling_params = build_sampling_params(
         max_new_tokens=req.max_new_tokens,
         temperature=req.temperature,
@@ -124,7 +135,13 @@ def generate_v2(
         )
 
     while True:
-        event: Event = state.output_queue.get()  # block until there is an event
+        try:
+            event: Event = state.output_queue.get(timeout=_GENERATION_TIMEOUT_S)
+        except Empty:
+            return JSONResponse(
+                status_code=504,
+                content={"error": "Generation timed out."},
+            )
 
         # Since this is the non-streaming endpoint, discard intermediate tokens
         # and wait for the terminal DoneEvent or ErrorEvent.
@@ -208,7 +225,17 @@ def generate_stream_v2(
 
     def _event_stream() -> Generator[str, None, None]:
         while True:
-            event: Event = state.output_queue.get()  # block until there is an event
+            try:
+                event: Event = state.output_queue.get(timeout=_GENERATION_TIMEOUT_S)
+            except Empty:
+                error_chunk = StreamChunk(
+                    token_str="",
+                    is_first=False,
+                    is_done=True,
+                    error="Generation timed out.",
+                )
+                yield f"data: {error_chunk.model_dump_json()}\n\n"
+                return
 
             if isinstance(event, TokenEvent):
                 chunk = StreamChunk(
@@ -218,8 +245,21 @@ def generate_stream_v2(
                 )
                 yield f"data: {chunk.model_dump_json()}\n\n"
 
+                # If this is the last token, we expect a DoneEvent or ErrorEvent to follow
                 if event.is_last:
-                    done_event = state.output_queue.get()  # Expect a DoneEvent next
+                    try:
+                        done_event = state.output_queue.get(
+                            timeout=_GENERATION_TIMEOUT_S
+                        )
+                    except Empty:
+                        error_chunk = StreamChunk(
+                            token_str="",
+                            is_first=False,
+                            is_done=True,
+                            error="Generation timed out waiting for final event.",
+                        )
+                        yield f"data: {error_chunk.model_dump_json()}\n\n"
+                        return
                     if isinstance(done_event, DoneEvent):
                         log_event(
                             "stream_done",
