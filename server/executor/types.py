@@ -39,8 +39,10 @@ class DoneEvent:
         text: The full decoded text for the sequence, including all tokens.
         num_prompt_tokens: The number of tokens in the prompt.
         num_output_tokens: The number of tokens in the output sequence.
-        ttft: The time to first token in milliseconds.
-        total_ms: The total time taken for the sequence generation in milliseconds.
+        ttft: The time to first token in milliseconds (from start of prefill to first token).
+        total_ms: The total time from the start of prefill to completion in milliseconds.
+        queue_wait_ms: The time spent waiting in the queue before prefill started, in milliseconds.
+        execution_ms: The total execution time (same as total_ms, clamped to non-negative).
 
     """
 
