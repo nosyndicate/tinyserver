@@ -30,3 +30,6 @@ python_files = ["test_*.py"]
 markers = [
     "smoke: end-to-end tests using a real randomly-initialized model (slower)",
 ]
+
+[tool.ruff.lint]
+extend-select = ["I"]
