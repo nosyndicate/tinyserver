@@ -1,19 +1,14 @@
 from __future__ import annotations
 
-import importlib.util
 import json
-import sys
 from argparse import Namespace
-from pathlib import Path
 from typing import Any
 
-
-BENCH_PATH = Path(__file__).resolve().parents[2] / "scripts" / "bench.py"
-SPEC = importlib.util.spec_from_file_location("bench_module", BENCH_PATH)
-assert SPEC is not None and SPEC.loader is not None
-bench = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = bench
-SPEC.loader.exec_module(bench)
+import scripts.bench.runners as bench_runners
+from scripts.bench.metrics import _summarize_results
+from scripts.bench.models import RequestPlan, RequestResult
+from scripts.bench.runners import _run_stream_request
+from scripts.bench.scenarios import _default_scenarios, _load_scenarios
 
 
 def test_load_scenarios_merges_json_file(tmp_path) -> None:
@@ -40,7 +35,7 @@ def test_load_scenarios_merges_json_file(tmp_path) -> None:
         )
     )
 
-    scenarios = bench._load_scenarios(str(scenario_file))
+    scenarios = _load_scenarios(str(scenario_file))
 
     assert "short_short" in scenarios
     assert scenarios["custom"].description == "custom scenario"
@@ -54,9 +49,9 @@ def test_summarize_results_reports_failures_and_percentiles() -> None:
         endpoint="stream_v2",
         mode="closed",
     )
-    scenario = bench._default_scenarios()["short_short"]
+    scenario = _default_scenarios()["short_short"]
     results = [
-        bench.RequestResult(
+        RequestResult(
             request_id="1",
             run_id="run-1",
             ordinal=0,
@@ -82,7 +77,7 @@ def test_summarize_results_reports_failures_and_percentiles() -> None:
             prompt_length_chars=12,
             response_text_chars=50,
         ),
-        bench.RequestResult(
+        RequestResult(
             request_id="2",
             run_id="run-1",
             ordinal=1,
@@ -110,7 +105,7 @@ def test_summarize_results_reports_failures_and_percentiles() -> None:
         ),
     ]
 
-    summary = bench._summarize_results(
+    summary = _summarize_results(
         args=args,
         scenario=scenario,
         run_id="run-1",
@@ -162,9 +157,9 @@ def test_run_stream_request_uses_done_chunk_metadata(monkeypatch) -> None:
     def fake_post(*args: Any, **kwargs: Any) -> _FakeStreamResponse:
         return _FakeStreamResponse(chunks)
 
-    monkeypatch.setattr(bench.requests, "post", fake_post)
+    monkeypatch.setattr(bench_runners.requests, "post", fake_post)
 
-    plan = bench.RequestPlan(
+    plan = RequestPlan(
         ordinal=0,
         scenario_name="short_short",
         payload={
@@ -177,7 +172,7 @@ def test_run_stream_request_uses_done_chunk_metadata(monkeypatch) -> None:
         prompt_source="short",
         metadata={},
     )
-    result = bench._run_stream_request(
+    result = _run_stream_request(
         base_url="http://127.0.0.1:8000",
         endpoint="stream_v2",
         timeout_seconds=5.0,
