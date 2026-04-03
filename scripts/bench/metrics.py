@@ -13,9 +13,18 @@ def _percentiles(values: list[float]) -> dict[str, float | None]:
     """Compute mean and p50/p90/p95/p99 using linear interpolation."""
     if not values:
         return {"mean": None, "p50": None, "p90": None, "p95": None, "p99": None}
+    mean = statistics.mean(values)
+    if len(values) < 2:
+        return {
+            "mean": mean,
+            "p50": values[0],
+            "p90": values[0],
+            "p95": values[0],
+            "p99": values[0],
+        }
     q = statistics.quantiles(values, n=100, method="linear")
     return {
-        "mean": statistics.mean(values),
+        "mean": mean,
         "p50": q[49],
         "p90": q[89],
         "p95": q[94],
