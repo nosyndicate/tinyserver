@@ -152,7 +152,7 @@ def _run_open_loop(
     runner = _request_runner(args.endpoint)
     results: list[RequestResult] = []
     futures: list[Future[RequestResult]] = []
-    max_workers = max(args.concurrency or 64, 4)
+    max_workers = args.concurrency or 64
     interval_seconds = 1.0 / args.arrival_rate
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -200,7 +200,7 @@ def _run_open_loop_for_duration(
     runner = _request_runner(args.endpoint)
     results: list[RequestResult] = []
     futures: list[Future[RequestResult]] = []
-    max_workers = max(args.concurrency or 64, 4)
+    max_workers = args.concurrency or 64
     interval_seconds = 1.0 / args.arrival_rate
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
