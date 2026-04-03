@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
@@ -381,7 +381,9 @@ def _run_stream_request(
         )
 
 
-def _request_runner(endpoint: str):
+def _request_runner(
+    endpoint: str,
+) -> Callable[[str, str, float, str, str, RequestPlan], RequestResult]:
     if "stream" in endpoint:
         return _run_stream_request
     return _run_sync_request
