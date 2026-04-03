@@ -88,7 +88,7 @@ def _run_closed_loop_for_duration(
     ordinal_lock = threading.Lock()
     results_lock = threading.Lock()
     next_ordinal = 0
-    deadline = time.perf_counter() + args.duration_seconds
+    stop = threading.Event()
 
     def make_plan(ordinal: int) -> RequestPlan:
         req = weighted_requests[ordinal % len(weighted_requests)]
@@ -118,10 +118,8 @@ def _run_closed_loop_for_duration(
     def worker() -> None:
         nonlocal next_ordinal
         local_results: list[RequestResult] = []
-        while True:
+        while not stop.is_set():
             with ordinal_lock:
-                if time.perf_counter() >= deadline:
-                    break
                 ordinal = next_ordinal
                 next_ordinal += 1
                 plan = make_plan(ordinal)
@@ -138,8 +136,11 @@ def _run_closed_loop_for_duration(
         with results_lock:
             results.extend(local_results)
 
+    deadline = time.perf_counter() + args.duration_seconds
     with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
         futures = [executor.submit(worker) for _ in range(args.concurrency)]
+        time.sleep(max(deadline - time.perf_counter(), 0.0))
+        stop.set()
         for future in as_completed(futures):
             future.result()
     return sorted(results, key=lambda item: item.ordinal)

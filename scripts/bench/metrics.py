@@ -9,12 +9,18 @@ from typing import Any
 from .models import RequestResult, Scenario
 
 
-def _percentile(values: list[float], pct: float) -> float | None:
+def _percentiles(values: list[float]) -> dict[str, float | None]:
+    """Compute mean and p50/p90/p95/p99 using linear interpolation."""
     if not values:
-        return None
-    ordered = sorted(values)
-    idx = int(pct * (len(ordered) - 1))
-    return ordered[idx]
+        return {"mean": None, "p50": None, "p90": None, "p95": None, "p99": None}
+    q = statistics.quantiles(values, n=100, method="linear")
+    return {
+        "mean": statistics.mean(values),
+        "p50": q[49],
+        "p90": q[89],
+        "p95": q[94],
+        "p99": q[98],
+    }
 
 
 def _rate(numerator: float, denominator_seconds: float) -> float | None:
@@ -70,41 +76,11 @@ def _summarize_results(
             sum(output_tokens), throughput_window_seconds
         ),
         "total_output_tokens": sum(output_tokens),
-        "latency_ms": {
-            "mean": statistics.mean(totals) if totals else None,
-            "p50": _percentile(totals, 0.50),
-            "p90": _percentile(totals, 0.90),
-            "p95": _percentile(totals, 0.95),
-            "p99": _percentile(totals, 0.99),
-        },
-        "ttft_ms": {
-            "mean": statistics.mean(ttfts) if ttfts else None,
-            "p50": _percentile(ttfts, 0.50),
-            "p90": _percentile(ttfts, 0.90),
-            "p95": _percentile(ttfts, 0.95),
-            "p99": _percentile(ttfts, 0.99),
-        },
-        "tpot_ms": {
-            "mean": statistics.mean(tpots) if tpots else None,
-            "p50": _percentile(tpots, 0.50),
-            "p90": _percentile(tpots, 0.90),
-            "p95": _percentile(tpots, 0.95),
-            "p99": _percentile(tpots, 0.99),
-        },
-        "queue_wait_ms": {
-            "mean": statistics.mean(queue_waits) if queue_waits else None,
-            "p50": _percentile(queue_waits, 0.50),
-            "p90": _percentile(queue_waits, 0.90),
-            "p95": _percentile(queue_waits, 0.95),
-            "p99": _percentile(queue_waits, 0.99),
-        },
-        "execution_ms": {
-            "mean": statistics.mean(executions) if executions else None,
-            "p50": _percentile(executions, 0.50),
-            "p90": _percentile(executions, 0.90),
-            "p95": _percentile(executions, 0.95),
-            "p99": _percentile(executions, 0.99),
-        },
+        "latency_ms": _percentiles(totals),
+        "ttft_ms": _percentiles(ttfts),
+        "tpot_ms": _percentiles(tpots),
+        "queue_wait_ms": _percentiles(queue_waits),
+        "execution_ms": _percentiles(executions),
         "error_counts": dict(error_counts),
         "http_status_counts": dict(status_counts),
         "scenario_mix_counts": dict(

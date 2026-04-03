@@ -41,6 +41,60 @@ def _parse_sse_chunk(line: str) -> dict[str, Any] | None:
     return json.loads(line[len("data: ") :])
 
 
+def _make_result(
+    *,
+    run_id: str,
+    endpoint: str,
+    mode: str,
+    plan: RequestPlan,
+    start_ts: float,
+    end_ts: float,
+    latency_ms: float | None = None,
+    first_token_ts: float | None = None,
+    ttft_ms: float | None = None,
+    tpot_ms: float | None = None,
+    output_tokens: int | None = None,
+    prompt_tokens: int | None = None,
+    tokens_per_s: float | None = None,
+    queue_wait_ms: float | None = None,
+    execution_ms: float | None = None,
+    http_status: int | None = None,
+    ok: bool = False,
+    error_type: str | None = None,
+    error: str | None = None,
+    response_text_chars: int | None = None,
+) -> RequestResult:
+    if latency_ms is None:
+        latency_ms = (end_ts - start_ts) * 1000.0
+    return RequestResult(
+        request_id=str(uuid.uuid4()),
+        run_id=run_id,
+        ordinal=plan.ordinal,
+        scenario_name=plan.scenario_name,
+        endpoint=endpoint,
+        mode=mode,
+        prompt_source=plan.prompt_source,
+        start_ts=start_ts,
+        first_token_ts=first_token_ts,
+        end_ts=end_ts,
+        latency_ms=latency_ms,
+        ttft_ms=ttft_ms,
+        tpot_ms=tpot_ms,
+        output_tokens=output_tokens,
+        prompt_tokens=prompt_tokens,
+        tokens_per_s=tokens_per_s,
+        queue_wait_ms=queue_wait_ms,
+        execution_ms=execution_ms,
+        http_status=http_status,
+        ok=ok,
+        error_type=error_type,
+        error=error,
+        prompt_length_chars=plan.prompt_length_chars,
+        response_text_chars=response_text_chars,
+        metadata=dict(plan.metadata),
+    )
+
+
 def _run_sync_request(
     base_url: str,
     endpoint: str,
@@ -49,7 +103,6 @@ def _run_sync_request(
     mode: str,
     plan: RequestPlan,
 ) -> RequestResult:
-    request_id = str(uuid.uuid4())
     start_ts = time.time()
     first_token_ts = None
     try:
@@ -82,23 +135,22 @@ def _run_sync_request(
                 tpot_ms = max(float(total_ms) - float(ttft_ms), 0.0) / (
                     output_tokens - 1
                 )
-            return RequestResult(
-                request_id=request_id,
+            return _make_result(
                 run_id=run_id,
-                ordinal=plan.ordinal,
-                scenario_name=plan.scenario_name,
                 endpoint=endpoint,
                 mode=mode,
-                prompt_source=plan.prompt_source,
+                plan=plan,
                 start_ts=start_ts,
-                first_token_ts=first_token_ts,
                 end_ts=end_ts,
                 latency_ms=float(total_ms),
+                first_token_ts=first_token_ts,
                 ttft_ms=float(ttft_ms) if ttft_ms is not None else None,
                 tpot_ms=tpot_ms,
                 output_tokens=output_tokens,
                 prompt_tokens=prompt_tokens,
-                tokens_per_s=float(tokens_per_s) if tokens_per_s is not None else None,
+                tokens_per_s=(
+                    float(tokens_per_s) if tokens_per_s is not None else None
+                ),
                 queue_wait_ms=(
                     float(response_data["queue_wait_ms"])
                     if response_data.get("queue_wait_ms") is not None
@@ -111,11 +163,7 @@ def _run_sync_request(
                 ),
                 http_status=response.status_code,
                 ok=True,
-                error_type=None,
-                error=None,
-                prompt_length_chars=plan.prompt_length_chars,
                 response_text_chars=len(response_text),
-                metadata=dict(plan.metadata),
             )
 
         error_message = None
@@ -123,90 +171,41 @@ def _run_sync_request(
             error_message = response_data.get("error") or json.dumps(response_data)
         elif error is not None:
             error_message = error
-        return RequestResult(
-            request_id=request_id,
+        return _make_result(
             run_id=run_id,
-            ordinal=plan.ordinal,
-            scenario_name=plan.scenario_name,
             endpoint=endpoint,
             mode=mode,
-            prompt_source=plan.prompt_source,
+            plan=plan,
             start_ts=start_ts,
-            first_token_ts=first_token_ts,
             end_ts=end_ts,
             latency_ms=latency_ms,
-            ttft_ms=None,
-            tpot_ms=None,
-            output_tokens=None,
-            prompt_tokens=None,
-            tokens_per_s=None,
-            queue_wait_ms=None,
-            execution_ms=None,
             http_status=response.status_code,
-            ok=False,
             error_type="http_error",
             error=error_message,
-            prompt_length_chars=plan.prompt_length_chars,
-            response_text_chars=None,
-            metadata=dict(plan.metadata),
         )
     except requests.Timeout as exc:
         end_ts = time.time()
-        return RequestResult(
-            request_id=request_id,
+        return _make_result(
             run_id=run_id,
-            ordinal=plan.ordinal,
-            scenario_name=plan.scenario_name,
             endpoint=endpoint,
             mode=mode,
-            prompt_source=plan.prompt_source,
+            plan=plan,
             start_ts=start_ts,
-            first_token_ts=first_token_ts,
             end_ts=end_ts,
-            latency_ms=(end_ts - start_ts) * 1000.0,
-            ttft_ms=None,
-            tpot_ms=None,
-            output_tokens=None,
-            prompt_tokens=None,
-            tokens_per_s=None,
-            queue_wait_ms=None,
-            execution_ms=None,
-            http_status=None,
-            ok=False,
             error_type="timeout",
             error=str(exc),
-            prompt_length_chars=plan.prompt_length_chars,
-            response_text_chars=None,
-            metadata=dict(plan.metadata),
         )
     except requests.RequestException as exc:
         end_ts = time.time()
-        return RequestResult(
-            request_id=request_id,
+        return _make_result(
             run_id=run_id,
-            ordinal=plan.ordinal,
-            scenario_name=plan.scenario_name,
             endpoint=endpoint,
             mode=mode,
-            prompt_source=plan.prompt_source,
+            plan=plan,
             start_ts=start_ts,
-            first_token_ts=first_token_ts,
             end_ts=end_ts,
-            latency_ms=(end_ts - start_ts) * 1000.0,
-            ttft_ms=None,
-            tpot_ms=None,
-            output_tokens=None,
-            prompt_tokens=None,
-            tokens_per_s=None,
-            queue_wait_ms=None,
-            execution_ms=None,
-            http_status=None,
-            ok=False,
             error_type="request_exception",
             error=str(exc),
-            prompt_length_chars=plan.prompt_length_chars,
-            response_text_chars=None,
-            metadata=dict(plan.metadata),
         )
 
 
@@ -218,7 +217,6 @@ def _run_stream_request(
     mode: str,
     plan: RequestPlan,
 ) -> RequestResult:
-    request_id = str(uuid.uuid4())
     start_ts = time.time()
     first_token_ts: float | None = None
     output_tokens = 0
@@ -229,6 +227,32 @@ def _run_stream_request(
     total_ms_from_server: float | None = None
     ttft_ms_from_server: float | None = None
     tokens_per_s_from_server: float | None = None
+
+    def _error_result(
+        error_type: str,
+        error: str | None,
+        end_ts: float,
+        http_status: int | None,
+    ) -> RequestResult:
+        return _make_result(
+            run_id=run_id,
+            endpoint=endpoint,
+            mode=mode,
+            plan=plan,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            first_token_ts=first_token_ts,
+            ttft_ms=((first_token_ts - start_ts) * 1000.0 if first_token_ts else None),
+            output_tokens=output_tokens,
+            prompt_tokens=prompt_tokens,
+            tokens_per_s=None,
+            queue_wait_ms=queue_wait_ms,
+            execution_ms=execution_ms,
+            http_status=http_status,
+            error_type=error_type,
+            error=error,
+            response_text_chars=response_text_chars,
+        )
 
     try:
         with requests.post(
@@ -247,34 +271,11 @@ def _run_stream_request(
                     continue
                 if chunk.get("error"):
                     end_ts = time.time()
-                    return RequestResult(
-                        request_id=request_id,
-                        run_id=run_id,
-                        ordinal=plan.ordinal,
-                        scenario_name=plan.scenario_name,
-                        endpoint=endpoint,
-                        mode=mode,
-                        prompt_source=plan.prompt_source,
-                        start_ts=start_ts,
-                        first_token_ts=first_token_ts,
-                        end_ts=end_ts,
-                        latency_ms=(end_ts - start_ts) * 1000.0,
-                        ttft_ms=(first_token_ts - start_ts) * 1000.0
-                        if first_token_ts
-                        else None,
-                        tpot_ms=None,
-                        output_tokens=output_tokens,
-                        prompt_tokens=prompt_tokens,
-                        tokens_per_s=None,
-                        queue_wait_ms=queue_wait_ms,
-                        execution_ms=execution_ms,
-                        http_status=response.status_code,
-                        ok=False,
+                    return _error_result(
                         error_type="server_error",
                         error=str(chunk.get("error")),
-                        prompt_length_chars=plan.prompt_length_chars,
-                        response_text_chars=response_text_chars,
-                        metadata=dict(plan.metadata),
+                        end_ts=end_ts,
+                        http_status=response.status_code,
                     )
 
                 token_str = chunk.get("token_str", "")
@@ -334,18 +335,15 @@ def _run_stream_request(
                         tokens_per_s = _rate(output_tokens, total_ms / 1000.0)
                     if output_tokens > 1:
                         tpot_ms = max(total_ms - ttft_ms, 0.0) / (output_tokens - 1)
-                    return RequestResult(
-                        request_id=request_id,
+                    return _make_result(
                         run_id=run_id,
-                        ordinal=plan.ordinal,
-                        scenario_name=plan.scenario_name,
                         endpoint=endpoint,
                         mode=mode,
-                        prompt_source=plan.prompt_source,
+                        plan=plan,
                         start_ts=start_ts,
-                        first_token_ts=first_token_ts,
                         end_ts=end_ts,
                         latency_ms=total_ms,
+                        first_token_ts=first_token_ts,
                         ttft_ms=ttft_ms,
                         tpot_ms=tpot_ms,
                         output_tokens=output_tokens,
@@ -355,101 +353,31 @@ def _run_stream_request(
                         execution_ms=execution_ms,
                         http_status=response.status_code,
                         ok=True,
-                        error_type=None,
-                        error=None,
-                        prompt_length_chars=plan.prompt_length_chars,
                         response_text_chars=response_text_chars,
-                        metadata=dict(plan.metadata),
                     )
 
         end_ts = time.time()
-        latency_ms = (end_ts - start_ts) * 1000.0
-        return RequestResult(
-            request_id=request_id,
-            run_id=run_id,
-            ordinal=plan.ordinal,
-            scenario_name=plan.scenario_name,
-            endpoint=endpoint,
-            mode=mode,
-            prompt_source=plan.prompt_source,
-            start_ts=start_ts,
-            first_token_ts=first_token_ts,
-            end_ts=end_ts,
-            latency_ms=latency_ms,
-            ttft_ms=(first_token_ts - start_ts) * 1000.0 if first_token_ts else None,
-            tpot_ms=None,
-            output_tokens=output_tokens,
-            prompt_tokens=prompt_tokens,
-            tokens_per_s=_rate(output_tokens, latency_ms / 1000.0)
-            if output_tokens
-            else None,
-            queue_wait_ms=queue_wait_ms,
-            execution_ms=execution_ms,
-            http_status=200,
-            ok=False,
+        return _error_result(
             error_type="stream_ended_without_done",
             error="stream ended before is_done event",
-            prompt_length_chars=plan.prompt_length_chars,
-            response_text_chars=response_text_chars,
-            metadata=dict(plan.metadata),
+            end_ts=end_ts,
+            http_status=200,
         )
     except requests.Timeout as exc:
         end_ts = time.time()
-        return RequestResult(
-            request_id=request_id,
-            run_id=run_id,
-            ordinal=plan.ordinal,
-            scenario_name=plan.scenario_name,
-            endpoint=endpoint,
-            mode=mode,
-            prompt_source=plan.prompt_source,
-            start_ts=start_ts,
-            first_token_ts=first_token_ts,
-            end_ts=end_ts,
-            latency_ms=(end_ts - start_ts) * 1000.0,
-            ttft_ms=(first_token_ts - start_ts) * 1000.0 if first_token_ts else None,
-            tpot_ms=None,
-            output_tokens=output_tokens,
-            prompt_tokens=prompt_tokens,
-            tokens_per_s=None,
-            queue_wait_ms=queue_wait_ms,
-            execution_ms=execution_ms,
-            http_status=None,
-            ok=False,
+        return _error_result(
             error_type="timeout",
             error=str(exc),
-            prompt_length_chars=plan.prompt_length_chars,
-            response_text_chars=response_text_chars,
-            metadata=dict(plan.metadata),
+            end_ts=end_ts,
+            http_status=None,
         )
     except requests.RequestException as exc:
         end_ts = time.time()
-        return RequestResult(
-            request_id=request_id,
-            run_id=run_id,
-            ordinal=plan.ordinal,
-            scenario_name=plan.scenario_name,
-            endpoint=endpoint,
-            mode=mode,
-            prompt_source=plan.prompt_source,
-            start_ts=start_ts,
-            first_token_ts=first_token_ts,
-            end_ts=end_ts,
-            latency_ms=(end_ts - start_ts) * 1000.0,
-            ttft_ms=(first_token_ts - start_ts) * 1000.0 if first_token_ts else None,
-            tpot_ms=None,
-            output_tokens=output_tokens,
-            prompt_tokens=prompt_tokens,
-            tokens_per_s=None,
-            queue_wait_ms=queue_wait_ms,
-            execution_ms=execution_ms,
-            http_status=None,
-            ok=False,
+        return _error_result(
             error_type="request_exception",
             error=str(exc),
-            prompt_length_chars=plan.prompt_length_chars,
-            response_text_chars=response_text_chars,
-            metadata=dict(plan.metadata),
+            end_ts=end_ts,
+            http_status=None,
         )
 
 
