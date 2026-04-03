@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 from argparse import Namespace
-from typing import Any
+from pathlib import Path
+from typing import Any, Generator
+
+import pytest
 
 import scripts.bench.runners as bench_runners
 from scripts.bench.metrics import _summarize_results
@@ -11,7 +14,7 @@ from scripts.bench.runners import _run_stream_request
 from scripts.bench.scenarios import _default_scenarios, _load_scenarios
 
 
-def test_load_scenarios_merges_json_file(tmp_path) -> None:
+def test_load_scenarios_merges_json_file(tmp_path: Path) -> None:
     prompt_file = tmp_path / "prompt.txt"
     prompt_file.write_text("hello from file")
     scenario_file = tmp_path / "scenarios.json"
@@ -134,7 +137,7 @@ class _FakeStreamResponse:
     def raise_for_status(self) -> None:
         return None
 
-    def iter_lines(self, decode_unicode: bool = False):  # noqa: ANN202
+    def iter_lines(self, decode_unicode: bool = False) -> Generator[str, None, None]:
         yield from self._lines
 
     def __enter__(self) -> "_FakeStreamResponse":
@@ -144,7 +147,9 @@ class _FakeStreamResponse:
         return None
 
 
-def test_run_stream_request_uses_done_chunk_metadata(monkeypatch) -> None:
+def test_run_stream_request_uses_done_chunk_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     chunks = [
         'data: {"token_str":"Hello","is_first":true,"is_done":false}\n',
         (

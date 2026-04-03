@@ -118,23 +118,25 @@ def _run_closed_loop_for_duration(
     def worker() -> None:
         nonlocal next_ordinal
         local_results: list[RequestResult] = []
-        while not stop.is_set():
-            with ordinal_lock:
-                ordinal = next_ordinal
-                next_ordinal += 1
-                plan = make_plan(ordinal)
-            local_results.append(
-                runner(
-                    args.base_url,
-                    args.endpoint,
-                    args.timeout_seconds,
-                    run_id,
-                    args.mode,
-                    plan,
+        try:
+            while not stop.is_set():
+                with ordinal_lock:
+                    ordinal = next_ordinal
+                    next_ordinal += 1
+                    plan = make_plan(ordinal)
+                local_results.append(
+                    runner(
+                        args.base_url,
+                        args.endpoint,
+                        args.timeout_seconds,
+                        run_id,
+                        args.mode,
+                        plan,
+                    )
                 )
-            )
-        with results_lock:
-            results.extend(local_results)
+        finally:
+            with results_lock:
+                results.extend(local_results)
 
     deadline = time.perf_counter() + args.duration_seconds
     with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
@@ -152,7 +154,7 @@ def _run_open_loop(
     runner = _request_runner(args.endpoint)
     results: list[RequestResult] = []
     futures: list[Future[RequestResult]] = []
-    max_workers = max(args.concurrency or 64, 4)
+    max_workers = args.concurrency or 64
     interval_seconds = 1.0 / args.arrival_rate
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -200,7 +202,7 @@ def _run_open_loop_for_duration(
     runner = _request_runner(args.endpoint)
     results: list[RequestResult] = []
     futures: list[Future[RequestResult]] = []
-    max_workers = max(args.concurrency or 64, 4)
+    max_workers = args.concurrency or 64
     interval_seconds = 1.0 / args.arrival_rate
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
