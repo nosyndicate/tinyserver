@@ -39,9 +39,10 @@ class DoneEvent:
         text: The full decoded text for the sequence, including all tokens.
         num_prompt_tokens: The number of tokens in the prompt.
         num_output_tokens: The number of tokens in the output sequence.
-        ttft: The time to first token in milliseconds.
-        total_ms: The total time taken for the sequence generation in milliseconds.
-
+        ttft: The time to first token in milliseconds (from start of prefill to first token).
+        total_ms: The total time from the start of prefill to completion in milliseconds.
+        queue_wait_ms: The time spent waiting in the queue before prefill started, in milliseconds.
+        execution_ms: Time spent executing after leaving the queue (total_ms - queue_wait_ms).
     """
 
     text: str
@@ -50,6 +51,8 @@ class DoneEvent:
 
     ttft: float
     total_ms: float
+    queue_wait_ms: float
+    execution_ms: float
 
 
 @dataclass(frozen=True)
@@ -116,6 +119,9 @@ class GenerationRequestState:
     # Decoding state
     first_token_ns: int | None = None
     start_ns: int | None = None
+    # Set in routes.py before submit(), read in executor._finish().
+    # Queue.put/get provides happens-before guarantee, no extra sync needed.
+    enqueued_ns: int | None = None
     output_tokens: list[str] = field(default_factory=list)
 
     # Final results
