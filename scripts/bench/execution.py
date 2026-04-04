@@ -6,7 +6,7 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 
-from .models import RequestPlan, RequestResult, Scenario, ScenarioRequest
+from .models import RequestPlan, RequestResult, Scenario
 from .planning import _build_request_plans
 from .runners import _request_runner
 
@@ -75,55 +75,37 @@ def _run_closed_loop_for_duration(
     run_id: str,
     prompt_override: str | None,
 ) -> list[RequestResult]:
-    runner = _request_runner(args.endpoint)
-    weighted_requests: list[ScenarioRequest] = []
-    for req in scenario.requests:
-        weighted_requests.extend([req] * max(req.weight, 1))
-    if not weighted_requests:
-        raise ValueError(
-            f"scenario {scenario.name!r} does not contain any request templates"
-        )
+    # Over-provision plans so workers won't exhaust them before the deadline.
+    # _build_request_plans cycles through weighted requests, so extra plans
+    # are cheap and any unused ones are simply discarded.
+    estimated_requests = max(1, int(args.duration_seconds * args.concurrency * 4))
+    plans = _build_request_plans(
+        scenario,
+        estimated_requests,
+        prompt_override,
+        args.max_new_tokens,
+        args.temperature,
+        args.top_p,
+        args.seed,
+    )
 
+    runner = _request_runner(args.endpoint)
     results: list[RequestResult] = []
-    ordinal_lock = threading.Lock()
+    next_index_lock = threading.Lock()
     results_lock = threading.Lock()
-    next_ordinal = 0
+    next_index = 0
     stop = threading.Event()
 
-    def make_plan(ordinal: int) -> RequestPlan:
-        req = weighted_requests[ordinal % len(weighted_requests)]
-        prompt = prompt_override if prompt_override is not None else req.prompt
-        payload = {
-            "prompt": prompt,
-            "max_new_tokens": args.max_new_tokens
-            if args.max_new_tokens is not None
-            else req.max_new_tokens,
-            "temperature": args.temperature
-            if args.temperature is not None
-            else req.temperature,
-            "top_p": args.top_p if args.top_p is not None else req.top_p,
-        }
-        seed = args.seed if args.seed is not None else req.seed
-        if seed is not None:
-            payload["seed"] = seed
-        return RequestPlan(
-            ordinal=ordinal,
-            scenario_name=scenario.name,
-            payload=payload,
-            prompt_length_chars=len(prompt),
-            prompt_source=req.metadata.get("class", "default"),
-            metadata=dict(req.metadata),
-        )
-
     def worker() -> None:
-        nonlocal next_ordinal
+        nonlocal next_index
         local_results: list[RequestResult] = []
         try:
             while not stop.is_set():
-                with ordinal_lock:
-                    ordinal = next_ordinal
-                    next_ordinal += 1
-                    plan = make_plan(ordinal)
+                with next_index_lock:
+                    if next_index >= len(plans):
+                        break
+                    plan = plans[next_index]
+                    next_index += 1
                 local_results.append(
                     runner(
                         args.base_url,
