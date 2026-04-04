@@ -1,0 +1,7 @@
+You are helping profile an inference server. Explain the tradeoff between latency, throughput, batching, prefill cost, decode efficiency, queueing, and fairness for online LLM serving. Then provide a compact checklist for benchmarking and what signals to log. Keep the explanation dense and technical.
+
+Context:
+- The server currently supports sync and streaming endpoints.
+- Prefill and decode are already separated.
+- The next steps include a worker, batching, scheduling policy, and KV cache improvements.
+- The benchmark should surface saturation behavior and queue pressure.

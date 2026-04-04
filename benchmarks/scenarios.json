@@ -1,0 +1,84 @@
+{
+  "short_short": {
+    "description": "Short prompt and short output; primarily TTFT-focused.",
+    "requests": [
+      {
+        "prompt_file": "prompts/short.txt",
+        "max_new_tokens": 48,
+        "temperature": 0.8,
+        "top_p": 0.95,
+        "metadata": {
+          "class": "short"
+        }
+      }
+    ]
+  },
+  "long_long": {
+    "description": "Long prompt and longer output; throughput and prefill stress.",
+    "requests": [
+      {
+        "prompt_file": "prompts/long.txt",
+        "max_new_tokens": 192,
+        "temperature": 0.8,
+        "top_p": 0.95,
+        "metadata": {
+          "class": "long"
+        }
+      }
+    ]
+  },
+  "mixed": {
+    "description": "Weighted mix of short and long requests.",
+    "requests": [
+      {
+        "prompt_file": "prompts/short.txt",
+        "max_new_tokens": 48,
+        "temperature": 0.8,
+        "top_p": 0.95,
+        "weight": 3,
+        "metadata": {
+          "class": "short"
+        }
+      },
+      {
+        "prompt_file": "prompts/long.txt",
+        "max_new_tokens": 192,
+        "temperature": 0.8,
+        "top_p": 0.95,
+        "weight": 1,
+        "metadata": {
+          "class": "long"
+        }
+      }
+    ]
+  },
+  "burst": {
+    "description": "Short prompt with moderate output, intended for open-loop pressure tests.",
+    "requests": [
+      {
+        "prompt_file": "prompts/burst.txt",
+        "max_new_tokens": 96,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "metadata": {
+          "class": "burst"
+        }
+      }
+    ]
+  },
+  "seeded_deterministic": {
+    "description": "Determinism and regression scenario with fixed seed.",
+    "requests": [
+      {
+        "prompt_file": "prompts/deterministic.txt",
+        "max_new_tokens": 64,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "seed": 7,
+        "metadata": {
+          "class": "deterministic"
+        }
+      }
+    ]
+  }
+}
