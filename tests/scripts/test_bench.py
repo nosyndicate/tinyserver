@@ -4,8 +4,10 @@ import json
 from argparse import Namespace
 from pathlib import Path
 from typing import Any, Generator
+from unittest.mock import patch
 
 import pytest
+import requests as requests_lib
 
 import scripts.bench.runners as bench_runners
 from scripts.bench.cli import _validate_args
@@ -490,6 +492,54 @@ class TestMakeResult:
         )
         assert r.latency_ms == 999.0
 
+    def test_error_fields_propagated(self) -> None:
+        r = _make_result(
+            run_id="r1",
+            endpoint="generate",
+            mode="closed",
+            plan=_DUMMY_PLAN,
+            start_ts=1.0,
+            end_ts=2.0,
+            ok=False,
+            error_type="timeout",
+            error="request timed out",
+        )
+        assert r.ok is False
+        assert r.error_type == "timeout"
+        assert r.error == "request timed out"
+
+    def test_defaults_to_not_ok(self) -> None:
+        r = _make_result(
+            run_id="r1",
+            endpoint="generate",
+            mode="closed",
+            plan=_DUMMY_PLAN,
+            start_ts=0.0,
+            end_ts=0.1,
+        )
+        assert r.ok is False
+        assert r.http_status is None
+        assert r.error_type is None
+
+    def test_none_optional_fields(self) -> None:
+        r = _make_result(
+            run_id="r1",
+            endpoint="generate",
+            mode="closed",
+            plan=_DUMMY_PLAN,
+            start_ts=0.0,
+            end_ts=0.1,
+        )
+        assert r.first_token_ts is None
+        assert r.ttft_ms is None
+        assert r.tpot_ms is None
+        assert r.output_tokens is None
+        assert r.prompt_tokens is None
+        assert r.tokens_per_s is None
+        assert r.queue_wait_ms is None
+        assert r.execution_ms is None
+        assert r.response_text_chars is None
+
 
 # ---------------------------------------------------------------------------
 # _request_runner
@@ -626,3 +676,157 @@ def test_summarize_results_empty() -> None:
     assert summary["failed_requests"] == 0
     assert summary["success_rate"] is None
     assert summary["latency_ms"]["mean"] is None
+
+
+# ---------------------------------------------------------------------------
+# _FakeSyncResponse helper
+# ---------------------------------------------------------------------------
+
+
+class _FakeSyncResponse:
+    def __init__(
+        self,
+        status_code: int,
+        json_data: dict[str, Any] | None = None,
+        text: str = "",
+    ) -> None:
+        self.status_code = status_code
+        self.ok = 200 <= status_code < 300
+        self._json_data = json_data
+        self.text = text
+
+    def json(self) -> dict[str, Any]:
+        if self._json_data is None:
+            raise ValueError("no json")
+        return self._json_data
+
+
+# ---------------------------------------------------------------------------
+# _run_sync_request
+# ---------------------------------------------------------------------------
+
+
+class TestRunSyncRequest:
+    def test_success_parses_metrics(self) -> None:
+        fake = _FakeSyncResponse(
+            200,
+            json_data={
+                "text": "hello world",
+                "ttft_ms": 50.0,
+                "total_ms": 200.0,
+                "output_tokens": 5,
+                "prompt_tokens": 10,
+                "tokens_per_s": 25.0,
+                "queue_wait_ms": 15.0,
+                "execution_ms": 185.0,
+            },
+        )
+        with patch("scripts.bench.runners.requests.post", return_value=fake):
+            result = _run_sync_request(
+                base_url="http://localhost:8000",
+                endpoint="generate_v2",
+                timeout_seconds=5.0,
+                run_id="run-1",
+                mode="closed",
+                plan=_DUMMY_PLAN,
+            )
+        assert result.ok is True
+        assert result.http_status == 200
+        assert result.ttft_ms == 50.0
+        assert result.latency_ms == 200.0
+        assert result.output_tokens == 5
+        assert result.prompt_tokens == 10
+        assert result.tokens_per_s == 25.0
+        assert result.queue_wait_ms == 15.0
+        assert result.execution_ms == 185.0
+        assert result.response_text_chars == len("hello world")
+
+    def test_success_computes_tpot(self) -> None:
+        fake = _FakeSyncResponse(
+            200,
+            json_data={
+                "text": "abc",
+                "ttft_ms": 40.0,
+                "total_ms": 200.0,
+                "output_tokens": 5,
+                "prompt_tokens": 8,
+                "tokens_per_s": 25.0,
+            },
+        )
+        with patch("scripts.bench.runners.requests.post", return_value=fake):
+            result = _run_sync_request(
+                base_url="http://localhost:8000",
+                endpoint="generate",
+                timeout_seconds=5.0,
+                run_id="run-1",
+                mode="closed",
+                plan=_DUMMY_PLAN,
+            )
+        # tpot = (total_ms - ttft_ms) / (output_tokens - 1) = (200 - 40) / 4 = 40.0
+        assert result.tpot_ms == pytest.approx(40.0)
+
+    def test_http_error_with_json(self) -> None:
+        fake = _FakeSyncResponse(500, json_data={"error": "internal failure"})
+        with patch("scripts.bench.runners.requests.post", return_value=fake):
+            result = _run_sync_request(
+                base_url="http://localhost:8000",
+                endpoint="generate",
+                timeout_seconds=5.0,
+                run_id="run-1",
+                mode="closed",
+                plan=_DUMMY_PLAN,
+            )
+        assert result.ok is False
+        assert result.error_type == "http_error"
+        assert result.error == "internal failure"
+        assert result.http_status == 500
+
+    def test_http_error_non_json(self) -> None:
+        fake = _FakeSyncResponse(502, json_data=None, text="Bad Gateway")
+        with patch("scripts.bench.runners.requests.post", return_value=fake):
+            result = _run_sync_request(
+                base_url="http://localhost:8000",
+                endpoint="generate",
+                timeout_seconds=5.0,
+                run_id="run-1",
+                mode="closed",
+                plan=_DUMMY_PLAN,
+            )
+        assert result.ok is False
+        assert result.error_type == "http_error"
+        assert result.error == "Bad Gateway"
+        assert result.http_status == 502
+
+    def test_timeout(self) -> None:
+        with patch(
+            "scripts.bench.runners.requests.post",
+            side_effect=requests_lib.Timeout("timed out"),
+        ):
+            result = _run_sync_request(
+                base_url="http://localhost:8000",
+                endpoint="generate",
+                timeout_seconds=0.001,
+                run_id="run-1",
+                mode="closed",
+                plan=_DUMMY_PLAN,
+            )
+        assert result.ok is False
+        assert result.error_type == "timeout"
+        assert "timed out" in result.error  # type: ignore[operator]
+
+    def test_request_exception(self) -> None:
+        with patch(
+            "scripts.bench.runners.requests.post",
+            side_effect=requests_lib.ConnectionError("refused"),
+        ):
+            result = _run_sync_request(
+                base_url="http://localhost:8000",
+                endpoint="generate",
+                timeout_seconds=5.0,
+                run_id="run-1",
+                mode="closed",
+                plan=_DUMMY_PLAN,
+            )
+        assert result.ok is False
+        assert result.error_type == "request_exception"
+        assert "refused" in result.error  # type: ignore[operator]
