@@ -95,34 +95,23 @@ def main(argv: list[str] | None = None) -> int:
     scenario = scenarios[args.scenario]
 
     prompt_override = Path(args.prompt_file).read_text() if args.prompt_file else None
-    if args.requests is not None:
-        plans = _build_request_plans(
-            scenario,
-            args.requests + args.warmup_requests,
-            prompt_override,
-            args.max_new_tokens,
-            args.temperature,
-            args.top_p,
-            args.seed,
-        )
-        warmup_plans = plans
-    else:
-        warmup_plans = _build_request_plans(
-            scenario,
-            args.warmup_requests,
-            prompt_override,
-            args.max_new_tokens,
-            args.temperature,
-            args.top_p,
-            args.seed,
-        )
-        plans = warmup_plans
+    all_plans = _build_request_plans(
+        scenario,
+        args.warmup_requests
+        if args.duration_seconds is not None
+        else args.requests + args.warmup_requests,
+        prompt_override,
+        args.max_new_tokens,
+        args.temperature,
+        args.top_p,
+        args.seed,
+    )
 
-    warmup_results = _run_warmup(args, warmup_plans)
+    warmup_results = _run_warmup(args, all_plans)
     run_id = datetime.now(timezone.utc).strftime("run-%Y%m%dT%H%M%S")
     run_started_ts = time.time()
     if args.requests is not None:
-        measurement_plans = plans[args.warmup_requests :]
+        measurement_plans = all_plans[args.warmup_requests :]
         if args.mode == "closed":
             results = _run_closed_loop(args, measurement_plans, run_id)
         else:

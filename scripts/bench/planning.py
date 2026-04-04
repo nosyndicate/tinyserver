@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from typing import Any
 
 from .models import RequestPlan, Scenario, ScenarioRequest
@@ -52,29 +51,3 @@ def _build_request_plans(
             )
         )
     return plans
-
-
-def _build_duration_plans(
-    scenario: Scenario,
-    duration_seconds: float,
-    arrival_rate: float | None,
-    concurrency: int | None,
-    prompt_override: str | None,
-    max_new_tokens_override: int | None,
-    temperature_override: float | None,
-    top_p_override: float | None,
-    seed_override: int | None,
-) -> list[RequestPlan]:
-    if arrival_rate is not None:
-        total_requests = max(1, math.ceil(duration_seconds * arrival_rate))
-    else:
-        total_requests = max(1, duration_seconds * max(concurrency or 1, 1))
-    return _build_request_plans(
-        scenario,
-        int(total_requests),
-        prompt_override,
-        max_new_tokens_override,
-        temperature_override,
-        top_p_override,
-        seed_override,
-    )
