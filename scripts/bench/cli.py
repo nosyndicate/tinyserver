@@ -95,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
     scenario = scenarios[args.scenario]
 
     prompt_override = Path(args.prompt_file).read_text() if args.prompt_file else None
-    warmup_plans = _build_request_plans(
+    all_plans = _build_request_plans(
         scenario,
         args.warmup_requests
         if args.duration_seconds is not None
@@ -107,11 +107,11 @@ def main(argv: list[str] | None = None) -> int:
         args.seed,
     )
 
-    warmup_results = _run_warmup(args, warmup_plans)
+    warmup_results = _run_warmup(args, all_plans)
     run_id = datetime.now(timezone.utc).strftime("run-%Y%m%dT%H%M%S")
     run_started_ts = time.time()
     if args.requests is not None:
-        measurement_plans = warmup_plans[args.warmup_requests :]
+        measurement_plans = all_plans[args.warmup_requests :]
         if args.mode == "closed":
             results = _run_closed_loop(args, measurement_plans, run_id)
         else:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import sys
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
@@ -94,15 +95,17 @@ def _run_closed_loop_for_duration(
     next_index_lock = threading.Lock()
     results_lock = threading.Lock()
     next_index = 0
+    plans_exhausted = False
     stop = threading.Event()
 
     def worker() -> None:
-        nonlocal next_index
+        nonlocal next_index, plans_exhausted
         local_results: list[RequestResult] = []
         try:
             while not stop.is_set():
                 with next_index_lock:
                     if next_index >= len(plans):
+                        plans_exhausted = True
                         break
                     plan = plans[next_index]
                     next_index += 1
@@ -127,6 +130,15 @@ def _run_closed_loop_for_duration(
         stop.set()
         for future in as_completed(futures):
             future.result()
+
+    if plans_exhausted:
+        print(
+            "WARNING: _run_closed_loop_for_duration: plan list exhausted before"
+            " deadline; some workers stopped early. Consider increasing"
+            " --duration-seconds or reducing --concurrency.",
+            file=sys.stderr,
+        )
+
     return sorted(results, key=lambda item: item.ordinal)
 
 
