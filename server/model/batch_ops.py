@@ -25,7 +25,7 @@ def batched_prefill(
 
     all_formatted_prompts: list[str] = []
     for prompt in prompts:
-        message = {"role": "user", "content": prompt}
+        message = [{"role": "user", "content": prompt}]
         formatted = tokenizer.apply_chat_template(
             message, tokenize=False, add_generation_prompt=True, enable_thinking=False
         )
