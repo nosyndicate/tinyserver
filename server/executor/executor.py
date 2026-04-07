@@ -36,7 +36,7 @@ def _finish(request_state: GenerationRequestState) -> None:
     """
     Finalize the request and emit a DoneEvent.
 
-    Precondition: start_ns must be set (set in prefill before decode is called.
+    Precondition: start_ns must be set (in prefill before decode is called).
     """
     request_state.status = RequestStatus.DONE
     end_ns = now_ns()
@@ -142,7 +142,7 @@ class Executor(BaseExecutor):
                     token=next_token,
                     is_first=is_first,
                     is_last=is_last,
-                    index=request_state.num_output_tokens,
+                    index=request_state.num_output_tokens - 1,
                 )
             )
 
@@ -169,6 +169,7 @@ class BatchExecutor(BaseBatchExecutor):
     def __init__(self, runner: ModelRunner) -> None:
         self._runner = runner
 
+    @torch.inference_mode()
     def batched_prefill(self, request_states: list[GenerationRequestState]) -> None:
         current_time_ns = now_ns()
         for request_state in request_states:
@@ -245,7 +246,7 @@ class BatchExecutor(BaseBatchExecutor):
                         token=next_token,
                         is_first=is_first,
                         is_last=is_last,
-                        index=request_state.num_output_tokens,
+                        index=request_state.num_output_tokens - 1,
                     )
                 )
 
