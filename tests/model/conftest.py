@@ -1,6 +1,16 @@
+import gc
+from collections.abc import Generator
+
 import pytest
 import torch
-from transformers import GPT2Config, GPT2LMHeadModel
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    GPT2Config,
+    GPT2LMHeadModel,
+    PreTrainedModel,
+    PreTrainedTokenizerFast,
+)
 
 from server.model.hf_runner import ModelRunner
 
@@ -99,3 +109,44 @@ def gpt2_runner() -> ModelRunner:
     model = GPT2LMHeadModel(config)
     model.eval()
     return ModelRunner(model=model, tokenizer=_SmokeTokenizer(), device="cpu")
+
+
+# ---------------------------------------------------------------------------
+# Qwen3-0.6B fixtures for batch_ops integration tests
+# ---------------------------------------------------------------------------
+
+_QWEN3_MODEL_NAME = "Qwen/Qwen3-0.6B"
+
+
+@pytest.fixture(scope="session")
+def qwen3_model_and_tokenizer() -> Generator[
+    tuple[PreTrainedModel, PreTrainedTokenizerFast], None, None
+]:
+    """Load Qwen/Qwen3-0.6B model and tokenizer once per test session."""
+    tokenizer = AutoTokenizer.from_pretrained(_QWEN3_MODEL_NAME, use_fast=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        _QWEN3_MODEL_NAME,
+        torch_dtype=torch.float32,
+    )
+    model.eval()
+
+    yield model, tokenizer
+
+    del model
+    gc.collect()
+
+
+@pytest.fixture(scope="session")
+def qwen3_model(
+    qwen3_model_and_tokenizer: tuple[PreTrainedModel, PreTrainedTokenizerFast],
+) -> PreTrainedModel:
+    model, _ = qwen3_model_and_tokenizer
+    return model
+
+
+@pytest.fixture(scope="session")
+def qwen3_tokenizer(
+    qwen3_model_and_tokenizer: tuple[PreTrainedModel, PreTrainedTokenizerFast],
+) -> PreTrainedTokenizerFast:
+    _, tokenizer = qwen3_model_and_tokenizer
+    return tokenizer
