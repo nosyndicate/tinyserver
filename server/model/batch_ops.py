@@ -33,9 +33,17 @@ def batched_prefill(
         )
         all_formatted_prompts.append(formatted)
 
-    inputs = tokenizer(
-        all_formatted_prompts, return_tensors="pt", padding=True, padding_side="left"
-    ).to(device)
+    original_padding_side = tokenizer.padding_side
+    try:
+        tokenizer.padding_side = "left"
+        inputs = tokenizer(
+            all_formatted_prompts,
+            return_tensors="pt",
+            padding=True,
+        ).to(device)
+    finally:
+        tokenizer.padding_side = original_padding_side
+
     input_ids = inputs["input_ids"]
     attention_mask = inputs["attention_mask"]
 
