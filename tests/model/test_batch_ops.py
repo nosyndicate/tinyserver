@@ -2,7 +2,13 @@ import pytest
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizerFast
 
-from server.model.batch_ops import batched_prefill
+from server.model.batch_ops import (
+    DecodeBatchOutput,
+    batched_decode_forward,
+    batched_prefill,
+    build_attention_mask,
+    pad_and_stack_kv_caches,
+)
 
 pytestmark = pytest.mark.slow
 
@@ -247,3 +253,203 @@ def test_batched_prefill_outputs_can_be_used_for_decode(
     expected_seq_len = result.num_prompt_tokens + 1
     for layer in decode_output.past_key_values.layers:
         assert layer.keys.shape[2] == expected_seq_len
+
+
+# ------------------------------
+# Tests for decode helpers
+# ------------------------------
+
+
+def test_pad_and_stack_kv_caches_shapes(
+    qwen3_model: PreTrainedModel, qwen3_tokenizer: PreTrainedTokenizerFast
+) -> None:
+    prompts = ["Hi", "What is the capital of France?"]
+    results = batched_prefill(qwen3_model, qwen3_tokenizer, prompts, device="cpu")
+
+    caches = [r.past_key_values for r in results]
+    batched_cache, seq_lengths = pad_and_stack_kv_caches(caches)
+
+    assert seq_lengths == [r.num_prompt_tokens for r in results]
+
+    num_kv_heads = qwen3_model.config.num_key_value_heads
+    head_dim = qwen3_model.config.head_dim
+    max_seq_len = max(seq_lengths)
+
+    for layer in batched_cache.layers:
+        assert layer.keys.shape == (2, num_kv_heads, max_seq_len, head_dim)
+        assert layer.values.shape == (2, num_kv_heads, max_seq_len, head_dim)
+
+
+def test_build_attention_mask_values() -> None:
+    mask = build_attention_mask([3, 5], device="cpu")
+
+    assert mask.shape == (2, 6)  # max_len + 1
+    # Row 0: seq_len=3, rightmost 4 positions should be 1
+    assert mask[0].tolist() == [0, 0, 1, 1, 1, 1]
+    # Row 1: seq_len=5, rightmost 6 positions should be 1 (all ones)
+    assert mask[1].tolist() == [1, 1, 1, 1, 1, 1]
+
+
+def test_batched_decode_forward_shapes(
+    qwen3_model: PreTrainedModel, qwen3_tokenizer: PreTrainedTokenizerFast
+) -> None:
+    prompts = ["Hello", "What is 2+2?"]
+    results = batched_prefill(qwen3_model, qwen3_tokenizer, prompts, device="cpu")
+
+    token_ids = [int(torch.argmax(r.logits[:, -1, :]).item()) for r in results]
+    caches = [r.past_key_values for r in results]
+
+    decode_results = batched_decode_forward(
+        qwen3_model, token_ids, caches, device="cpu"
+    )
+
+    vocab_size = qwen3_model.config.vocab_size
+    assert len(decode_results) == 2
+
+    for i, dec in enumerate(decode_results):
+        assert isinstance(dec, DecodeBatchOutput)
+        assert dec.logits.shape == (1, 1, vocab_size)
+        expected_seq_len = results[i].num_prompt_tokens + 1
+        for layer in dec.past_key_values.layers:
+            assert layer.keys.shape[2] == expected_seq_len
+
+    # The decode cache should be the prefill cache plus exactly one new token.
+    for i, dec in enumerate(decode_results):
+        prefill_n = results[i].num_prompt_tokens
+        for layer_idx in range(len(dec.past_key_values.layers)):
+            prefill_keys = results[i].past_key_values.layers[layer_idx].keys
+            prefill_values = results[i].past_key_values.layers[layer_idx].values
+            decode_keys = dec.past_key_values.layers[layer_idx].keys
+            decode_values = dec.past_key_values.layers[layer_idx].values
+
+            assert torch.allclose(
+                decode_keys[:, :, :prefill_n, :], prefill_keys, atol=1e-4, rtol=1e-4
+            )
+            assert torch.allclose(
+                decode_values[:, :, :prefill_n, :], prefill_values, atol=1e-4, rtol=1e-4
+            )
+
+
+def test_batched_decode_forward_matches_single_decode(
+    qwen3_model: PreTrainedModel, qwen3_tokenizer: PreTrainedTokenizerFast
+) -> None:
+    prompts = ["Hello", "Explain gravity briefly."]
+    results = batched_prefill(qwen3_model, qwen3_tokenizer, prompts, device="cpu")
+
+    token_ids = [int(torch.argmax(r.logits[:, -1, :]).item()) for r in results]
+    caches = [r.past_key_values for r in results]
+
+    decode_results = batched_decode_forward(
+        qwen3_model, token_ids, caches, device="cpu"
+    )
+
+    # Compare each batched decode result against a single-request decode.
+    for i in range(len(prompts)):
+        single_input = torch.tensor([[token_ids[i]]])
+        with torch.inference_mode():
+            single_output = qwen3_model(
+                input_ids=single_input,
+                past_key_values=caches[i],
+                use_cache=True,
+            )
+
+        assert torch.allclose(
+            decode_results[i].logits,
+            single_output.logits,
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+
+def test_batched_decode_forward_cache_can_be_reused(
+    qwen3_model: PreTrainedModel, qwen3_tokenizer: PreTrainedTokenizerFast
+) -> None:
+    results = batched_prefill(
+        qwen3_model, qwen3_tokenizer, ["Tell me a story"], device="cpu"
+    )
+    result = results[0]
+
+    # First decode step
+    token_id_1 = int(torch.argmax(result.logits[:, -1, :]).item())
+    decode_1 = batched_decode_forward(
+        qwen3_model, [token_id_1], [result.past_key_values], device="cpu"
+    )
+    dec1 = decode_1[0]
+
+    assert dec1.logits.shape[1] == 1
+    expected_len_1 = result.num_prompt_tokens + 1
+    for layer in dec1.past_key_values.layers:
+        assert layer.keys.shape[2] == expected_len_1
+
+    # Decode cache should extend the prefill cache by one token.
+    prefill_n = result.num_prompt_tokens
+    for layer_idx in range(len(dec1.past_key_values.layers)):
+        prefill_keys = result.past_key_values.layers[layer_idx].keys
+        prefill_values = result.past_key_values.layers[layer_idx].values
+        assert torch.allclose(
+            dec1.past_key_values.layers[layer_idx].keys[:, :, :prefill_n, :],
+            prefill_keys,
+            atol=1e-4,
+            rtol=1e-4,
+        )
+        assert torch.allclose(
+            dec1.past_key_values.layers[layer_idx].values[:, :, :prefill_n, :],
+            prefill_values,
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+    # Second decode step using the cache from the first
+    token_id_2 = int(torch.argmax(dec1.logits[:, -1, :]).item())
+    decode_2 = batched_decode_forward(
+        qwen3_model, [token_id_2], [dec1.past_key_values], device="cpu"
+    )
+    dec2 = decode_2[0]
+
+    expected_len_2 = expected_len_1 + 1
+    for layer in dec2.past_key_values.layers:
+        assert layer.keys.shape[2] == expected_len_2
+
+    # Second decode cache should extend the first decode cache by one token.
+    for layer_idx in range(len(dec2.past_key_values.layers)):
+        prev_keys = dec1.past_key_values.layers[layer_idx].keys
+        prev_values = dec1.past_key_values.layers[layer_idx].values
+        assert torch.allclose(
+            dec2.past_key_values.layers[layer_idx].keys[:, :, :expected_len_1, :],
+            prev_keys,
+            atol=1e-4,
+            rtol=1e-4,
+        )
+        assert torch.allclose(
+            dec2.past_key_values.layers[layer_idx].values[:, :, :expected_len_1, :],
+            prev_values,
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+
+def test_split_decode_outputs_preserves_individual_caches(
+    qwen3_model: PreTrainedModel, qwen3_tokenizer: PreTrainedTokenizerFast
+) -> None:
+    prompts = ["Short", "A slightly longer prompt here"]
+    results = batched_prefill(qwen3_model, qwen3_tokenizer, prompts, device="cpu")
+
+    token_ids = [int(torch.argmax(r.logits[:, -1, :]).item()) for r in results]
+    caches = [r.past_key_values for r in results]
+
+    decode_results = batched_decode_forward(
+        qwen3_model, token_ids, caches, device="cpu"
+    )
+
+    # Each split cache should work independently for a subsequent decode step.
+    for i, dec in enumerate(decode_results):
+        next_token = int(torch.argmax(dec.logits[:, -1, :]).item())
+        with torch.inference_mode():
+            solo = qwen3_model(
+                input_ids=torch.tensor([[next_token]]),
+                past_key_values=dec.past_key_values,
+                use_cache=True,
+            )
+        expected_seq_len = results[i].num_prompt_tokens + 2
+        for layer in solo.past_key_values.layers:
+            assert layer.keys.shape[2] == expected_seq_len
