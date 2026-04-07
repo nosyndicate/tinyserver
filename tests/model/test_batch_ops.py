@@ -255,9 +255,9 @@ def test_batched_prefill_outputs_can_be_used_for_decode(
         assert layer.keys.shape[2] == expected_seq_len
 
 
-# ---------------------------------------------------------------------------
-# Tests for decode helpers added in commit 1029fb7
-# ---------------------------------------------------------------------------
+# ------------------------------
+# Tests for decode helpers
+# ------------------------------
 
 
 def test_pad_and_stack_kv_caches_shapes(
@@ -313,6 +313,22 @@ def test_batched_decode_forward_shapes(
         for layer in dec.past_key_values.layers:
             assert layer.keys.shape[2] == expected_seq_len
 
+    # The decode cache should be the prefill cache plus exactly one new token.
+    for i, dec in enumerate(decode_results):
+        prefill_n = results[i].num_prompt_tokens
+        for layer_idx in range(len(dec.past_key_values.layers)):
+            prefill_keys = results[i].past_key_values.layers[layer_idx].keys
+            prefill_values = results[i].past_key_values.layers[layer_idx].values
+            decode_keys = dec.past_key_values.layers[layer_idx].keys
+            decode_values = dec.past_key_values.layers[layer_idx].values
+
+            assert torch.allclose(
+                decode_keys[:, :, :prefill_n, :], prefill_keys, atol=1e-4, rtol=1e-4
+            )
+            assert torch.allclose(
+                decode_values[:, :, :prefill_n, :], prefill_values, atol=1e-4, rtol=1e-4
+            )
+
 
 def test_batched_decode_forward_matches_single_decode(
     qwen3_model: PreTrainedModel, qwen3_tokenizer: PreTrainedTokenizerFast
@@ -365,6 +381,24 @@ def test_batched_decode_forward_cache_can_be_reused(
     for layer in dec1.past_key_values.layers:
         assert layer.keys.shape[2] == expected_len_1
 
+    # Decode cache should extend the prefill cache by one token.
+    prefill_n = result.num_prompt_tokens
+    for layer_idx in range(len(dec1.past_key_values.layers)):
+        prefill_keys = result.past_key_values.layers[layer_idx].keys
+        prefill_values = result.past_key_values.layers[layer_idx].values
+        assert torch.allclose(
+            dec1.past_key_values.layers[layer_idx].keys[:, :, :prefill_n, :],
+            prefill_keys,
+            atol=1e-4,
+            rtol=1e-4,
+        )
+        assert torch.allclose(
+            dec1.past_key_values.layers[layer_idx].values[:, :, :prefill_n, :],
+            prefill_values,
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
     # Second decode step using the cache from the first
     token_id_2 = int(torch.argmax(dec1.logits[:, -1, :]).item())
     decode_2 = batched_decode_forward(
@@ -375,6 +409,23 @@ def test_batched_decode_forward_cache_can_be_reused(
     expected_len_2 = expected_len_1 + 1
     for layer in dec2.past_key_values.layers:
         assert layer.keys.shape[2] == expected_len_2
+
+    # Second decode cache should extend the first decode cache by one token.
+    for layer_idx in range(len(dec2.past_key_values.layers)):
+        prev_keys = dec1.past_key_values.layers[layer_idx].keys
+        prev_values = dec1.past_key_values.layers[layer_idx].values
+        assert torch.allclose(
+            dec2.past_key_values.layers[layer_idx].keys[:, :, :expected_len_1, :],
+            prev_keys,
+            atol=1e-4,
+            rtol=1e-4,
+        )
+        assert torch.allclose(
+            dec2.past_key_values.layers[layer_idx].values[:, :, :expected_len_1, :],
+            prev_values,
+            atol=1e-4,
+            rtol=1e-4,
+        )
 
 
 def test_split_decode_outputs_preserves_individual_caches(

@@ -121,26 +121,36 @@ def pad_and_stack_kv_caches(
     seq_lengths = [cache.layers[0].keys.shape[2] for cache in caches]
 
     max_seq_len = max(seq_lengths)
+    batch_size = len(caches)
+    _, num_kv_heads, _, head_dim = caches[0].layers[0].keys.shape
+    device = caches[0].layers[0].keys.device
+    dtype = caches[0].layers[0].keys.dtype
 
     batched_cache = DynamicCache()
     for layer_idx in range(num_layers):
-        padded_keys = []
-        padded_values = []
-        for cache in caches:
-            keys = cache.layers[layer_idx].keys
-            values = cache.layers[layer_idx].values
-
-            # Pad the seq_len dimension to max_seq_len with zeros on the left (since we are using left padding).
-            pad_len = max_seq_len - keys.shape[2]
-            padded_key = torch.nn.functional.pad(keys, (0, 0, pad_len, 0))
-            padded_value = torch.nn.functional.pad(values, (0, 0, pad_len, 0))
-
-            padded_keys.append(padded_key)
-            padded_values.append(padded_value)
-
-        # Stack along the batch dimension
-        batched_keys = torch.cat(padded_keys, dim=0)
-        batched_values = torch.cat(padded_values, dim=0)
+        # Pre-allocate output tensors and copy each cache into the right slice.
+        # This avoids the intermediate allocations from F.pad + torch.cat.
+        batched_keys = torch.zeros(
+            batch_size,
+            num_kv_heads,
+            max_seq_len,
+            head_dim,
+            device=device,
+            dtype=dtype,
+        )
+        batched_values = torch.zeros(
+            batch_size,
+            num_kv_heads,
+            max_seq_len,
+            head_dim,
+            device=device,
+            dtype=dtype,
+        )
+        for i, cache in enumerate(caches):
+            seq_len = seq_lengths[i]
+            # Right-align: actual data occupies the rightmost seq_len positions.
+            batched_keys[i, :, -seq_len:] = cache.layers[layer_idx].keys
+            batched_values[i, :, -seq_len:] = cache.layers[layer_idx].values
 
         batched_cache.update(
             key_states=batched_keys,
