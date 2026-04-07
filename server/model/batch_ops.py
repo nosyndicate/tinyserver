@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 from transformers import DynamicCache, PreTrainedModel, PreTrainedTokenizerFast
-from transformers.utils import CausalLMOutputWithPast
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 @dataclass
