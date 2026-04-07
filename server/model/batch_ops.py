@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 from transformers import DynamicCache, PreTrainedModel, PreTrainedTokenizerFast
+from transformers.utils import CausalLMOutputWithPast
 
 
 @dataclass
@@ -10,6 +11,12 @@ class PrefillBatchOutput:
     logits: Tensor
     past_key_values: DynamicCache
     num_prompt_tokens: int
+
+
+@dataclass
+class DecodeBatchOutput:
+    logits: Tensor
+    past_key_values: DynamicCache
 
 
 @torch.inference_mode()
@@ -70,6 +77,94 @@ def batched_prefill(
     )
 
 
+@torch.inference_mode()
+def batched_decode_forward(
+    model: PreTrainedModel,
+    token_ids: list[int],
+    past_key_values: list[DynamicCache],
+    device: str,
+) -> list[DecodeBatchOutput]:
+    input_ids = torch.tensor(token_ids, device=device, dtype=torch.long).reshape(-1, 1)
+
+    batched_cache, seq_lengths = pad_and_stack_kv_caches(past_key_values)
+
+    attention_mask = build_attention_mask(
+        seq_lengths=seq_lengths,
+        device=device,
+    )
+
+    # position_ids are of size [batch_size, 1] and indicate the position of token generated from
+    # last forward pass for each request.
+    position_ids = torch.tensor(seq_lengths, device=device).reshape(-1, 1)
+
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=batched_cache,
+        use_cache=True,
+    )
+
+    return split_decode_outputs(outputs, seq_lengths)
+
+
+def pad_and_stack_kv_caches(
+    caches: list[DynamicCache],
+) -> tuple[DynamicCache, list[int]]:
+    """
+    For a batch of requests, pad and stack their kv caches into a single cache that can be used
+    for a batched decode forward pass.
+    """
+    num_layers = len(caches[0].layers)
+    # Cache has the shape [b, num_kv_heads, seq_len, head_dim].
+    # We need to pad seq_len to the max seq_len in the batch.
+    seq_lengths = [cache.layers[0].keys.shape[2] for cache in caches]
+
+    max_seq_len = max(seq_lengths)
+
+    batched_cache = DynamicCache()
+    for layer_idx in range(num_layers):
+        padded_keys = []
+        padded_values = []
+        for cache in caches:
+            keys = cache.layers[layer_idx].keys
+            values = cache.layers[layer_idx].values
+
+            # Pad the seq_len dimension to max_seq_len with zeros on the left (since we are using left padding).
+            pad_len = max_seq_len - keys.shape[2]
+            padded_key = torch.nn.functional.pad(keys, (0, 0, pad_len, 0))
+            padded_value = torch.nn.functional.pad(values, (0, 0, pad_len, 0))
+
+            padded_keys.append(padded_key)
+            padded_values.append(padded_value)
+
+        # Stack along the batch dimension
+        batched_keys = torch.cat(padded_keys, dim=0)
+        batched_values = torch.cat(padded_values, dim=0)
+
+        batched_cache.update(
+            key_states=batched_keys,
+            value_states=batched_values,
+            layer_idx=layer_idx,
+        )
+
+    return batched_cache, seq_lengths
+
+
+def build_attention_mask(
+    seq_lengths: list[int],
+    device: str,
+) -> Tensor:
+    batch_size = len(seq_lengths)
+    max_len = max(seq_lengths)
+    attention_mask = torch.zeros(
+        (batch_size, max_len + 1), device=device, dtype=torch.long
+    )
+    for i, seq_len in enumerate(seq_lengths):
+        attention_mask[i, -(seq_len + 1) :] = 1
+    return attention_mask
+
+
 def split_prefill_outputs(
     logits: Tensor,
     past_key_values: DynamicCache,
@@ -102,6 +197,45 @@ def split_prefill_outputs(
                 logits=request_logits,
                 past_key_values=request_cache,
                 num_prompt_tokens=prompt_len,
+            )
+        )
+
+    return results
+
+
+def split_decode_outputs(
+    outputs: CausalLMOutputWithPast,
+    seq_lengths: list[int],
+) -> list[DecodeBatchOutput]:
+    """
+    For a batch of decode forward outputs, split the combined logits and cache into individual
+    results for each request.
+    """
+    results: list[DecodeBatchOutput] = []
+
+    batch_size = int(outputs.logits.shape[0])
+    for batch_idx in range(batch_size):
+        bs, be = batch_idx, batch_idx + 1
+        seq_len = seq_lengths[batch_idx] + 1
+
+        # logits should have the shape [batch_size, 1, vocab_size],
+        # where the 1 corresponds to the single new token being generated.
+        request_logits = outputs.logits[bs:be, :, :].contiguous()
+
+        request_cache = DynamicCache()
+        for layer_idx in range(len(outputs.past_key_values.layers)):
+            keys = outputs.past_key_values.layers[layer_idx].keys
+            values = outputs.past_key_values.layers[layer_idx].values
+            request_cache.update(
+                key_states=keys[bs:be, :, -seq_len:, :].contiguous(),
+                value_states=values[bs:be, :, -seq_len:, :].contiguous(),
+                layer_idx=layer_idx,
+            )
+
+        results.append(
+            DecodeBatchOutput(
+                logits=request_logits,
+                past_key_values=request_cache,
             )
         )
 
