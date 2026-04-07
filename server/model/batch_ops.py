@@ -22,6 +22,8 @@ def batched_prefill(
     """
     Run prefill for a batch of requests and split the outputs into individual results.
     """
+    if not prompts:
+        raise ValueError("prompts must not be empty")
 
     all_formatted_prompts: list[str] = []
     for prompt in prompts:
@@ -34,9 +36,22 @@ def batched_prefill(
     inputs = tokenizer(
         all_formatted_prompts, return_tensors="pt", padding=True, padding_side="left"
     ).to(device)
-    outputs = model(**inputs, use_cache=True)
+    input_ids = inputs["input_ids"]
+    attention_mask = inputs["attention_mask"]
 
-    attention_mask: Tensor = inputs["attention_mask"]
+    # We use Qwen3 which uses RoPE position embeddings, so we need to provide
+    # correct position ids that account for left padding to make sure we are
+    # getting the right kv cache outputs.
+    position_ids = attention_mask.long().cumsum(-1) - 1
+    position_ids.masked_fill_(attention_mask == 0, 0)
+
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        use_cache=True,
+    )
+
     logits: Tensor = outputs.logits
     batched_cache: DynamicCache = outputs.past_key_values
 
