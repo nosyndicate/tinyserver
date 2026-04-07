@@ -87,6 +87,20 @@ class ExecutorConfig:
     max_active_requests: int = field(default=10)
 
 
+@dataclass(frozen=True)
+class BatchExecutorConfig(ExecutorConfig):
+    """
+    The configuration for the batch executor.
+
+    Attributes:
+        max_prefill_batch_size: The maximum batch size for prefill. Requests will be grouped into batches of this size for the prefill step.
+        max_decode_batch_size: The maximum batch size for decode. Requests will be grouped into batches of this size for the decode steps.
+    """
+
+    max_prefill_batch_size: int = field(default=4)
+    max_decode_batch_size: int = field(default=4)
+
+
 class RequestStatus(Enum):
     QUEUED = "queued"
     PREFILLING = "prefilling"
@@ -141,3 +155,9 @@ class BaseExecutor(Protocol):
     def prefill(self, request_state: GenerationRequestState) -> None: ...
 
     def decode_one_step(self, request_state: GenerationRequestState) -> None: ...
+
+
+class BaseBatchExecutor(Protocol):
+    def batched_prefill(self, request_states: list[GenerationRequestState]) -> None: ...
+
+    def batched_decode(self, request_states: list[GenerationRequestState]) -> None: ...
