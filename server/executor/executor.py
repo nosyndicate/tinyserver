@@ -1,5 +1,3 @@
-from typing import TypeVar
-
 import torch
 
 from server.executor.types import (
@@ -14,14 +12,7 @@ from server.executor.types import (
 )
 from server.metrics.timers import now_ns, ns_to_ms
 from server.model.hf_runner import ModelRunner
-
-T = TypeVar("T")
-
-
-def assert_not_none(value: T | None) -> T:
-    if value is None:
-        raise ValueError("Expected value to be not None")
-    return value
+from server.utils import assert_not_none
 
 
 def _handle_error(request_state: GenerationRequestState, error: Exception) -> None:

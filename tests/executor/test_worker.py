@@ -32,6 +32,7 @@ from server.executor.types import (
 )
 from server.executor.worker import Worker
 from server.model.sampling import SamplingParams
+from server.utils import assert_not_none
 
 # ─── Test infrastructure ──────────────────────────────────────────────────────
 
@@ -226,8 +227,8 @@ def test_stop_joins_thread() -> None:
     worker = make_worker()
     worker.start()
     worker.stop()
-    assert worker._thread is not None
-    assert not worker._thread.is_alive()
+
+    assert not assert_not_none(worker._thread).is_alive()
 
 
 def test_double_start_is_noop() -> None:
@@ -237,8 +238,7 @@ def test_double_start_is_noop() -> None:
         tid_after_first = id(worker._thread)
         worker.start()  # should log a warning and return
         assert id(worker._thread) == tid_after_first
-        assert worker._thread is not None
-        assert worker._thread.is_alive()
+        assert assert_not_none(worker._thread).is_alive()
     finally:
         worker.stop()
 
@@ -438,9 +438,10 @@ def test_graceful_decode_failure_removes_request_from_active() -> None:
 
 
 def _wait_for_worker_to_die(worker: Worker, timeout: float = 2.0) -> None:
-    assert worker._thread is not None
-    worker._thread.join(timeout=timeout)
-    assert not worker._thread.is_alive(), "Worker thread did not exit within timeout"
+    assert_not_none(worker._thread).join(timeout=timeout)
+    assert not assert_not_none(worker._thread).is_alive(), (
+        "Worker thread did not exit within timeout"
+    )
 
 
 def _assert_error_event(req: GenerationRequestState) -> None:
@@ -583,8 +584,7 @@ def test_shutdown_set_at_first_prefill_cancels_both() -> None:
     worker.submit(r0)
     worker.submit(r1)
     worker.start()
-    assert worker._thread is not None
-    worker._thread.join(timeout=2.0)
+    assert_not_none(worker._thread).join(timeout=2.0)
 
     for req in [r0, r1]:
         events = drain_events(req)
