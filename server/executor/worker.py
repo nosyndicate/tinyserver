@@ -17,17 +17,8 @@ logger = logging.getLogger(__name__)
 
 class Worker(Protocol):
     """
-    Worker is responsible for managing the lifecycle of generation requests, including prefill and decode steps.
-
-    Usage:
-        worker = Worker(executor, config)
-        worker.start()
-        worker.submit(request_state)
-        ...
-        worker.stop()
+    Protocol for worker implementations that manage the lifecycle of generation requests.
     """
-
-    def _run_loop(self) -> None: ...
 
     def start(self) -> None: ...
 
