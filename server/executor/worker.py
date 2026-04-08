@@ -341,6 +341,8 @@ class BatchWorker(Worker):
 
     def _select_decode_batch(self) -> list[GenerationRequestState]:
         """Select a batch of requests from the active list for decode, up to max_decode_batch_size."""
+        # Check the status to ensure we only select requests that have completed prefill and are ready for decode.
+        # This is just being defensive, in the current implementation of the loop, all active requests should be in DECODING status
         decoding = [req for req in self._active if req.status == RequestStatus.DECODING]
         return decoding[: self._config.max_decode_batch_size]
 
