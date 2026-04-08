@@ -24,13 +24,15 @@ from typing import Any, Callable
 import pytest
 
 from server.executor.types import (
+    BaseBatchExecutor,
     BaseExecutor,
+    BatchExecutorConfig,
     ErrorEvent,
     ExecutorConfig,
     GenerationRequestState,
     RequestStatus,
 )
-from server.executor.worker import SimpleWorker
+from server.executor.worker import BatchWorker, SimpleWorker
 from server.model.sampling import SamplingParams
 
 # ─── Test infrastructure ──────────────────────────────────────────────────────
@@ -1001,3 +1003,573 @@ def test_max_active_one_serialises_requests() -> None:
 
     assert prefill_order == ["r0", "r1"]
     assert done_at_prefill.get("r0_status") == RequestStatus.DONE
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BatchWorker tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─── BatchWorker test infrastructure ─────────────────────────────────────────
+
+
+class FakeBatchExecutor(BaseBatchExecutor):
+    """
+    Hand-crafted fake batch executor with per-request behavioral control.
+
+    prefill_side_effect: callable | BaseException | None
+        None (default) → sets each req.status = DECODING
+        BaseException instance → raised (triggers _handle_fatal_error)
+        callable(request_states) → called instead of default behaviour
+
+    decode_steps: dict[str, int]
+        Number of decode calls before setting status=DONE (default: 1).
+
+    decode_side_effect: callable | BaseException | None
+        Same structure as prefill_side_effect; applied to the whole batch.
+
+    prefill_hook / decode_hook: threading.Event | None
+        Set exactly once on the first call (useful for synchronisation).
+
+    decode_gate: threading.Event | None
+        batched_decode() blocks on gate.wait() before executing.
+    """
+
+    def __init__(
+        self,
+        prefill_side_effect: Any | None = None,
+        decode_steps: dict[str, int] | None = None,
+        decode_side_effect: Any | None = None,
+        prefill_hook: threading.Event | None = None,
+        decode_hook: threading.Event | None = None,
+        decode_gate: threading.Event | None = None,
+    ) -> None:
+        self._prefill_fx = prefill_side_effect
+        self._decode_steps = decode_steps or {}
+        self._decode_fx = decode_side_effect
+        self._prefill_hook = prefill_hook
+        self._decode_hook = decode_hook
+        self._decode_gate = decode_gate
+        self._decode_counts: dict[str, int] = {}
+
+    def batched_prefill(self, request_states: list[GenerationRequestState]) -> None:
+        if self._prefill_hook is not None:
+            self._prefill_hook.set()
+            self._prefill_hook = None
+
+        if isinstance(self._prefill_fx, BaseException):
+            raise self._prefill_fx
+        elif callable(self._prefill_fx):
+            self._prefill_fx(request_states)
+        else:
+            for req in request_states:
+                req.status = RequestStatus.DECODING
+
+    def batched_decode(self, request_states: list[GenerationRequestState]) -> None:
+        if self._decode_hook is not None:
+            self._decode_hook.set()
+            self._decode_hook = None
+
+        if self._decode_gate is not None:
+            self._decode_gate.wait(timeout=5.0)
+
+        if isinstance(self._decode_fx, BaseException):
+            raise self._decode_fx
+        elif callable(self._decode_fx):
+            self._decode_fx(request_states)
+        else:
+            for req in request_states:
+                n = self._decode_counts.get(req.request_id, 0) + 1
+                self._decode_counts[req.request_id] = n
+                steps = self._decode_steps.get(req.request_id, 1)
+                if n >= steps:
+                    req.status = RequestStatus.DONE
+
+
+def make_batch_worker(
+    executor: FakeBatchExecutor | None = None,
+    max_queue_size: int = 16,
+    max_active_requests: int = 4,
+    max_prefill_batch_size: int = 4,
+    max_decode_batch_size: int = 4,
+) -> BatchWorker:
+    if executor is None:
+        executor = FakeBatchExecutor()
+    return BatchWorker(
+        executor,
+        BatchExecutorConfig(
+            max_queue_size=max_queue_size,
+            max_active_requests=max_active_requests,
+            max_prefill_batch_size=max_prefill_batch_size,
+            max_decode_batch_size=max_decode_batch_size,
+        ),
+    )
+
+
+def _wait_for_batch_worker_to_die(worker: BatchWorker, timeout: float = 2.0) -> None:
+    assert worker._thread is not None
+    worker._thread.join(timeout=timeout)
+    assert not worker._thread.is_alive(), "Worker thread did not exit within timeout"
+
+
+# ─── BatchWorker Group 1: Constructor validation ─────────────────────────────
+
+
+def test_batch_max_queue_size_zero_raises() -> None:
+    with pytest.raises(ValueError, match="max_queue_size"):
+        make_batch_worker(max_queue_size=0)
+
+
+def test_batch_max_active_requests_zero_raises() -> None:
+    with pytest.raises(ValueError, match="max_active_requests"):
+        make_batch_worker(max_active_requests=0)
+
+
+def test_batch_max_prefill_batch_size_zero_raises() -> None:
+    with pytest.raises(ValueError, match="max_prefill_batch_size"):
+        make_batch_worker(max_prefill_batch_size=0)
+
+
+def test_batch_max_decode_batch_size_zero_raises() -> None:
+    with pytest.raises(ValueError, match="max_decode_batch_size"):
+        make_batch_worker(max_decode_batch_size=0)
+
+
+def test_batch_prefill_batch_size_exceeds_max_active_raises() -> None:
+    with pytest.raises(ValueError, match="max_prefill_batch_size"):
+        make_batch_worker(max_active_requests=2, max_prefill_batch_size=3)
+
+
+def test_batch_decode_batch_size_exceeds_max_active_raises() -> None:
+    with pytest.raises(ValueError, match="max_decode_batch_size"):
+        make_batch_worker(
+            max_active_requests=2, max_prefill_batch_size=2, max_decode_batch_size=3
+        )
+
+
+# ─── BatchWorker Group 2: Happy-path request lifecycle ───────────────────────
+
+
+def test_batch_single_request_completes() -> None:
+    worker = make_batch_worker()
+    r0 = make_req("r0")
+    try:
+        worker.start()
+        worker.submit(r0)
+        assert wait_for_status(r0, RequestStatus.DONE)
+    finally:
+        worker.stop()
+
+
+def test_batch_multistep_decode_completes() -> None:
+    executor = FakeBatchExecutor(decode_steps={"r0": 3})
+    worker = make_batch_worker(executor)
+    r0 = make_req("r0")
+    try:
+        worker.start()
+        worker.submit(r0)
+        assert wait_for_status(r0, RequestStatus.DONE)
+    finally:
+        worker.stop()
+
+
+def test_batch_three_concurrent_requests_all_complete() -> None:
+    worker = make_batch_worker(max_active_requests=4)
+    reqs = [make_req(f"r{i}") for i in range(3)]
+    try:
+        worker.start()
+        for req in reqs:
+            worker.submit(req)
+        for req in reqs:
+            assert wait_for_status(req, RequestStatus.DONE), (
+                f"{req.request_id} did not complete"
+            )
+    finally:
+        worker.stop()
+
+
+def test_batch_more_requests_than_max_active_all_complete() -> None:
+    worker = make_batch_worker(
+        max_queue_size=8,
+        max_active_requests=2,
+        max_prefill_batch_size=2,
+        max_decode_batch_size=2,
+    )
+    reqs = [make_req(f"r{i}") for i in range(5)]
+    try:
+        worker.start()
+        for req in reqs:
+            worker.submit(req)
+        for req in reqs:
+            assert wait_for_status(req, RequestStatus.DONE), (
+                f"{req.request_id} did not complete"
+            )
+    finally:
+        worker.stop()
+
+
+# ─── BatchWorker Group 3: Batching behaviour ─────────────────────────────────
+
+
+def test_batch_prefill_respects_max_prefill_batch_size() -> None:
+    """batched_prefill is called with at most max_prefill_batch_size requests."""
+    prefill_sizes: list[int] = []
+
+    def recording_prefill(request_states: list[GenerationRequestState]) -> None:
+        prefill_sizes.append(len(request_states))
+        for req in request_states:
+            req.status = RequestStatus.DECODING
+
+    executor = FakeBatchExecutor(prefill_side_effect=recording_prefill)
+    worker = make_batch_worker(
+        executor, max_queue_size=16, max_active_requests=8, max_prefill_batch_size=2
+    )
+    reqs = [make_req(f"r{i}") for i in range(5)]
+    for req in reqs:
+        worker.submit(req)
+    try:
+        worker.start()
+        for req in reqs:
+            assert wait_for_status(req, RequestStatus.DONE), (
+                f"{req.request_id} did not complete"
+            )
+    finally:
+        worker.stop()
+
+    assert all(size <= 2 for size in prefill_sizes), (
+        f"Prefill batch sizes {prefill_sizes} exceeded max_prefill_batch_size=2"
+    )
+
+
+def test_batch_decode_respects_max_decode_batch_size() -> None:
+    """batched_decode is called with at most max_decode_batch_size requests."""
+    decode_sizes: list[int] = []
+
+    def recording_decode(request_states: list[GenerationRequestState]) -> None:
+        decode_sizes.append(len(request_states))
+        for req in request_states:
+            req.status = RequestStatus.DONE
+
+    executor = FakeBatchExecutor(decode_side_effect=recording_decode)
+    worker = make_batch_worker(
+        executor, max_queue_size=16, max_active_requests=8, max_decode_batch_size=2
+    )
+    reqs = [make_req(f"r{i}") for i in range(5)]
+    for req in reqs:
+        worker.submit(req)
+    try:
+        worker.start()
+        for req in reqs:
+            assert wait_for_status(req, RequestStatus.DONE), (
+                f"{req.request_id} did not complete"
+            )
+    finally:
+        worker.stop()
+
+    assert all(size <= 2 for size in decode_sizes), (
+        f"Decode batch sizes {decode_sizes} exceeded max_decode_batch_size=2"
+    )
+
+
+# ─── BatchWorker Group 4: Shutdown ───────────────────────────────────────────
+
+
+def test_batch_stop_cancels_waiting_requests() -> None:
+    """Requests in _waiting are cancelled with ErrorEvents during stop()."""
+    prefill_entered = threading.Event()
+    prefill_gate = threading.Event()
+
+    def blocking_prefill(request_states: list[GenerationRequestState]) -> None:
+        prefill_entered.set()
+        prefill_gate.wait(timeout=5.0)
+        for req in request_states:
+            req.status = RequestStatus.DECODING
+
+    executor = FakeBatchExecutor(prefill_side_effect=blocking_prefill)
+    # max_prefill_batch_size=1 so only one request enters prefill at a time
+    worker = make_batch_worker(
+        executor,
+        max_queue_size=8,
+        max_active_requests=4,
+        max_prefill_batch_size=1,
+    )
+    r0, r1, r2 = make_req("r0"), make_req("r1"), make_req("r2")
+    worker.submit(r0)
+    worker.submit(r1)
+    worker.submit(r2)
+    worker.start()
+
+    # Wait for first prefill to start (r0 is in prefill, r1/r2 in _waiting)
+    assert prefill_entered.wait(timeout=2.0)
+
+    # Set shutdown and release gate
+    worker._shutdown_event.set()
+    prefill_gate.set()
+
+    worker.stop()
+
+    # r1 and r2 were in _waiting and should have been cancelled
+    for req in [r1, r2]:
+        events = drain_events(req)
+        assert any(isinstance(e, ErrorEvent) for e in events), (
+            f"{req.request_id} should have received an ErrorEvent"
+        )
+        assert req.status == RequestStatus.FAILED
+
+
+def test_batch_stop_cancels_active_requests() -> None:
+    """Active requests are cancelled during stop()."""
+    decode_entered = threading.Event()
+    decode_gate = threading.Event()
+
+    def blocking_decode(request_states: list[GenerationRequestState]) -> None:
+        decode_entered.set()
+        decode_gate.wait(timeout=5.0)
+        # Leave as DECODING — stop() should cancel them.
+
+    executor = FakeBatchExecutor(decode_side_effect=blocking_decode)
+    worker = make_batch_worker(
+        executor,
+        max_active_requests=2,
+        max_prefill_batch_size=2,
+        max_decode_batch_size=2,
+    )
+    r0, r1 = make_req("r0"), make_req("r1")
+    worker.submit(r0)
+    worker.submit(r1)
+    worker.start()
+
+    assert decode_entered.wait(timeout=2.0)
+
+    # Call stop() in a background thread
+    stop_done = threading.Event()
+
+    def do_stop() -> None:
+        worker.stop()
+        stop_done.set()
+
+    threading.Thread(target=do_stop, daemon=True).start()
+
+    # Wait for shutdown signal, then release decode
+    deadline = time.monotonic() + 2.0
+    while not worker._shutdown_event.is_set() and time.monotonic() < deadline:
+        time.sleep(0.001)
+    decode_gate.set()
+    stop_done.wait(timeout=5.0)
+
+    for req in [r0, r1]:
+        assert req.status == RequestStatus.FAILED
+        events = drain_events(req)
+        assert len(events) == 1
+        assert isinstance(events[0], ErrorEvent)
+
+
+def test_batch_stop_cancels_inbound_requests() -> None:
+    """Requests still in the inbound queue are cancelled during stop()."""
+    worker = make_batch_worker()
+    r0, r1 = make_req("r0"), make_req("r1")
+    # Submit without starting — requests stay in inbound queue
+    worker.submit(r0)
+    worker.submit(r1)
+    worker.stop()
+
+    for req in [r0, r1]:
+        assert req.status == RequestStatus.FAILED
+        events = drain_events(req)
+        assert len(events) == 1
+        assert isinstance(events[0], ErrorEvent)
+
+
+# ─── BatchWorker Group 5: Prefill exception ──────────────────────────────────
+
+
+def test_batch_prefill_exception_all_requests_get_error_event() -> None:
+    """All requests in the prefill batch get ErrorEvents when batched_prefill raises."""
+    executor = FakeBatchExecutor(prefill_side_effect=RuntimeError("prefill boom"))
+    worker = make_batch_worker(executor, max_active_requests=4)
+    reqs = [make_req(f"r{i}") for i in range(3)]
+    for req in reqs:
+        worker.submit(req)
+    worker.start()
+    _wait_for_batch_worker_to_die(worker)
+
+    for req in reqs:
+        _assert_error_event(req)
+    worker.stop()
+
+
+def test_batch_prefill_exception_waiting_requests_also_cancelled() -> None:
+    """Requests still in _waiting when prefill raises also get ErrorEvents."""
+    executor = FakeBatchExecutor(prefill_side_effect=RuntimeError("prefill boom"))
+    # max_prefill_batch_size=1 means only r0 enters prefill, r1/r2 stay in _waiting
+    worker = make_batch_worker(
+        executor,
+        max_queue_size=8,
+        max_active_requests=4,
+        max_prefill_batch_size=1,
+    )
+    reqs = [make_req(f"r{i}") for i in range(3)]
+    for req in reqs:
+        worker.submit(req)
+    worker.start()
+    _wait_for_batch_worker_to_die(worker)
+
+    for req in reqs:
+        _assert_error_event(req)
+    worker.stop()
+
+
+def test_batch_prefill_exception_inbound_also_cancelled() -> None:
+    """Requests still in the inbound queue when prefill raises get ErrorEvents."""
+    executor = FakeBatchExecutor(prefill_side_effect=RuntimeError("prefill boom"))
+    # max_active_requests=2 means at most 2 move to waiting; r2/r3 stay in inbound
+    worker = make_batch_worker(
+        executor,
+        max_queue_size=8,
+        max_active_requests=2,
+        max_prefill_batch_size=2,
+        max_decode_batch_size=2,
+    )
+    reqs = [make_req(f"r{i}") for i in range(4)]
+    for req in reqs:
+        worker.submit(req)
+    worker.start()
+    _wait_for_batch_worker_to_die(worker)
+
+    for req in reqs:
+        _assert_error_event(req)
+    worker.stop()
+
+
+# ─── BatchWorker Group 6: Decode exception ───────────────────────────────────
+
+
+def test_batch_decode_exception_cancels_all() -> None:
+    """An exception in batched_decode triggers _handle_fatal_error."""
+    executor = FakeBatchExecutor(decode_side_effect=RuntimeError("decode boom"))
+    worker = make_batch_worker(executor)
+    r0 = make_req("r0")
+    worker.submit(r0)
+    worker.start()
+    _wait_for_batch_worker_to_die(worker)
+
+    _assert_error_event(r0)
+    worker.stop()
+
+
+def test_batch_decode_exception_cancels_active_and_waiting() -> None:
+    """Decode exception cancels both active and waiting requests."""
+
+    def decode_boom_on_first(request_states: list[GenerationRequestState]) -> None:
+        raise RuntimeError("decode boom")
+
+    executor = FakeBatchExecutor(decode_side_effect=decode_boom_on_first)
+    # max_prefill_batch_size=1 so r1 stays in _waiting while r0 is decoded
+    worker = make_batch_worker(
+        executor,
+        max_queue_size=8,
+        max_active_requests=4,
+        max_prefill_batch_size=1,
+    )
+    r0, r1 = make_req("r0"), make_req("r1")
+    worker.submit(r0)
+    worker.submit(r1)
+    worker.start()
+    _wait_for_batch_worker_to_die(worker)
+
+    for req in [r0, r1]:
+        _assert_error_event(req)
+    worker.stop()
+
+
+def test_batch_stop_after_decode_crash_is_safe() -> None:
+    """stop() must not raise even if the worker thread has already died."""
+    executor = FakeBatchExecutor(decode_side_effect=RuntimeError("boom"))
+    worker = make_batch_worker(executor)
+    worker.submit(make_req("r0"))
+    worker.start()
+    _wait_for_batch_worker_to_die(worker)
+    worker.stop()  # must not raise
+    assert worker._thread is not None
+    assert not worker._thread.is_alive()
+
+
+# ─── BatchWorker Group 7: Graceful failure ───────────────────────────────────
+
+
+def test_batch_graceful_prefill_failure_does_not_block_others() -> None:
+    """A graceful prefill failure (status set to FAILED without exception) doesn't block other requests."""
+
+    def prefill_fail_r0(request_states: list[GenerationRequestState]) -> None:
+        for req in request_states:
+            if req.request_id == "r0":
+                req.status = RequestStatus.FAILED
+                req.error = "model error"
+                req.output_queue.put(
+                    ErrorEvent(request_id=req.request_id, error=req.error)
+                )
+            else:
+                req.status = RequestStatus.DECODING
+
+    executor = FakeBatchExecutor(prefill_side_effect=prefill_fail_r0)
+    worker = make_batch_worker(executor, max_active_requests=4)
+    r0, r1 = make_req("r0"), make_req("r1")
+    try:
+        worker.start()
+        worker.submit(r0)
+        worker.submit(r1)
+        assert wait_for_status(r1, RequestStatus.DONE), "r1 should have completed"
+    finally:
+        worker.stop()
+
+    assert r0.status == RequestStatus.FAILED
+    assert r1.status == RequestStatus.DONE
+
+
+# ─── BatchWorker Group 8: Edge cases ─────────────────────────────────────────
+
+
+def test_batch_idle_worker_does_not_crash() -> None:
+    worker = make_batch_worker()
+    try:
+        worker.start()
+        time.sleep(0.05)
+        assert worker._thread is not None
+        assert worker._thread.is_alive()
+    finally:
+        worker.stop()
+    assert worker._thread is not None
+    assert not worker._thread.is_alive()
+
+
+def test_batch_worker_restart_after_stop() -> None:
+    """stop() then start() must work."""
+    worker = make_batch_worker()
+
+    r0 = make_req("r0")
+    worker.start()
+    worker.submit(r0)
+    assert wait_for_status(r0, RequestStatus.DONE)
+    worker.stop()
+    thread_id_first = id(worker._thread)
+
+    r1 = make_req("r1")
+    worker.start()
+    assert id(worker._thread) != thread_id_first
+    worker.submit(r1)
+    assert wait_for_status(r1, RequestStatus.DONE)
+    worker.stop()
+
+
+def test_batch_submit_after_stop_raises() -> None:
+    worker = make_batch_worker()
+    worker.stop()
+    with pytest.raises(RuntimeError, match="shutting down"):
+        worker.submit(make_req("r0"))
+
+
+def test_batch_submit_full_queue_raises() -> None:
+    worker = make_batch_worker(max_queue_size=1)
+    worker.submit(make_req("r0"))
+    with pytest.raises(queue.Full):
+        worker.submit(make_req("r1"))
+    worker.stop()
