@@ -1,21 +1,24 @@
 import logging
 import threading
 from queue import Empty, Queue
+from typing import Protocol
 
 from server.executor.types import (
+    BaseExecutor,
     ErrorEvent,
     ExecutorConfig,
     GenerationRequestState,
     RequestStatus,
-    BaseExecutor,
 )
 from server.metrics.timers import now_ns
 
 logger = logging.getLogger(__name__)
 
 
-class Worker:
+class Worker(Protocol):
     """
+    Worker is responsible for managing the lifecycle of generation requests, including prefill and decode steps.
+
     Usage:
         worker = Worker(executor, config)
         worker.start()
@@ -24,6 +27,16 @@ class Worker:
         worker.stop()
     """
 
+    def _run_loop(self) -> None: ...
+
+    def start(self) -> None: ...
+
+    def stop(self) -> None: ...
+
+    def submit(self, request_state: GenerationRequestState) -> None: ...
+
+
+class SingleRequestWorker:
     def __init__(self, executor: BaseExecutor, config: ExecutorConfig) -> None:
         if config.max_queue_size <= 0:
             raise ValueError("max_queue_size must be positive")

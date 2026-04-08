@@ -30,7 +30,7 @@ from server.executor.types import (
     GenerationRequestState,
     RequestStatus,
 )
-from server.executor.worker import Worker
+from server.executor.worker import SingleRequestWorker
 from server.model.sampling import SamplingParams
 
 # ─── Test infrastructure ──────────────────────────────────────────────────────
@@ -158,10 +158,10 @@ def make_worker(
     executor: FakeExecutor | None = None,
     max_queue_size: int = 16,
     max_active_requests: int = 4,
-) -> Worker:
+) -> SingleRequestWorker:
     if executor is None:
         executor = FakeExecutor()
-    return Worker(
+    return SingleRequestWorker(
         executor,
         ExecutorConfig(
             max_queue_size=max_queue_size, max_active_requests=max_active_requests
@@ -174,12 +174,16 @@ def make_worker(
 
 def test_max_queue_size_zero_raises() -> None:
     with pytest.raises(ValueError, match="max_queue_size"):
-        Worker(FakeExecutor(), ExecutorConfig(max_queue_size=0, max_active_requests=1))
+        SingleRequestWorker(
+            FakeExecutor(), ExecutorConfig(max_queue_size=0, max_active_requests=1)
+        )
 
 
 def test_max_active_requests_zero_raises() -> None:
     with pytest.raises(ValueError, match="max_active_requests"):
-        Worker(FakeExecutor(), ExecutorConfig(max_queue_size=1, max_active_requests=0))
+        SingleRequestWorker(
+            FakeExecutor(), ExecutorConfig(max_queue_size=1, max_active_requests=0)
+        )
 
 
 @pytest.mark.parametrize(
@@ -188,13 +192,13 @@ def test_max_active_requests_zero_raises() -> None:
 )
 def test_invalid_config_parametrized(qs: int, mar: int) -> None:
     with pytest.raises(ValueError):
-        Worker(
+        SingleRequestWorker(
             FakeExecutor(), ExecutorConfig(max_queue_size=qs, max_active_requests=mar)
         )
 
 
 def test_minimum_valid_config_constructs() -> None:
-    worker = Worker(
+    worker = SingleRequestWorker(
         FakeExecutor(), ExecutorConfig(max_queue_size=1, max_active_requests=1)
     )
     assert worker._thread is None
@@ -437,7 +441,7 @@ def test_graceful_decode_failure_removes_request_from_active() -> None:
 # ─── Group 6: prefill exception cancels the entire new_requests batch ────────
 
 
-def _wait_for_worker_to_die(worker: Worker, timeout: float = 2.0) -> None:
+def _wait_for_worker_to_die(worker: SingleRequestWorker, timeout: float = 2.0) -> None:
     assert worker._thread is not None
     worker._thread.join(timeout=timeout)
     assert not worker._thread.is_alive(), "Worker thread did not exit within timeout"
