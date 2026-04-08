@@ -19,8 +19,7 @@ from server.metrics.timers import now_ns, ns_to_ms, timed
 from server.model.determinism import make_generator
 from server.model.hf_runner import ModelRunner
 from server.model.sampling import build_sampling_params
-
-_GENERATION_TIMEOUT_S = 300  # 5 minutes
+from server.utils import GENERATION_TIMEOUT_S
 
 
 def _compute_tokens_per_s(num_output_tokens: int, total_ms: float) -> float:
@@ -142,7 +141,7 @@ def generate_v2(req: GenerateRequest, request: Request) -> GenerateResponse:
 
     while True:
         try:
-            event: Event = state.output_queue.get(timeout=_GENERATION_TIMEOUT_S)
+            event: Event = state.output_queue.get(timeout=GENERATION_TIMEOUT_S)
         except Empty:
             raise HTTPException(
                 status_code=504,
@@ -230,7 +229,7 @@ def generate_stream_v2(req: GenerateRequest, request: Request) -> StreamingRespo
     def _event_stream() -> Generator[str, None, None]:
         while True:
             try:
-                event: Event = state.output_queue.get(timeout=_GENERATION_TIMEOUT_S)
+                event: Event = state.output_queue.get(timeout=GENERATION_TIMEOUT_S)
             except Empty:
                 error_chunk = StreamChunk(
                     token_str="",
@@ -249,7 +248,7 @@ def generate_stream_v2(req: GenerateRequest, request: Request) -> StreamingRespo
                 if event.is_last:
                     try:
                         done_event = state.output_queue.get(
-                            timeout=_GENERATION_TIMEOUT_S
+                            timeout=GENERATION_TIMEOUT_S
                         )
                     except Empty:
                         error_chunk = StreamChunk(

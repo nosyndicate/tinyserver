@@ -215,8 +215,7 @@ def test_start_creates_named_daemon_thread() -> None:
     worker = make_worker()
     try:
         worker.start()
-        assert worker._thread is not None
-        assert worker._thread.is_alive()
+        assert assert_not_none(worker._thread).is_alive()
         assert worker._thread.daemon is True
         assert worker._thread.name == "inference-worker"
     finally:
@@ -550,7 +549,7 @@ def test_shutdown_between_prefill_calls_cancels_remaining() -> None:
     # Worker has completed r0's prefill (r0 is now in active) and is blocked.
     worker._shutdown_event.set()
     test_can_proceed.set()
-    assert worker._thread is not None
+    assert assert_not_none(worker._thread).is_alive()
     worker._thread.join(timeout=2.0)
 
     # r0 was in self._active → cancelled by the prefill-loop shutdown handler
@@ -646,8 +645,7 @@ def test_decode_completes_before_shutdown_check_request_is_done() -> None:
         decode_entered.wait(timeout=2.0)  # worker is blocked inside decode
         worker._shutdown_event.set()
         decode_gate.set()
-        assert worker._thread is not None
-        worker._thread.join(timeout=2.0)
+        assert_not_none(worker._thread).join(timeout=2.0)
     finally:
         worker.stop()
 
@@ -671,8 +669,7 @@ def test_shutdown_between_decode_calls_cancels_all_active() -> None:
     worker.submit(r0)
     worker.submit(r1)
     worker.start()
-    assert worker._thread is not None
-    worker._thread.join(timeout=2.0)
+    assert_not_none(worker._thread).join(timeout=2.0)
 
     for req in [r0, r1]:
         events = drain_events(req)
@@ -780,8 +777,7 @@ def test_stop_after_decode_crash_is_safe() -> None:
     worker.start()
     _wait_for_worker_to_die(worker)
     worker.stop()  # must not raise
-    assert worker._thread is not None
-    assert not worker._thread.is_alive()
+    assert not assert_not_none(worker._thread).is_alive()
 
 
 # ─── Group 10: Capacity and batching ─────────────────────────────────────────
@@ -903,8 +899,7 @@ def test_idle_worker_with_empty_queue_does_not_crash() -> None:
     try:
         worker.start()
         time.sleep(0.05)  # let the worker spin through several idle
-        assert worker._thread is not None
-        assert worker._thread.is_alive()
+        assert assert_not_none(worker._thread).is_alive()
     finally:
         worker.stop()
     assert worker._thread is not None

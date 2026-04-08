@@ -1,6 +1,7 @@
 from typing import TypeVar
 
 LOWEST_TEMPERATURE = 1e-5
+GENERATION_TIMEOUT_S = 300  # 5 minutes
 
 
 T = TypeVar("T")
