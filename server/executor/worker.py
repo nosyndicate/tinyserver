@@ -19,13 +19,16 @@ class Worker(ABC):
     """Abstract base class for worker implementations that manage the lifecycle of generation requests."""
 
     @abstractmethod
-    def start(self) -> None: ...
+    def start(self) -> None:
+        raise NotImplementedError
 
     @abstractmethod
-    def stop(self) -> None: ...
+    def stop(self) -> None:
+        raise NotImplementedError
 
     @abstractmethod
-    def submit(self, request_state: GenerationRequestState) -> None: ...
+    def submit(self, request_state: GenerationRequestState) -> None:
+        raise NotImplementedError
 
 
 class SimpleWorker(Worker):
