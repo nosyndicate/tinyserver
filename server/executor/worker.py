@@ -1,7 +1,7 @@
 import logging
 import threading
+from abc import ABC, abstractmethod
 from queue import Empty, Queue
-from typing import Protocol
 
 from server.executor.types import (
     BaseExecutor,
@@ -15,19 +15,29 @@ from server.metrics.timers import now_ns
 logger = logging.getLogger(__name__)
 
 
-class Worker(Protocol):
-    """
-    Protocol for worker implementations that manage the lifecycle of generation requests.
-    """
+class Worker(ABC):
+    """Abstract base class for worker implementations that manage the lifecycle of generation requests."""
 
+    @abstractmethod
     def start(self) -> None: ...
 
+    @abstractmethod
     def stop(self) -> None: ...
 
+    @abstractmethod
     def submit(self, request_state: GenerationRequestState) -> None: ...
 
 
-class SingleRequestWorker:
+class SimpleWorker(Worker):
+    """
+    Usage:
+        worker = SimpleWorker(executor, config)
+        worker.start()
+        worker.submit(request_state)
+        ...
+        worker.stop()
+    """
+
     def __init__(self, executor: BaseExecutor, config: ExecutorConfig) -> None:
         if config.max_queue_size <= 0:
             raise ValueError("max_queue_size must be positive")

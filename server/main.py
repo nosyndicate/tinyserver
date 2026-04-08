@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from server.api.routes import router as api_router
 from server.executor.executor import Executor
 from server.executor.types import ExecutorConfig
-from server.executor.worker import SingleRequestWorker
+from server.executor.worker import SimpleWorker
 from server.model.hf_runner import ModelConfig, load_hf_model
 
 
@@ -24,7 +24,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     executor = Executor(runner)
     executor_config = ExecutorConfig()
-    worker = SingleRequestWorker(executor, executor_config)
+    worker = SimpleWorker(executor, executor_config)
     worker.start()
 
     app.state.runner = runner
