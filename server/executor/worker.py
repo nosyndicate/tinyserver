@@ -4,7 +4,9 @@ from abc import ABC, abstractmethod
 from queue import Empty, Queue
 
 from server.executor.types import (
+    BaseBatchExecutor,
     BaseExecutor,
+    BatchExecutorConfig,
     ErrorEvent,
     ExecutorConfig,
     GenerationRequestState,
@@ -225,7 +227,11 @@ class SimpleWorker(Worker):
         """Signal the thread to stop and wait for it to finish."""
         self._shutdown_event.set()
 
-        # Drain the inbound queue and emit error events for pending requests
+        if self._thread is not None:
+            self._thread.join()
+            logger.info("Worker thread stopped")
+
+        # Thread has stopped — drain any remaining inbound requests without races
         while True:
             try:
                 req = self._inbound.get_nowait()
@@ -233,11 +239,7 @@ class SimpleWorker(Worker):
             except Empty:
                 break
 
-        if self._thread is not None:
-            self._thread.join()
-            logger.info("Worker thread stopped")
-
-        # Since thread stopped, cancel any active requests that were still in-flight
+        # Cancel any active requests that were still in-flight
         for pending in self._active:
             try:
                 self._cancel_request(
@@ -249,6 +251,243 @@ class SimpleWorker(Worker):
                     pending.request_id,
                 )
 
+        self._active.clear()
+
+    def submit(self, request_state: GenerationRequestState) -> None:
+        """Submit a new request to the worker.
+
+        Raises:
+            queue.Full: If the worker's inbound queue is full, indicating that the worker is overloaded.
+        """
+        if self._shutdown_event.is_set():
+            raise RuntimeError("Cannot submit new request, worker is shutting down")
+
+        request_state.enqueued_ns = now_ns()
+        self._inbound.put_nowait(request_state)
+
+
+class BatchWorker(Worker):
+    """
+    A BatchWorker implementation that batches requests together for more efficient processing.
+    The implementation is similar to SimpleWorker, but it collects new requests into batches before processing.
+    The batch size is determined by the BatchExecutorConfig (e.g., max_prefill_batch_size and max_decode_batch_size).
+    """
+
+    def _check_config(self, config: BatchExecutorConfig) -> None:
+        if config.max_queue_size <= 0:
+            raise ValueError("max_queue_size must be positive")
+        if config.max_active_requests <= 0:
+            raise ValueError("max_active_requests must be positive")
+        if config.max_prefill_batch_size <= 0:
+            raise ValueError("max_prefill_batch_size must be positive")
+        if config.max_decode_batch_size <= 0:
+            raise ValueError("max_decode_batch_size must be positive")
+        if config.max_prefill_batch_size > config.max_active_requests:
+            raise ValueError(
+                "max_prefill_batch_size cannot be greater than max_active_requests"
+            )
+        if config.max_decode_batch_size > config.max_active_requests:
+            raise ValueError(
+                "max_decode_batch_size cannot be greater than max_active_requests"
+            )
+
+    def __init__(
+        self, executor: BaseBatchExecutor, config: BatchExecutorConfig
+    ) -> None:
+        self._check_config(config)
+
+        self._executor = executor
+        self._config = config
+
+        # Inbound queue, HTTP handlers put the new request here.
+        # If the queue is full, submit() raises queue.Full; callers (e.g., HTTP
+        # handlers) should translate that condition into an HTTP 503 response.
+        self._inbound: Queue[GenerationRequestState] = Queue(
+            maxsize=self._config.max_queue_size
+        )
+
+        # The list of requests that are waiting to be prefilled
+        self._waiting: list[GenerationRequestState] = []
+
+        # The list of active requests being processed by the worker (after prefill, during decode)
+        self._active: list[GenerationRequestState] = []
+
+        # Shutdown event to signal the worker thread to stop
+        self._shutdown_event = threading.Event()
+
+        # The worker thread that runs the main loop
+        self._thread: threading.Thread | None = None
+
+    def _drain_inbound(self) -> None:
+        """Move all requests from the inbound queue to the waiting list, up to max_active_requests."""
+        max_num_reqs = self._config.max_active_requests
+        while len(self._waiting) + len(self._active) < max_num_reqs:
+            try:
+                req = self._inbound.get_nowait()
+                self._waiting.append(req)
+            except Empty:
+                break
+
+    def _select_prefill_batch(self) -> list[GenerationRequestState]:
+        """Select a batch of requests from the waiting list for prefill, up to max_prefill_batch_size."""
+        batch_size = min(
+            self._config.max_prefill_batch_size,
+            self._config.max_active_requests - len(self._active),
+            len(self._waiting),
+        )
+        batch = self._waiting[:batch_size]
+        self._waiting = self._waiting[batch_size:]
+        return batch
+
+    def _select_decode_batch(self) -> list[GenerationRequestState]:
+        """Select a batch of requests from the active list for decode, up to max_decode_batch_size."""
+        # Check the status to ensure we only select requests that have completed prefill and are ready for decode.
+        # This is just being defensive, in the current implementation of the loop, all active requests should be in DECODING status
+        decoding = [req for req in self._active if req.status == RequestStatus.DECODING]
+        return decoding[: self._config.max_decode_batch_size]
+
+    def _run_loop(self) -> None:
+        prefill_batch: list[GenerationRequestState] = []
+        try:
+            while not self._shutdown_event.is_set():
+                # Move new requests from the inbound queue to the waiting list
+                self._drain_inbound()
+
+                if not self._shutdown_event.is_set():
+                    prefill_batch = self._select_prefill_batch()
+                    if prefill_batch:
+                        self._executor.batched_prefill(prefill_batch)
+                        self._active.extend(
+                            req
+                            for req in prefill_batch
+                            if req.status == RequestStatus.DECODING
+                        )
+                        prefill_batch = []
+
+                if not self._shutdown_event.is_set():
+                    # If there are active requests, select a batch and decode one step
+                    decoding_batch = self._select_decode_batch()
+                    if decoding_batch:
+                        self._executor.batched_decode(decoding_batch)
+
+                # After the decoding, some requests may have finished or failed, remove them from the active list
+                self._active = [
+                    req for req in self._active if req.status == RequestStatus.DECODING
+                ]
+
+                # If there are still waiting or active requests, we directly continue to the next loop iteration without
+                # sleeping, to maximize throughput and minimize latency. Otherwise, we sleep for a
+                # short while to avoid busy loop. Use the sleep on _shutdown_event so when shutdown
+                # signal is set, it can break the sleep immediately and exit the loop.
+                if not self._waiting and not self._active:
+                    self._shutdown_event.wait(timeout=0.01)
+
+            # Graceful shutdown: cancel any remaining waiting and active requests
+            for pending in self._waiting + self._active:
+                try:
+                    self._cancel_request(
+                        pending, "Worker is shutting down, request cancelled"
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to clean up request %s during shutdown",
+                        pending.request_id,
+                    )
+            self._waiting.clear()
+            self._active.clear()
+        except Exception as e:
+            self._handle_fatal_error(e, extra_requests=prefill_batch)
+
+    def _cancel_request(
+        self, request_state: GenerationRequestState, error_message: str
+    ) -> None:
+        """
+        Helper method to cancel a request with a given error message.
+        It updates the request state and emits an error event.
+        """
+        request_state.status = RequestStatus.FAILED
+        request_state.error = error_message
+        request_state.output_queue.put(
+            ErrorEvent(
+                request_id=request_state.request_id,
+                error=request_state.error,
+            )
+        )
+
+    def _handle_fatal_error(
+        self,
+        error: Exception,
+        extra_requests: list[GenerationRequestState] | None = None,
+    ) -> None:
+        logger.exception("BatchWorker crashed: %s", error)
+        error_message = f"BatchWorker encountered an unexpected error: {error}"
+
+        for pending in (extra_requests or []) + self._waiting + self._active:
+            try:
+                self._cancel_request(pending, error_message)
+            except Exception:
+                logger.exception(
+                    "Failed to emit error event for active request %s",
+                    pending.request_id,
+                )
+
+        self._waiting.clear()
+        self._active.clear()
+
+        while True:
+            try:
+                pending = self._inbound.get_nowait()
+            except Empty:
+                break
+            try:
+                self._cancel_request(pending, error_message)
+            except Exception:
+                logger.exception(
+                    "Failed to emit error event for pending request %s",
+                    pending.request_id,
+                )
+
+    def start(self) -> None:
+        """Create the thread and start the main loop."""
+        if self._thread is not None and self._thread.is_alive():
+            logger.warning("Worker thread is already running")
+            return
+        self._shutdown_event.clear()
+        self._thread = threading.Thread(
+            target=self._run_loop, name="inference-worker", daemon=True
+        )
+        self._thread.start()
+        logger.info("Worker thread started")
+
+    def stop(self) -> None:
+        """Signal the thread to stop and wait for it to finish."""
+        self._shutdown_event.set()
+
+        if self._thread is not None:
+            self._thread.join()
+            logger.info("Worker thread stopped")
+
+        # Thread has stopped — drain any remaining inbound requests without races
+        while True:
+            try:
+                req = self._inbound.get_nowait()
+                self._cancel_request(req, "Worker is shutting down, request rejected")
+            except Empty:
+                break
+
+        # Cancel any waiting or active requests that were still in-flight
+        for pending in self._waiting + self._active:
+            try:
+                self._cancel_request(
+                    pending, "Worker is shutting down, request cancelled"
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to emit error event for request %s",
+                    pending.request_id,
+                )
+
+        self._waiting.clear()
         self._active.clear()
 
     def submit(self, request_state: GenerationRequestState) -> None:
