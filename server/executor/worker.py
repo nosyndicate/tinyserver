@@ -381,6 +381,20 @@ class BatchWorker(Worker):
                 # signal is set, it can break the sleep immediately and exit the loop.
                 if not self._waiting and not self._active:
                     self._shutdown_event.wait(timeout=0.01)
+
+            # Graceful shutdown: cancel any remaining waiting and active requests
+            for pending in self._waiting + self._active:
+                try:
+                    self._cancel_request(
+                        pending, "Worker is shutting down, request cancelled"
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to clean up request %s during shutdown",
+                        pending.request_id,
+                    )
+            self._waiting.clear()
+            self._active.clear()
         except Exception as e:
             self._handle_fatal_error(e, extra_requests=prefill_batch)
 
