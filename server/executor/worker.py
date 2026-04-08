@@ -227,7 +227,11 @@ class SimpleWorker(Worker):
         """Signal the thread to stop and wait for it to finish."""
         self._shutdown_event.set()
 
-        # Drain the inbound queue and emit error events for pending requests
+        if self._thread is not None:
+            self._thread.join()
+            logger.info("Worker thread stopped")
+
+        # Thread has stopped — drain any remaining inbound requests without races
         while True:
             try:
                 req = self._inbound.get_nowait()
@@ -235,11 +239,7 @@ class SimpleWorker(Worker):
             except Empty:
                 break
 
-        if self._thread is not None:
-            self._thread.join()
-            logger.info("Worker thread stopped")
-
-        # Since thread stopped, cancel any active requests that were still in-flight
+        # Cancel any active requests that were still in-flight
         for pending in self._active:
             try:
                 self._cancel_request(
@@ -351,20 +351,22 @@ class BatchWorker(Worker):
                 # Move new requests from the inbound queue to the waiting list
                 self._drain_inbound()
 
-                prefill_batch = self._select_prefill_batch()
-                if prefill_batch:
-                    self._executor.batched_prefill(prefill_batch)
-                    self._active.extend(
-                        req
-                        for req in prefill_batch
-                        if req.status == RequestStatus.DECODING
-                    )
-                    prefill_batch = []
+                if not self._shutdown_event.is_set():
+                    prefill_batch = self._select_prefill_batch()
+                    if prefill_batch:
+                        self._executor.batched_prefill(prefill_batch)
+                        self._active.extend(
+                            req
+                            for req in prefill_batch
+                            if req.status == RequestStatus.DECODING
+                        )
+                        prefill_batch = []
 
-                # If there are active requests, select a batch and decode one step
-                decoding_batch = self._select_decode_batch()
-                if decoding_batch:
-                    self._executor.batched_decode(decoding_batch)
+                if not self._shutdown_event.is_set():
+                    # If there are active requests, select a batch and decode one step
+                    decoding_batch = self._select_decode_batch()
+                    if decoding_batch:
+                        self._executor.batched_decode(decoding_batch)
 
                 # After the decoding, some requests may have finished or failed, remove them from the active list
                 self._active = [
@@ -445,7 +447,11 @@ class BatchWorker(Worker):
         """Signal the thread to stop and wait for it to finish."""
         self._shutdown_event.set()
 
-        # Drain the inbound queue and emit error events for pending requests
+        if self._thread is not None:
+            self._thread.join()
+            logger.info("Worker thread stopped")
+
+        # Thread has stopped — drain any remaining inbound requests without races
         while True:
             try:
                 req = self._inbound.get_nowait()
@@ -453,11 +459,7 @@ class BatchWorker(Worker):
             except Empty:
                 break
 
-        if self._thread is not None:
-            self._thread.join()
-            logger.info("Worker thread stopped")
-
-        # Since thread stopped, cancel any waiting or active requests that were still in-flight
+        # Cancel any waiting or active requests that were still in-flight
         for pending in self._waiting + self._active:
             try:
                 self._cancel_request(
