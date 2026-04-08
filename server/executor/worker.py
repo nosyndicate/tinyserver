@@ -1,23 +1,40 @@
 import logging
 import threading
+from abc import ABC, abstractmethod
 from queue import Empty, Queue
 
 from server.executor.types import (
+    BaseExecutor,
     ErrorEvent,
     ExecutorConfig,
     GenerationRequestState,
     RequestStatus,
-    BaseExecutor,
 )
 from server.metrics.timers import now_ns
 
 logger = logging.getLogger(__name__)
 
 
-class Worker:
+class Worker(ABC):
+    """Abstract base class for worker implementations that manage the lifecycle of generation requests."""
+
+    @abstractmethod
+    def start(self) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def stop(self) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def submit(self, request_state: GenerationRequestState) -> None:
+        raise NotImplementedError
+
+
+class SimpleWorker(Worker):
     """
     Usage:
-        worker = Worker(executor, config)
+        worker = SimpleWorker(executor, config)
         worker.start()
         worker.submit(request_state)
         ...
