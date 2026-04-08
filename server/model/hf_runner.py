@@ -11,6 +11,12 @@ from transformers import (
 )
 
 from server.metrics.logging import log_event
+from server.model.batch_ops import (
+    DecodeBatchOutput,
+    PrefillBatchOutput,
+    batched_decode_forward,
+    batched_prefill,
+)
 from server.model.determinism import make_generator
 from server.model.sampling import SamplingParams
 
@@ -117,6 +123,22 @@ class ModelRunner:
         all_logits: torch.Tensor = outputs.logits  # shape [1, prompt_len, vocab_size]
         prompt_tokens = int(inputs["input_ids"].shape[1])
         return all_logits, past_key_values, prompt_tokens
+
+    def prefill_batch(self, prompts: list[str]) -> list[PrefillBatchOutput]:
+        """Run prefill for a batch of prompts and return the outputs."""
+        prefill_batch_outputs = batched_prefill(
+            self.model, self.tokenizer, prompts, self.device
+        )
+        return prefill_batch_outputs
+
+    def decode_batch(
+        self,
+        token_ids: list[int],
+        past_key_values: list[DynamicCache],
+    ) -> list[DecodeBatchOutput]:
+        return batched_decode_forward(
+            self.model, token_ids, past_key_values, device=self.device
+        )
 
     @torch.inference_mode()
     def sample_token(
