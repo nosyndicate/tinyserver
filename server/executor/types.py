@@ -84,7 +84,7 @@ class ExecutorConfig:
     """
 
     max_queue_size: int = field(default=64)
-    max_active_requests: int = field(default=10)
+    max_active_requests: int = field(default=16)
 
 
 @dataclass(frozen=True)
@@ -97,8 +97,8 @@ class BatchExecutorConfig(ExecutorConfig):
         max_decode_batch_size: The maximum batch size for decode. Requests will be grouped into batches of this size for the decode steps.
     """
 
-    max_prefill_batch_size: int = field(default=4)
-    max_decode_batch_size: int = field(default=4)
+    max_prefill_batch_size: int = field(default=8)
+    max_decode_batch_size: int = field(default=8)
 
 
 class RequestStatus(Enum):

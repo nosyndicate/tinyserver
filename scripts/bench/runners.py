@@ -15,13 +15,21 @@ STREAM_HEADERS = {"Accept": "text/event-stream"}
 
 
 def _endpoint_path(endpoint: str) -> str:
-    if endpoint in {"generate", "generate_v2"}:
+    if endpoint in {"generate", "generate_v2", "generate_v3"}:
         return endpoint if endpoint.startswith("/") else f"/{endpoint}"
-    if endpoint in {"stream_v2", "generate/stream", "generate/stream_v2"}:
+    if endpoint in {
+        "stream_v2",
+        "stream_v3",
+        "generate/stream",
+        "generate/stream_v2",
+        "generate/stream_v3",
+    }:
         mapping = {
             "stream_v2": "/generate/stream_v2",
+            "stream_v3": "/generate/stream_v3",
             "generate/stream": "/generate/stream",
             "generate/stream_v2": "/generate/stream_v2",
+            "generate/stream_v3": "/generate/stream_v3",
         }
         return mapping[endpoint]
     if endpoint == "stream":

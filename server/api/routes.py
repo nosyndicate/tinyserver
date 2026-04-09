@@ -13,7 +13,7 @@ from server.executor.types import (
     GenerationRequestState,
     TokenEvent,
 )
-from server.executor.worker import Worker
+from server.executor.worker import BatchWorker, SimpleWorker
 from server.metrics.logging import log_event
 from server.metrics.timers import now_ns, ns_to_ms, timed
 from server.model.determinism import make_generator
@@ -41,7 +41,7 @@ def _get_runner(request: Request) -> ModelRunner:
     return runner
 
 
-def _get_worker(request: Request) -> Worker:
+def _get_worker(request: Request) -> SimpleWorker:
     """
     Retrieve the worker instance from the request's app state.
     """
@@ -49,6 +49,16 @@ def _get_worker(request: Request) -> Worker:
     if worker is None:
         raise RuntimeError("Worker not found in app state")
     return worker
+
+
+def _get_batch_worker(request: Request) -> BatchWorker:
+    """
+    Retrieve the batch worker instance from the request's app state.
+    """
+    batch_worker = request.app.state.batch_worker
+    if batch_worker is None:
+        raise RuntimeError("Batch worker not found in app state")
+    return batch_worker
 
 
 def _build_request_state(req: GenerateRequest, device: str) -> GenerationRequestState:
@@ -173,6 +183,64 @@ def generate_v2(req: GenerateRequest, request: Request) -> GenerateResponse:
                 status_code=500,
                 detail=f"Generation failed: {event.error}",
             )
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail="Unexpected event type received from worker",
+            )
+
+
+@router.post("/generate_v3", response_model=GenerateResponse)
+def generate_v3(req: GenerateRequest, request: Request) -> GenerateResponse:
+    batch_worker = _get_batch_worker(request)
+    state = _build_request_state(req, device=request.app.state.device)
+
+    try:
+        batch_worker.submit(state)
+    except Full:
+        raise HTTPException(
+            status_code=503,
+            detail="Server at capacity. Please try again later.",
+        )
+
+    while True:
+        try:
+            event: Event = state.output_queue.get(timeout=_GENERATION_TIMEOUT_S)
+        except Empty:
+            raise HTTPException(
+                status_code=504,
+                detail="Generation timed out.",
+            )
+
+        # Since this is the non-streaming endpoint, discard intermediate tokens
+        # and wait for the terminal DoneEvent or ErrorEvent.
+        if isinstance(event, TokenEvent):
+            continue
+        elif isinstance(event, DoneEvent):
+            tokens_per_s = _compute_tokens_per_s(
+                event.num_output_tokens, event.total_ms
+            )
+
+            return GenerateResponse(
+                text=event.text,
+                prompt_tokens=event.num_prompt_tokens,
+                output_tokens=event.num_output_tokens,
+                ttft_ms=event.ttft,
+                total_ms=event.total_ms,
+                tokens_per_s=tokens_per_s,
+                queue_wait_ms=event.queue_wait_ms,
+                execution_ms=event.execution_ms,
+            )
+        elif isinstance(event, ErrorEvent):
+            raise HTTPException(
+                status_code=500,
+                detail=f"Generation failed: {event.error}",
+            )
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail="Unexpected event type received from batch worker",
+            )
 
 
 @router.post("/generate/stream")
@@ -217,6 +285,113 @@ def generate_stream(req: GenerateRequest, request: Request) -> StreamingResponse
 @router.post("/generate/stream_v2", response_model=None)
 def generate_stream_v2(req: GenerateRequest, request: Request) -> StreamingResponse:
     worker = _get_worker(request)
+    state = _build_request_state(req, device=request.app.state.device)
+
+    try:
+        worker.submit(state)
+    except Full:
+        raise HTTPException(
+            status_code=503,
+            detail="Server at capacity. Please try again later.",
+        )
+
+    def _event_stream() -> Generator[str, None, None]:
+        while True:
+            try:
+                event: Event = state.output_queue.get(timeout=_GENERATION_TIMEOUT_S)
+            except Empty:
+                error_chunk = StreamChunk(
+                    token_str="",
+                    is_first=False,
+                    is_done=True,
+                    error="Generation timed out.",
+                )
+                yield f"data: {error_chunk.model_dump_json(exclude_none=True)}\n\n"
+                return
+
+            if isinstance(event, TokenEvent):
+                # For the final token, wait for the terminal DoneEvent so the last SSE
+                # payload can carry the same timing metadata as /generate_v2.
+                # Note: this introduces a small latency for the final token as it's
+                # held until the executor finishes cleanup and emits DoneEvent.
+                if event.is_last:
+                    try:
+                        done_event = state.output_queue.get(
+                            timeout=_GENERATION_TIMEOUT_S
+                        )
+                    except Empty:
+                        error_chunk = StreamChunk(
+                            token_str="",
+                            is_first=False,
+                            is_done=True,
+                            error="Generation timed out waiting for final event.",
+                        )
+                        yield f"data: {error_chunk.model_dump_json(exclude_none=True)}\n\n"
+                        return
+                    if isinstance(done_event, DoneEvent):
+                        tokens_per_s = _compute_tokens_per_s(
+                            done_event.num_output_tokens, done_event.total_ms
+                        )
+                        chunk = StreamChunk(
+                            token_str=event.token,
+                            is_first=event.is_first,
+                            is_done=True,
+                            prompt_tokens=done_event.num_prompt_tokens,
+                            output_tokens=done_event.num_output_tokens,
+                            ttft_ms=done_event.ttft,
+                            total_ms=done_event.total_ms,
+                            tokens_per_s=tokens_per_s,
+                            queue_wait_ms=done_event.queue_wait_ms,
+                            execution_ms=done_event.execution_ms,
+                        )
+                        yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                        log_event(
+                            "stream_done",
+                            output_tokens=done_event.num_output_tokens,
+                            ttft_ms=done_event.ttft,
+                        )
+                    elif isinstance(done_event, ErrorEvent):
+                        error_chunk = StreamChunk(
+                            token_str="",
+                            is_first=False,
+                            is_done=True,
+                            error=done_event.error,
+                        )
+                        yield f"data: {error_chunk.model_dump_json(exclude_none=True)}\n\n"
+                    else:
+                        # Unexpected event type after last token, yield a generic error
+                        error_chunk = StreamChunk(
+                            token_str="",
+                            is_first=False,
+                            is_done=True,
+                            error="Unexpected event type after last token",
+                        )
+                        yield f"data: {error_chunk.model_dump_json(exclude_none=True)}\n\n"
+
+                    return
+                chunk = StreamChunk(
+                    token_str=event.token,
+                    is_first=event.is_first,
+                    is_done=False,
+                )
+                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+
+            elif isinstance(event, ErrorEvent):
+                chunk = StreamChunk(
+                    token_str="",
+                    is_first=False,
+                    is_done=True,
+                    error=event.error,
+                )
+                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                return
+
+    return StreamingResponse(_event_stream(), media_type="text/event-stream")
+
+
+@router.post("/generate/stream_v3", response_model=None)
+def generate_stream_v3(req: GenerateRequest, request: Request) -> StreamingResponse:
+    worker = _get_batch_worker(request)
     state = _build_request_state(req, device=request.app.state.device)
 
     try:

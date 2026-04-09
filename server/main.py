@@ -6,9 +6,9 @@ from typing import AsyncIterator
 from fastapi import FastAPI
 
 from server.api.routes import router as api_router
-from server.executor.executor import Executor
-from server.executor.types import ExecutorConfig
-from server.executor.worker import SimpleWorker
+from server.executor.executor import BatchExecutor, Executor
+from server.executor.types import BatchExecutorConfig, ExecutorConfig
+from server.executor.worker import BatchWorker, SimpleWorker
 from server.model.hf_runner import ModelConfig, load_hf_model
 
 
@@ -27,8 +27,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     worker = SimpleWorker(executor, executor_config)
     worker.start()
 
+    batch_executor = BatchExecutor(runner)
+    batch_executor_config = BatchExecutorConfig()
+    batch_worker = BatchWorker(batch_executor, batch_executor_config)
+    batch_worker.start()
+
     app.state.runner = runner
     app.state.worker = worker
+    app.state.batch_worker = batch_worker
     app.state.device = config.device
 
     # App is running now
@@ -36,6 +42,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Everything after the yield runs on shutdown.
     worker.stop()
+    batch_worker.stop()
 
 
 def create_app() -> FastAPI:

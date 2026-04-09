@@ -10,7 +10,7 @@ from .models import RequestResult, Scenario
 
 
 def _percentiles(values: list[float]) -> dict[str, float | None]:
-    """Compute mean and p50/p90/p95/p99 using linear interpolation."""
+    """Compute mean and p50/p90/p95/p99 using inclusive interpolation."""
     if not values:
         return {"mean": None, "p50": None, "p90": None, "p95": None, "p99": None}
     mean = statistics.mean(values)
@@ -22,7 +22,7 @@ def _percentiles(values: list[float]) -> dict[str, float | None]:
             "p95": values[0],
             "p99": values[0],
         }
-    q = statistics.quantiles(values, n=100, method="linear")
+    q = statistics.quantiles(values, n=100, method="inclusive")
     return {
         "mean": mean,
         "p50": q[49],
