@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from argparse import Namespace
 
-import pytest
-
 from scripts.bench.metrics import _percentiles, _rate, _summarize_results
 from scripts.bench.models import RequestResult
 from scripts.bench.scenarios import _default_scenarios
@@ -21,13 +19,10 @@ class TestPercentiles:
         assert result["p99"] == 42.0
 
     def test_two_values(self) -> None:
-        # NOTE: _percentiles uses method="linear" which is not a valid method
-        # for statistics.quantiles in Python 3.11. This means it currently only
-        # works for lists with fewer than 2 elements (hitting early returns).
-        # This test documents the bug — it should be fixed to use "inclusive"
-        # or "exclusive".
-        with pytest.raises(ValueError, match="Unknown method"):
-            _percentiles([1.0, 2.0])
+        result = _percentiles([1.0, 2.0])
+        assert result["mean"] == 1.5
+        assert result["p50"] == 1.5
+        assert result["p99"] is not None
 
 
 class TestRate:
