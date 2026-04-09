@@ -22,7 +22,7 @@ def _percentiles(values: list[float]) -> dict[str, float | None]:
             "p95": values[0],
             "p99": values[0],
         }
-    q = statistics.quantiles(values, n=100, method="linear")
+    q = statistics.quantiles(values, n=100)
     return {
         "mean": mean,
         "p50": q[49],
