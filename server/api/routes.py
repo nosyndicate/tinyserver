@@ -13,7 +13,7 @@ from server.executor.types import (
     GenerationRequestState,
     TokenEvent,
 )
-from server.executor.worker import Worker
+from server.executor.worker import BatchWorker, SimpleWorker
 from server.metrics.logging import log_event
 from server.metrics.timers import now_ns, ns_to_ms, timed
 from server.model.determinism import make_generator
@@ -41,7 +41,7 @@ def _get_runner(request: Request) -> ModelRunner:
     return runner
 
 
-def _get_worker(request: Request) -> Worker:
+def _get_worker(request: Request) -> SimpleWorker:
     """
     Retrieve the worker instance from the request's app state.
     """
@@ -51,7 +51,7 @@ def _get_worker(request: Request) -> Worker:
     return worker
 
 
-def _get_batch_worker(request: Request) -> Worker:
+def _get_batch_worker(request: Request) -> BatchWorker:
     """
     Retrieve the batch worker instance from the request's app state.
     """
@@ -183,6 +183,11 @@ def generate_v2(req: GenerateRequest, request: Request) -> GenerateResponse:
                 status_code=500,
                 detail=f"Generation failed: {event.error}",
             )
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail="Unexpected event type received from worker",
+            )
 
 
 @router.post("/generate_v3", response_model=GenerateResponse)
@@ -230,6 +235,11 @@ def generate_v3(req: GenerateRequest, request: Request) -> GenerateResponse:
             raise HTTPException(
                 status_code=500,
                 detail=f"Generation failed: {event.error}",
+            )
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail="Unexpected event type received from batch worker",
             )
 
 

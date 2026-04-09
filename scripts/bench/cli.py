@@ -37,10 +37,13 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=[
             "generate",
             "generate_v2",
+            "generate_v3",
             "stream",
             "stream_v2",
+            "stream_v3",
             "generate/stream",
             "generate/stream_v2",
+            "generate/stream_v3",
         ],
     )
     parser.add_argument("--scenario", default="short_short")
@@ -97,9 +100,11 @@ def main(argv: list[str] | None = None) -> int:
     prompt_override = Path(args.prompt_file).read_text() if args.prompt_file else None
     all_plans = _build_request_plans(
         scenario,
-        args.warmup_requests
-        if args.duration_seconds is not None
-        else args.requests + args.warmup_requests,
+        (
+            args.warmup_requests
+            if args.duration_seconds is not None
+            else args.requests + args.warmup_requests
+        ),
         prompt_override,
         args.max_new_tokens,
         args.temperature,
