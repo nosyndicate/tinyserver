@@ -1,4 +1,3 @@
-from dataclasses import dataclass
 from typing import Generator
 
 import torch
@@ -19,14 +18,7 @@ from server.model.batch_ops import (
 )
 from server.model.determinism import make_generator
 from server.model.sampling import SamplingParams
-
-
-@dataclass
-class ModelConfig:
-    model_name_or_path: str = "Qwen/Qwen3-1.7B"
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype: torch.dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-
+from server.model.types import ModelConfig
 
 LOWEST_TEMPERATURE = 1e-5
 

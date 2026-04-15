@@ -1,7 +1,7 @@
 [project]
 name = "inference-server"
 version = "0.0.1"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
   "requests>=2.31",
   "fastapi>=0.110",

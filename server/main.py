@@ -3,13 +3,15 @@
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
+import torch
 from fastapi import FastAPI
 
 from server.api.routes import router as api_router
 from server.executor.executor import BatchExecutor, Executor
 from server.executor.types import BatchExecutorConfig, ExecutorConfig
 from server.executor.worker import BatchWorker, SimpleWorker
-from server.model.hf_runner import ModelConfig, load_hf_model
+from server.model.hf_backend import HFBackend
+from server.model.hf_runner import ModelConfig, ModelRunner
 
 
 @asynccontextmanager
@@ -19,8 +21,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
 
     # Everything before the yield runs on startup
-    config = ModelConfig()
-    runner = load_hf_model(config)
+    config = ModelConfig(device="cuda" if torch.cuda.is_available() else "cpu")
+    backend = HFBackend.load_model(config)
+
+    runner = ModelRunner(
+        model=backend.model, tokenizer=backend.tokenizer, device=config.device
+    )
 
     executor = Executor(runner)
     executor_config = ExecutorConfig()

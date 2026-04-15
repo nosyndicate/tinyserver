@@ -161,3 +161,10 @@ class BaseBatchExecutor(Protocol):
     def batched_prefill(self, request_states: list[GenerationRequestState]) -> None: ...
 
     def batched_decode(self, request_states: list[GenerationRequestState]) -> None: ...
+
+
+@dataclass
+class Sequence:
+    seq_len: int
+    block_table: list[int]
+    last_block_used: int | None = None
