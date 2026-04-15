@@ -42,7 +42,7 @@ class HFBackend(ModelBackend):
         )
         config = AutoConfig.from_pretrained(model_config.model_name_or_path)
 
-        # Optiona: register attention hook here if needed
+        # Optional: register attention hook here if needed
         # ALL_ATTENTION_FUNCTIONS["paged"] = paged_attention_forward
         # config.attention_implementation = "paged"
 
