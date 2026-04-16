@@ -22,7 +22,7 @@ def bytes_to_gb(bytes_value: int) -> str:
     return f"{gb:.2f} GB"
 
 
-def _get_available_memory(memory_utilization: float) -> int:
+def _get_available_memory(memory_utilization: float) -> float:
     """Returns the available GPU memory in bytes."""
     free_mem, total_mem = torch.cuda.mem_get_info()
     total_free_mem = free_mem * memory_utilization
