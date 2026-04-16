@@ -283,7 +283,7 @@ def load_hf_model(config: ModelConfig) -> ModelRunner:
     )
     model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
         config.model_name_or_path,
-        torch_dtype=config.dtype,
+        dtype=config.dtype,
         device_map="auto" if config.device == "cuda" else None,
     )
 

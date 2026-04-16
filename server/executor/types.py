@@ -166,5 +166,7 @@ class BaseBatchExecutor(Protocol):
 @dataclass
 class Sequence:
     seq_len: int
+    prompt_token_ids: list[int]
+    generated_token_ids: list[int]
     block_table: list[int]
     last_block_used: int | None = None

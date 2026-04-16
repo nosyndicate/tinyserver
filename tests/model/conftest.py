@@ -126,7 +126,7 @@ def qwen3_model_and_tokenizer() -> Generator[
     tokenizer = AutoTokenizer.from_pretrained(_QWEN3_MODEL_NAME, use_fast=True)
     model = AutoModelForCausalLM.from_pretrained(
         _QWEN3_MODEL_NAME,
-        torch_dtype=torch.float32,
+        dtype=torch.float32,
     )
     model.eval()
 
