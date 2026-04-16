@@ -40,6 +40,7 @@ def qwen3_cache_allocator(
     config: Qwen3Config,
     memory_utilization: float,
     block_size: int,
+    dtype: torch.dtype,
     device: str,
 ) -> None:
     available_mem = _get_available_memory(memory_utilization)
@@ -48,10 +49,10 @@ def qwen3_cache_allocator(
     num_kv_heads = config.num_key_value_heads
     head_dim = config.head_dim
 
-    default_dtype = torch.get_default_dtype()
-    default_dtype_size = torch.tensor([], dtype=default_dtype).element_size()
+    # kv cache dtype should match the model dtype to avoid unnecessary conversions during attention computation
+    dtype_size = torch.tensor([], dtype=dtype).element_size()
     block_bytes = (
-        2 * num_layers * block_size * num_kv_heads * head_dim * default_dtype_size
+        2 * num_layers * block_size * num_kv_heads * head_dim * dtype_size
     )  # 2 for key and value
     num_available_kv_blocks = int(available_mem // block_bytes)
 
@@ -69,6 +70,7 @@ def qwen3_cache_allocator(
         num_kv_heads,
         head_dim,
         device=device,
+        dtype=dtype,
     )
 
     for i in range(num_layers):
@@ -136,6 +138,7 @@ class HFBackend(ModelBackend):
             config,
             model_config.memory_utilization,
             model_config.block_size,
+            model_config.dtype,
             model_config.device,
         )
 
