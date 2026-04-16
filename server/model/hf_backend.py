@@ -30,7 +30,7 @@ def _get_available_memory(memory_utilization: float) -> int:
     current_mem_usage = torch.cuda.memory_stats()["allocated_bytes.all.current"]
     # reserve some room for peak memory usage during model execution
     available_mem = total_free_mem - (peak_mem_usage - current_mem_usage)
-    logger.info(f"available_mem: {bytes_to_gb(available_mem)}")
+    log_event(f"available_mem: {bytes_to_gb(available_mem)}")
 
     return available_mem
 
@@ -103,6 +103,10 @@ class HFBackend(ModelBackend):
 
     @staticmethod
     def load_model(model_config: ModelConfig) -> "HFBackend":
+
+        if model_config.model_name_or_path not in allocator_by_name:
+            raise ValueError(f"Unsupported model: {model_config.model_name_or_path}")
+
         log_event(
             "model_init_start",
             model=model_config.model_name_or_path,
@@ -126,17 +130,13 @@ class HFBackend(ModelBackend):
         model.eval()
         log_event("model_init_done", model=model_config.model_name_or_path)
 
-        if model_config.model_name_or_path in allocator_by_name:
-            allocator = allocator_by_name[model_config.model_name_or_path]
-            allocator(
-                model,
-                config,
-                model_config.memory_utilization,
-                model_config.block_size,
-                model_config.device,
-            )
-
-        else:
-            raise ValueError(f"Unsupported model: {model_config.model_name_or_path}")
+        allocator = allocator_by_name[model_config.model_name_or_path]
+        allocator(
+            model,
+            config,
+            model_config.memory_utilization,
+            model_config.block_size,
+            model_config.device,
+        )
 
         return HFBackend(model, tokenizer)

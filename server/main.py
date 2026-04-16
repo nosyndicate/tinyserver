@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
         "--memory-utilization",
         type=float,
         default=0.2,
-        help="Fraction of free GPU memory to use for KV cache (default: 0.9)",
+        help="Fraction of free GPU memory to use for KV cache (default: 0.2)",
     )
     return parser.parse_args()
 
@@ -39,17 +39,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
     Manage the lifecycle of the model, executor and worker.
     """
+    if not torch.cuda.is_available():
+        raise EnvironmentError(
+            "CUDA is not available. This server requires a GPU to run."
+        )
 
     # Everything before the yield runs on startup
     args = app.state.cli_args
     config = ModelConfig(
-        device="cuda" if torch.cuda.is_available() else "cpu",
+        device="cuda",
         block_size=args.block_size,
         memory_utilization=args.memory_utilization,
     )
 
     # runner and backend will load two models in total.
     # but the model load in backend will be modified to support kv cache
+    # model load by load_hf_model will be used to support v2 and v3
     runner = load_hf_model(config)
     HFBackend.load_model(config)
 
