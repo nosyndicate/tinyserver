@@ -11,6 +11,8 @@ class ModelConfig:
     model_name_or_path: str = "Qwen/Qwen3-1.7B"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     dtype: torch.dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    block_size: int = 256
+    memory_utilization: float = 0.9
 
 
 class ModelBackend(Protocol):
