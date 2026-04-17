@@ -28,7 +28,10 @@ def _compute_tokens_per_s(num_output_tokens: int, total_ms: float) -> float:
     return (num_output_tokens / (total_ms / 1000.0)) if total_ms > 0 else 0.0
 
 
-router = APIRouter()
+health_router = APIRouter()
+v1_router = APIRouter()
+v2_router = APIRouter()
+v3_router = APIRouter()
 
 
 def _get_runner(request: Request) -> ModelRunner:
@@ -82,12 +85,12 @@ def _build_request_state(req: GenerateRequest, device: str) -> GenerationRequest
     )
 
 
-@router.get("/health")
+@health_router.get("/health")
 def health() -> dict[str, bool]:
     return {"ok": True}
 
 
-@router.post("/generate", response_model=GenerateResponse)
+@v1_router.post("/generate", response_model=GenerateResponse)
 def generate(req: GenerateRequest, request: Request) -> GenerateResponse:
     """Generate text based on the input prompt."""
 
@@ -137,7 +140,7 @@ def generate(req: GenerateRequest, request: Request) -> GenerateResponse:
     )
 
 
-@router.post("/generate_v2", response_model=GenerateResponse)
+@v2_router.post("/generate_v2", response_model=GenerateResponse)
 def generate_v2(req: GenerateRequest, request: Request) -> GenerateResponse:
     worker = _get_worker(request)
     state = _build_request_state(req, device=request.app.state.device)
@@ -190,7 +193,7 @@ def generate_v2(req: GenerateRequest, request: Request) -> GenerateResponse:
             )
 
 
-@router.post("/generate_v3", response_model=GenerateResponse)
+@v3_router.post("/generate_v3", response_model=GenerateResponse)
 def generate_v3(req: GenerateRequest, request: Request) -> GenerateResponse:
     batch_worker = _get_batch_worker(request)
     state = _build_request_state(req, device=request.app.state.device)
@@ -243,7 +246,7 @@ def generate_v3(req: GenerateRequest, request: Request) -> GenerateResponse:
             )
 
 
-@router.post("/generate/stream")
+@v1_router.post("/generate/stream")
 def generate_stream(req: GenerateRequest, request: Request) -> StreamingResponse:
     runner = _get_runner(request)
     sampling_params = build_sampling_params(
@@ -282,7 +285,7 @@ def generate_stream(req: GenerateRequest, request: Request) -> StreamingResponse
     return StreamingResponse(_event_stream(), media_type="text/event-stream")
 
 
-@router.post("/generate/stream_v2", response_model=None)
+@v2_router.post("/generate/stream_v2", response_model=None)
 def generate_stream_v2(req: GenerateRequest, request: Request) -> StreamingResponse:
     worker = _get_worker(request)
     state = _build_request_state(req, device=request.app.state.device)
@@ -389,7 +392,7 @@ def generate_stream_v2(req: GenerateRequest, request: Request) -> StreamingRespo
     return StreamingResponse(_event_stream(), media_type="text/event-stream")
 
 
-@router.post("/generate/stream_v3", response_model=None)
+@v3_router.post("/generate/stream_v3", response_model=None)
 def generate_stream_v3(req: GenerateRequest, request: Request) -> StreamingResponse:
     worker = _get_batch_worker(request)
     state = _build_request_state(req, device=request.app.state.device)
