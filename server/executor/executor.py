@@ -81,6 +81,60 @@ def _finish(request_state: GenerationRequestState) -> None:
     request_state.output_queue.put(done_event)
 
 
+def _sample_and_emit(
+    runner: ModelRunner,
+    request_state: GenerationRequestState,
+) -> int | None:
+    """Sample the next token and emit a TokenEvent.
+
+    Returns the token ID if generation should continue, or None if the request is finished.
+    """
+    logits = request_state.all_logits[:, -1, :]
+    next_token_id = runner.sample_token(
+        logits, request_state.sampling_params, request_state.generator
+    )
+
+    is_first = request_state.num_output_tokens == 0
+    if is_first:
+        request_state.first_token_ns = now_ns()
+
+    if next_token_id == runner.eos_token_id:
+        request_state.output_queue.put(
+            TokenEvent(
+                token="",
+                is_first=is_first,
+                is_last=True,
+                index=request_state.num_output_tokens,
+            )
+        )
+        request_state.finished_reason = FinishReason.EOS
+        _finish(request_state)
+        return None
+
+    next_token = runner.tokenizer.decode([next_token_id], skip_special_tokens=True)
+    is_last = (
+        request_state.num_output_tokens + 1
+        >= request_state.sampling_params.max_new_tokens
+    )
+
+    request_state.output_tokens.append(next_token)
+    request_state.output_queue.put(
+        TokenEvent(
+            token=next_token,
+            is_first=is_first,
+            is_last=is_last,
+            index=request_state.num_output_tokens - 1,
+        )
+    )
+
+    if is_last:
+        request_state.finished_reason = FinishReason.MAX_LENGTH
+        _finish(request_state)
+        return None
+
+    return next_token_id
+
+
 class Executor(BaseExecutor):
     def __init__(self, runner: ModelRunner) -> None:
         self._runner = runner
@@ -100,67 +154,25 @@ class Executor(BaseExecutor):
             _handle_error(request_state, e)
 
     @torch.inference_mode()
-    def decode_one_step(self, request_state: GenerationRequestState) -> None:
+    def decode(self, request_state: GenerationRequestState) -> None:
         try:
             if request_state.all_logits is None:
                 raise ValueError("No logits available for decoding step")
 
-            logits = request_state.all_logits[:, -1, :]
-            next_token_id = self._runner.sample_token(
-                logits, request_state.sampling_params, request_state.generator
-            )
-
-            is_first = request_state.num_output_tokens == 0
-            if is_first:
-                request_state.first_token_ns = now_ns()
-
-            if next_token_id == self._runner.eos_token_id:
-                request_state.output_queue.put(
-                    TokenEvent(
-                        token="",
-                        is_first=is_first,
-                        is_last=True,
-                        index=request_state.num_output_tokens,
-                    )
-                )
-                request_state.finished_reason = FinishReason.EOS
-                _finish(request_state)
+            next_token_id = _sample_and_emit(self._runner, request_state)
+            if next_token_id is None:
                 return
 
-            next_token = self._runner.tokenizer.decode(
-                [next_token_id], skip_special_tokens=True
+            next_input_id = torch.tensor(
+                [[next_token_id]], device=request_state.all_logits.device
             )
-
-            is_last = (
-                request_state.num_output_tokens + 1
-                >= request_state.sampling_params.max_new_tokens
-            )
-
-            request_state.output_tokens.append(next_token)
-            request_state.output_queue.put(
-                TokenEvent(
-                    token=next_token,
-                    is_first=is_first,
-                    is_last=is_last,
-                    index=request_state.num_output_tokens - 1,
-                )
-            )
-
-            if is_last:
-                request_state.finished_reason = FinishReason.MAX_LENGTH
-                _finish(request_state)
-                return
-
-            next_input_id = torch.tensor([[next_token_id]], device=logits.device)
             output = self._runner.model(
                 next_input_id,
                 past_key_values=request_state.past_key_values,
                 use_cache=True,
             )
-
             request_state.all_logits = output.logits
             request_state.past_key_values = output.past_key_values
-
         except Exception as e:
             _handle_error(request_state, e)
 
@@ -199,63 +211,17 @@ class BatchExecutor(BaseBatchExecutor):
 
     @torch.inference_mode()
     def batched_decode(self, request_states: list[GenerationRequestState]) -> None:
-
         unfinished_request_states: list[tuple[GenerationRequestState, int]] = []
         for request_state in request_states:
             try:
                 if request_state.all_logits is None:
                     raise ValueError("No logits available for decoding step")
-
                 if request_state.past_key_values is None:
                     raise ValueError("No past_key_values available for decoding step")
 
-                logits = request_state.all_logits[:, -1, :]
-                next_token_id = self._runner.sample_token(
-                    logits, request_state.sampling_params, request_state.generator
-                )
-
-                is_first = request_state.num_output_tokens == 0
-                if is_first:
-                    request_state.first_token_ns = now_ns()
-
-                if next_token_id == self._runner.eos_token_id:
-                    request_state.output_queue.put(
-                        TokenEvent(
-                            token="",
-                            is_first=is_first,
-                            is_last=True,
-                            index=request_state.num_output_tokens,
-                        )
-                    )
-                    request_state.finished_reason = FinishReason.EOS
-                    _finish(request_state)
-                    continue
-
-                next_token = self._runner.tokenizer.decode(
-                    [next_token_id], skip_special_tokens=True
-                )
-
-                is_last = (
-                    request_state.num_output_tokens + 1
-                    >= request_state.sampling_params.max_new_tokens
-                )
-
-                request_state.output_tokens.append(next_token)
-                request_state.output_queue.put(
-                    TokenEvent(
-                        token=next_token,
-                        is_first=is_first,
-                        is_last=is_last,
-                        index=request_state.num_output_tokens - 1,
-                    )
-                )
-
-                if is_last:
-                    request_state.finished_reason = FinishReason.MAX_LENGTH
-                    _finish(request_state)
-                    continue
-
-                unfinished_request_states.append((request_state, next_token_id))
+                next_token_id = _sample_and_emit(self._runner, request_state)
+                if next_token_id is not None:
+                    unfinished_request_states.append((request_state, next_token_id))
             except Exception as e:
                 _handle_error(request_state, e)
 
@@ -263,7 +229,6 @@ class BatchExecutor(BaseBatchExecutor):
             return
 
         next_input_ids = [token_id for _, token_id in unfinished_request_states]
-
         past_key_values = [
             assert_not_none(request_state.past_key_values)
             for request_state, _ in unfinished_request_states
@@ -289,4 +254,3 @@ class BatchExecutor(BaseBatchExecutor):
         except Exception as e:
             for request_state, _ in unfinished_request_states:
                 _handle_error(request_state, e)
-            return

@@ -20,17 +20,109 @@ logger = logging.getLogger(__name__)
 class Worker(ABC):
     """Abstract base class for worker implementations that manage the lifecycle of generation requests."""
 
+    def __init__(self, max_queue_size: int) -> None:
+        self._inbound: Queue[GenerationRequestState] = Queue(maxsize=max_queue_size)
+        self._shutdown_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _cancel_request(
+        self, request_state: GenerationRequestState, error_message: str
+    ) -> None:
+        request_state.status = RequestStatus.FAILED
+        request_state.error = error_message
+        request_state.output_queue.put(
+            ErrorEvent(
+                request_id=request_state.request_id,
+                error=request_state.error,
+            )
+        )
+
     @abstractmethod
+    def _cancel_inflight(self, message: str) -> None:
+        """Cancel all in-flight (active/waiting) requests and clear them."""
+        raise NotImplementedError
+
+    def _handle_fatal_error(
+        self,
+        error: Exception,
+        extra_requests: list[GenerationRequestState] | None = None,
+    ) -> None:
+        """Cancel all active and pending requests after an unrecoverable error.
+
+        Args:
+            error: The exception that caused the fatal error.
+            extra_requests: Any additional requests that are not yet tracked by the
+                worker (e.g. new_requests[i:] when a prefill call raises).
+        """
+        logger.exception("Worker thread crashed with unexpected exception: %s", error)
+        error_message = f"Worker encountered an unexpected error: {error}"
+        for pending in extra_requests or []:
+            try:
+                self._cancel_request(pending, error_message)
+            except Exception:
+                logger.exception(
+                    "Failed to emit error event for extra request %s",
+                    pending.request_id,
+                )
+        self._cancel_inflight(error_message)
+        while True:
+            try:
+                pending = self._inbound.get_nowait()
+            except Empty:
+                break
+            try:
+                self._cancel_request(pending, error_message)
+            except Exception:
+                logger.exception(
+                    "Failed to emit error event for pending request %s",
+                    pending.request_id,
+                )
+
+    @abstractmethod
+    def _run_loop(self) -> None:
+        raise NotImplementedError
+
     def start(self) -> None:
-        raise NotImplementedError
+        """Create the thread and start the main loop."""
+        if self._thread is not None and self._thread.is_alive():
+            logger.warning("Worker thread is already running")
+            return
+        self._shutdown_event.clear()
+        self._thread = threading.Thread(
+            target=self._run_loop, name="inference-worker", daemon=True
+        )
+        self._thread.start()
+        logger.info("Worker thread started")
 
-    @abstractmethod
     def stop(self) -> None:
-        raise NotImplementedError
+        """Signal the thread to stop and wait for it to finish."""
+        self._shutdown_event.set()
 
-    @abstractmethod
+        if self._thread is not None:
+            self._thread.join()
+            logger.info("Worker thread stopped")
+
+        # Thread has stopped — drain any remaining inbound requests without races
+        while True:
+            try:
+                req = self._inbound.get_nowait()
+                self._cancel_request(req, "Worker is shutting down, request rejected")
+            except Empty:
+                break
+
+        self._cancel_inflight("Worker is shutting down, request cancelled")
+
     def submit(self, request_state: GenerationRequestState) -> None:
-        raise NotImplementedError
+        """Submit a new request to the worker.
+
+        Raises:
+            queue.Full: If the worker's inbound queue is full, indicating that the worker is overloaded.
+        """
+        if self._shutdown_event.is_set():
+            raise RuntimeError("Cannot submit new request, worker is shutting down")
+
+        request_state.enqueued_ns = now_ns()
+        self._inbound.put_nowait(request_state)
 
 
 class SimpleWorker(Worker):
@@ -49,88 +141,21 @@ class SimpleWorker(Worker):
         if config.max_active_requests <= 0:
             raise ValueError("max_active_requests must be positive")
 
+        super().__init__(config.max_queue_size)
         self._executor = executor
         self._config = config
-
-        # Inbound queue, HTTP handlers put the new request here.
-        # If the queue is full, submit() raises queue.Full; callers (e.g., HTTP
-        # handlers) should translate that condition into an HTTP 503 response.
-        self._inbound: Queue[GenerationRequestState] = Queue(
-            maxsize=self._config.max_queue_size
-        )
-
-        # The list of active requests being processed by the worker
         self._active: list[GenerationRequestState] = []
 
-        # Shutdown event to signal the worker thread to stop
-        self._shutdown_event = threading.Event()
-
-        # The worker thread that runs the main loop
-        self._thread: threading.Thread | None = None
-
-    def _cancel_request(
-        self, request_state: GenerationRequestState, error_message: str
-    ) -> None:
-        """
-        Helper method to cancel a request with a given error message.
-        It updates the request state and emits an error event.
-        """
-        request_state.status = RequestStatus.FAILED
-        request_state.error = error_message
-        request_state.output_queue.put(
-            ErrorEvent(
-                request_id=request_state.request_id,
-                error=request_state.error,
-            )
-        )
-
-    def _handle_fatal_error(
-        self,
-        error: Exception,
-        extra_requests: list[GenerationRequestState] | None = None,
-    ) -> None:
-        """Cancel all active and pending requests after an unrecoverable error.
-
-        Args:
-            error: The exception that caused the fatal error.
-            extra_requests: Any additional requests that are not yet in
-                self._active or self._inbound (e.g. new_requests[i:] when a
-                prefill call raises).
-        """
-        logger.exception("Worker thread crashed with unexpected exception: %s", error)
-        error_message = f"Worker encountered an unexpected error: {error}"
-        # Cancel any batch-local requests that are not yet in self._active
-        for pending in extra_requests or []:
-            try:
-                self._cancel_request(pending, error_message)
-            except Exception:
-                logger.exception(
-                    "Failed to emit error event for extra request %s",
-                    pending.request_id,
-                )
-        # Cancel all active requests
+    def _cancel_inflight(self, message: str) -> None:
         for pending in self._active:
             try:
-                self._cancel_request(pending, error_message)
+                self._cancel_request(pending, message)
             except Exception:
                 logger.exception(
                     "Failed to emit error event for active request %s",
                     pending.request_id,
                 )
         self._active.clear()
-        # Drain the inbound queue
-        while True:
-            try:
-                pending = self._inbound.get_nowait()
-            except Empty:
-                break
-            try:
-                self._cancel_request(pending, error_message)
-            except Exception:
-                logger.exception(
-                    "Failed to emit error event for pending request %s",
-                    pending.request_id,
-                )
 
     def _run_loop(self) -> None:
         try:
@@ -193,7 +218,7 @@ class SimpleWorker(Worker):
                         return
 
                     if req.status == RequestStatus.DECODING:
-                        self._executor.decode_one_step(req)
+                        self._executor.decode(req)
 
                 # After the decoding, some requests may have finished or failed, remove them from the active list
                 self._active = [
@@ -207,63 +232,7 @@ class SimpleWorker(Worker):
                 if not self._active:
                     self._shutdown_event.wait(timeout=0.01)
         except Exception as e:
-            # This is a background thread, no other thread is expected to catch this exception, so we log it here.
-            # We also attempt to cancel all active and pending requests with an error event.
             self._handle_fatal_error(e)
-
-    def start(self) -> None:
-        """Create the thread and start the main loop."""
-        if self._thread is not None and self._thread.is_alive():
-            logger.warning("Worker thread is already running")
-            return
-        self._shutdown_event.clear()
-        self._thread = threading.Thread(
-            target=self._run_loop, name="inference-worker", daemon=True
-        )
-        self._thread.start()
-        logger.info("Worker thread started")
-
-    def stop(self) -> None:
-        """Signal the thread to stop and wait for it to finish."""
-        self._shutdown_event.set()
-
-        if self._thread is not None:
-            self._thread.join()
-            logger.info("Worker thread stopped")
-
-        # Thread has stopped — drain any remaining inbound requests without races
-        while True:
-            try:
-                req = self._inbound.get_nowait()
-                self._cancel_request(req, "Worker is shutting down, request rejected")
-            except Empty:
-                break
-
-        # Cancel any active requests that were still in-flight
-        for pending in self._active:
-            try:
-                self._cancel_request(
-                    pending, "Worker is shutting down, request cancelled"
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to emit error event for active request %s",
-                    pending.request_id,
-                )
-
-        self._active.clear()
-
-    def submit(self, request_state: GenerationRequestState) -> None:
-        """Submit a new request to the worker.
-
-        Raises:
-            queue.Full: If the worker's inbound queue is full, indicating that the worker is overloaded.
-        """
-        if self._shutdown_event.is_set():
-            raise RuntimeError("Cannot submit new request, worker is shutting down")
-
-        request_state.enqueued_ns = now_ns()
-        self._inbound.put_nowait(request_state)
 
 
 class BatchWorker(Worker):
@@ -295,28 +264,23 @@ class BatchWorker(Worker):
         self, executor: BaseBatchExecutor, config: BatchExecutorConfig
     ) -> None:
         self._check_config(config)
-
+        super().__init__(config.max_queue_size)
         self._executor = executor
         self._config = config
-
-        # Inbound queue, HTTP handlers put the new request here.
-        # If the queue is full, submit() raises queue.Full; callers (e.g., HTTP
-        # handlers) should translate that condition into an HTTP 503 response.
-        self._inbound: Queue[GenerationRequestState] = Queue(
-            maxsize=self._config.max_queue_size
-        )
-
-        # The list of requests that are waiting to be prefilled
         self._waiting: list[GenerationRequestState] = []
-
-        # The list of active requests being processed by the worker (after prefill, during decode)
         self._active: list[GenerationRequestState] = []
 
-        # Shutdown event to signal the worker thread to stop
-        self._shutdown_event = threading.Event()
-
-        # The worker thread that runs the main loop
-        self._thread: threading.Thread | None = None
+    def _cancel_inflight(self, message: str) -> None:
+        for pending in self._waiting + self._active:
+            try:
+                self._cancel_request(pending, message)
+            except Exception:
+                logger.exception(
+                    "Failed to emit error event for request %s",
+                    pending.request_id,
+                )
+        self._waiting.clear()
+        self._active.clear()
 
     def _drain_inbound(self) -> None:
         """Move all requests from the inbound queue to the waiting list, up to max_active_requests."""
@@ -341,8 +305,7 @@ class BatchWorker(Worker):
 
     def _select_decode_batch(self) -> list[GenerationRequestState]:
         """Select a batch of requests from the active list for decode, up to max_decode_batch_size."""
-        # Check the status to ensure we only select requests that have completed prefill and are ready for decode.
-        # This is just being defensive, in the current implementation of the loop, all active requests should be in DECODING status
+        # This is just being defensive; in the current implementation all active requests should be in DECODING status
         decoding = [req for req in self._active if req.status == RequestStatus.DECODING]
         return decoding[: self._config.max_decode_batch_size]
 
@@ -383,121 +346,6 @@ class BatchWorker(Worker):
                     self._shutdown_event.wait(timeout=0.01)
 
             # Graceful shutdown: cancel any remaining waiting and active requests
-            for pending in self._waiting + self._active:
-                try:
-                    self._cancel_request(
-                        pending, "Worker is shutting down, request cancelled"
-                    )
-                except Exception:
-                    logger.exception(
-                        "Failed to clean up request %s during shutdown",
-                        pending.request_id,
-                    )
-            self._waiting.clear()
-            self._active.clear()
+            self._cancel_inflight("Worker is shutting down, request cancelled")
         except Exception as e:
             self._handle_fatal_error(e, extra_requests=prefill_batch)
-
-    def _cancel_request(
-        self, request_state: GenerationRequestState, error_message: str
-    ) -> None:
-        """
-        Helper method to cancel a request with a given error message.
-        It updates the request state and emits an error event.
-        """
-        request_state.status = RequestStatus.FAILED
-        request_state.error = error_message
-        request_state.output_queue.put(
-            ErrorEvent(
-                request_id=request_state.request_id,
-                error=request_state.error,
-            )
-        )
-
-    def _handle_fatal_error(
-        self,
-        error: Exception,
-        extra_requests: list[GenerationRequestState] | None = None,
-    ) -> None:
-        logger.exception("BatchWorker crashed: %s", error)
-        error_message = f"BatchWorker encountered an unexpected error: {error}"
-
-        for pending in (extra_requests or []) + self._waiting + self._active:
-            try:
-                self._cancel_request(pending, error_message)
-            except Exception:
-                logger.exception(
-                    "Failed to emit error event for active request %s",
-                    pending.request_id,
-                )
-
-        self._waiting.clear()
-        self._active.clear()
-
-        while True:
-            try:
-                pending = self._inbound.get_nowait()
-            except Empty:
-                break
-            try:
-                self._cancel_request(pending, error_message)
-            except Exception:
-                logger.exception(
-                    "Failed to emit error event for pending request %s",
-                    pending.request_id,
-                )
-
-    def start(self) -> None:
-        """Create the thread and start the main loop."""
-        if self._thread is not None and self._thread.is_alive():
-            logger.warning("Worker thread is already running")
-            return
-        self._shutdown_event.clear()
-        self._thread = threading.Thread(
-            target=self._run_loop, name="inference-worker", daemon=True
-        )
-        self._thread.start()
-        logger.info("Worker thread started")
-
-    def stop(self) -> None:
-        """Signal the thread to stop and wait for it to finish."""
-        self._shutdown_event.set()
-
-        if self._thread is not None:
-            self._thread.join()
-            logger.info("Worker thread stopped")
-
-        # Thread has stopped — drain any remaining inbound requests without races
-        while True:
-            try:
-                req = self._inbound.get_nowait()
-                self._cancel_request(req, "Worker is shutting down, request rejected")
-            except Empty:
-                break
-
-        # Cancel any waiting or active requests that were still in-flight
-        for pending in self._waiting + self._active:
-            try:
-                self._cancel_request(
-                    pending, "Worker is shutting down, request cancelled"
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to emit error event for request %s",
-                    pending.request_id,
-                )
-
-        self._waiting.clear()
-        self._active.clear()
-
-    def submit(self, request_state: GenerationRequestState) -> None:
-        """Submit a new request to the worker.
-
-        Raises:
-            queue.Full: If the worker's inbound queue is full, indicating that the worker is overloaded.
-        """
-        if self._shutdown_event.is_set():
-            raise RuntimeError("Cannot submit new request, worker is shutting down")
-
-        request_state.enqueued_ns = now_ns()
-        self._inbound.put_nowait(request_state)

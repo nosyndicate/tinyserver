@@ -10,7 +10,7 @@ Structure:
   Group 6:  prefill exception cancels the entire new_requests batch
   Group 7:  Shutdown detected mid-prefill loop
   Group 8:  Shutdown detected mid-decode loop
-  Group 9:  Fatal exception in decode_one_step
+  Group 9:  Fatal exception in decode
   Group 10: Capacity and batching
   Group 11: Edge cases
 """
@@ -63,7 +63,7 @@ class FakeExecutor(BaseExecutor):
         Set exactly once on the first call (useful for synchronisation).
 
     decode_gate: threading.Event | None
-        decode_one_step() blocks on gate.wait() before executing.
+        decode() blocks on gate.wait() before executing.
     """
 
     def __init__(
@@ -96,7 +96,7 @@ class FakeExecutor(BaseExecutor):
         else:
             request_state.status = RequestStatus.DECODING
 
-    def decode_one_step(self, request_state: GenerationRequestState) -> None:
+    def decode(self, request_state: GenerationRequestState) -> None:
         if self._decode_hook is not None:
             self._decode_hook.set()
             self._decode_hook = None  # fire once
@@ -556,7 +556,7 @@ def test_shutdown_during_idle_sleep_pending_request_drained() -> None:
 
 def test_decode_completes_before_shutdown_check_request_is_done() -> None:
     """
-    Shutdown event is set while the worker is inside decode_one_step().
+    Shutdown event is set while the worker is inside decode().
     Once decode finishes (gate released), the cleanup pass removes the DONE
     request from active; the outer while-loop then sees the shutdown event
     and exits cleanly.  The request should be DONE, not FAILED.
@@ -617,7 +617,7 @@ def test_shutdown_between_decode_calls_cancels_all_active() -> None:
 
 def test_stop_cancels_active_request_blocked_in_decode() -> None:
     """
-    stop() is called while a request is blocked inside decode_one_step().
+    stop() is called while a request is blocked inside decode().
     After the gate is released the worker exits its loop; stop()'s post-join
     cancel pass picks up the still-DECODING request and emits an ErrorEvent.
     """
@@ -661,11 +661,11 @@ def test_stop_cancels_active_request_blocked_in_decode() -> None:
     assert isinstance(events[0], ErrorEvent)
 
 
-# ─── Group 9: Fatal exception in decode_one_step ─────────────────────────────
+# ─── Group 9: Fatal exception in decode ─────────────────────────────
 
 
 def test_decode_exception_crashes_worker_and_cancels_active() -> None:
-    """An unhandled exception in decode_one_step triggers _handle_fatal_error."""
+    """An unhandled exception in decode triggers _handle_fatal_error."""
     executor = FakeExecutor(decode_side_effects={"r0": RuntimeError("decode boom")})
     worker = make_worker(executor)
     r0 = make_req("r0")
@@ -730,7 +730,7 @@ def test_max_active_requests_never_exceeded() -> None:
         for i in range(5):
             worker.submit(make_req(f"r{i}"))
         assert decode_hook.wait(timeout=2.0)
-        # The worker is now blocked inside decode_one_step; active list is frozen.
+        # The worker is now blocked inside decode; active list is frozen.
         assert len(worker._active) <= 2
     finally:
         decode_gate.set()
