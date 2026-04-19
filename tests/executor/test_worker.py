@@ -18,20 +18,21 @@ Structure:
 import queue
 import threading
 import time
-from typing import Any
 
 import pytest
 
 from server.executor.types import (
-    BaseExecutor,
     ErrorEvent,
     ExecutorConfig,
     GenerationRequestState,
     RequestStatus,
 )
-from server.executor.worker import SimpleWorker
 
 from .worker_helpers import (
+    SimpleWorkerInjector as FakeExecutor,
+)
+from .worker_helpers import (
+    TestableSimpleWorker,
     _assert_error_event,
     _make_fail_decode,
     _make_fail_prefill,
@@ -44,87 +45,14 @@ from .worker_helpers import (
 # ─── Test infrastructure ──────────────────────────────────────────────────────
 
 
-class FakeExecutor(BaseExecutor):
-    """
-    Hand-crafted fake executor with per-request behavioral control.
-
-    prefill_side_effects: dict[str, callable | BaseException | None]
-        None (default) → sets req.status = DECODING
-        BaseException instance → raised (triggers _handle_fatal_error)
-        callable(req) → called instead of default behaviour
-
-    decode_steps: dict[str, int]
-        Number of decode calls before setting status=DONE (default: 1).
-
-    decode_side_effects: dict[str, callable | BaseException | None]
-        Same structure as prefill_side_effects; applied per request_id.
-
-    prefill_hook / decode_hook: threading.Event | None
-        Set exactly once on the first call (useful for synchronisation).
-
-    decode_gate: threading.Event | None
-        decode() blocks on gate.wait() before executing.
-    """
-
-    def __init__(
-        self,
-        prefill_side_effects: dict[str, Any] | None = None,
-        decode_steps: dict[str, int] | None = None,
-        decode_side_effects: dict[str, Any] | None = None,
-        prefill_hook: threading.Event | None = None,
-        decode_hook: threading.Event | None = None,
-        decode_gate: threading.Event | None = None,
-    ) -> None:
-        self._prefill_fx = prefill_side_effects or {}
-        self._decode_steps = decode_steps or {}
-        self._decode_fx = decode_side_effects or {}
-        self._prefill_hook = prefill_hook
-        self._decode_hook = decode_hook
-        self._decode_gate = decode_gate
-        self._decode_counts: dict[str, int] = {}
-
-    def prefill(self, request_state: GenerationRequestState) -> None:
-        if self._prefill_hook is not None:
-            self._prefill_hook.set()
-            self._prefill_hook = None  # fire once
-
-        fx = self._prefill_fx.get(request_state.request_id)
-        if isinstance(fx, BaseException):
-            raise fx
-        elif callable(fx):
-            fx(request_state)
-        else:
-            request_state.status = RequestStatus.DECODING
-
-    def decode(self, request_state: GenerationRequestState) -> None:
-        if self._decode_hook is not None:
-            self._decode_hook.set()
-            self._decode_hook = None  # fire once
-
-        if self._decode_gate is not None:
-            self._decode_gate.wait(timeout=5.0)
-
-        fx = self._decode_fx.get(request_state.request_id)
-        if isinstance(fx, BaseException):
-            raise fx
-        elif callable(fx):
-            fx(request_state)
-        else:
-            n = self._decode_counts.get(request_state.request_id, 0) + 1
-            self._decode_counts[request_state.request_id] = n
-            steps = self._decode_steps.get(request_state.request_id, 1)
-            if n >= steps:
-                request_state.status = RequestStatus.DONE
-
-
 def make_worker(
     executor: FakeExecutor | None = None,
     max_queue_size: int = 16,
     max_active_requests: int = 4,
-) -> SimpleWorker:
+) -> TestableSimpleWorker:
     if executor is None:
         executor = FakeExecutor()
-    return SimpleWorker(
+    return TestableSimpleWorker(
         executor,
         ExecutorConfig(
             max_queue_size=max_queue_size, max_active_requests=max_active_requests
@@ -137,14 +65,14 @@ def make_worker(
 
 def test_max_queue_size_zero_raises() -> None:
     with pytest.raises(ValueError, match="max_queue_size"):
-        SimpleWorker(
+        TestableSimpleWorker(
             FakeExecutor(), ExecutorConfig(max_queue_size=0, max_active_requests=1)
         )
 
 
 def test_max_active_requests_zero_raises() -> None:
     with pytest.raises(ValueError, match="max_active_requests"):
-        SimpleWorker(
+        TestableSimpleWorker(
             FakeExecutor(), ExecutorConfig(max_queue_size=1, max_active_requests=0)
         )
 
@@ -155,13 +83,13 @@ def test_max_active_requests_zero_raises() -> None:
 )
 def test_invalid_config_parametrized(qs: int, mar: int) -> None:
     with pytest.raises(ValueError):
-        SimpleWorker(
+        TestableSimpleWorker(
             FakeExecutor(), ExecutorConfig(max_queue_size=qs, max_active_requests=mar)
         )
 
 
 def test_minimum_valid_config_constructs() -> None:
-    worker = SimpleWorker(
+    worker = TestableSimpleWorker(
         FakeExecutor(), ExecutorConfig(max_queue_size=1, max_active_requests=1)
     )
     assert worker._thread is None

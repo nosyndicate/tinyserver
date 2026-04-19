@@ -9,7 +9,6 @@ import uvicorn
 from fastapi import FastAPI
 
 from server.api.routes import health_router, v1_router, v2_router, v3_router
-from server.executor.executor import BatchExecutor, Executor
 from server.executor.types import BatchExecutorConfig, ExecutorConfig
 from server.executor.worker import BatchWorker, SimpleWorker
 from server.model.hf_runner import ModelConfig, load_hf_model
@@ -66,13 +65,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     version = args.api_version
 
     if version == "v2":
-        executor = Executor(runner)
-        worker = SimpleWorker(executor, ExecutorConfig())
+        worker = SimpleWorker(runner, ExecutorConfig())
         worker.start()
         app.state.worker = worker
     elif version == "v3":
-        batch_executor = BatchExecutor(runner)
-        batch_worker = BatchWorker(batch_executor, BatchExecutorConfig())
+        batch_worker = BatchWorker(runner, BatchExecutorConfig())
         batch_worker.start()
         app.state.batch_worker = batch_worker
 

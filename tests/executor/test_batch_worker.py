@@ -18,20 +18,21 @@ Structure:
 import queue
 import threading
 import time
-from typing import Any
 
 import pytest
 
 from server.executor.types import (
-    BaseBatchExecutor,
     BatchExecutorConfig,
     ErrorEvent,
     GenerationRequestState,
     RequestStatus,
 )
-from server.executor.worker import BatchWorker
 
 from .worker_helpers import (
+    BatchWorkerInjector as FakeBatchExecutor,
+)
+from .worker_helpers import (
+    TestableBatchWorker,
     _assert_error_event,
     _make_fail_decode,
     _make_fail_prefill,
@@ -44,104 +45,16 @@ from .worker_helpers import (
 # ─── Test infrastructure ──────────────────────────────────────────────────────
 
 
-class FakeBatchExecutor(BaseBatchExecutor):
-    """
-    Hand-crafted fake batch executor with per-request behavioral control.
-
-    prefill_side_effects: dict[str, callable | BaseException | None]
-        None (default) -> sets req.status = DECODING for all requests in batch
-        BaseException instance -> raised from batched_prefill (triggers _handle_fatal_error)
-        callable(req) -> called per-request instead of default behaviour
-
-    decode_steps: dict[str, int]
-        Number of decode calls before setting status=DONE (default: 1).
-
-    decode_side_effects: dict[str, callable | BaseException | None]
-        Same structure as prefill_side_effects; applied per request_id.
-        BaseException is raised from batched_decode (triggers _handle_fatal_error)
-
-    prefill_hook / decode_hook: threading.Event | None
-        Set exactly once on the first call (useful for synchronisation).
-
-    decode_gate: threading.Event | None
-        batched_decode() blocks on gate.wait() before executing.
-
-    prefill_call_sizes: list[int]
-        Records the len(batch) for each batched_prefill call.
-
-    decode_call_sizes: list[int]
-        Records the len(batch) for each batched_decode call.
-    """
-
-    def __init__(
-        self,
-        prefill_side_effects: dict[str, Any] | None = None,
-        decode_steps: dict[str, int] | None = None,
-        decode_side_effects: dict[str, Any] | None = None,
-        prefill_hook: threading.Event | None = None,
-        decode_hook: threading.Event | None = None,
-        decode_gate: threading.Event | None = None,
-    ) -> None:
-        self._prefill_fx = prefill_side_effects or {}
-        self._decode_steps = decode_steps or {}
-        self._decode_fx = decode_side_effects or {}
-        self._prefill_hook = prefill_hook
-        self._decode_hook = decode_hook
-        self._decode_gate = decode_gate
-        self._decode_counts: dict[str, int] = {}
-        self.prefill_call_sizes: list[int] = []
-        self.decode_call_sizes: list[int] = []
-
-    def batched_prefill(self, request_states: list[GenerationRequestState]) -> None:
-        self.prefill_call_sizes.append(len(request_states))
-
-        if self._prefill_hook is not None:
-            self._prefill_hook.set()
-            self._prefill_hook = None  # fire once
-
-        for req in request_states:
-            fx = self._prefill_fx.get(req.request_id)
-            if isinstance(fx, BaseException):
-                raise fx
-            elif callable(fx):
-                fx(req)
-            else:
-                req.status = RequestStatus.DECODING
-
-    def batched_decode(self, request_states: list[GenerationRequestState]) -> None:
-        self.decode_call_sizes.append(len(request_states))
-
-        if self._decode_hook is not None:
-            self._decode_hook.set()
-            self._decode_hook = None  # fire once
-
-        if self._decode_gate is not None:
-            self._decode_gate.wait(timeout=5.0)
-
-        for req in request_states:
-            fx = self._decode_fx.get(req.request_id)
-            if isinstance(fx, BaseException):
-                raise fx
-            elif callable(fx):
-                fx(req)
-            else:
-                n = self._decode_counts.get(req.request_id, 0) + 1
-                self._decode_counts[req.request_id] = n
-                steps = self._decode_steps.get(req.request_id, 1)
-                if n >= steps:
-                    req.status = RequestStatus.DONE
-
-
 def make_batch_worker(
     executor: FakeBatchExecutor | None = None,
     max_queue_size: int = 16,
     max_active_requests: int = 4,
     max_prefill_batch_size: int = 4,
     max_decode_batch_size: int = 4,
-) -> BatchWorker:
+) -> TestableBatchWorker:
     if executor is None:
         executor = FakeBatchExecutor()
-    return BatchWorker(
+    return TestableBatchWorker(
         executor,
         BatchExecutorConfig(
             max_queue_size=max_queue_size,
@@ -157,7 +70,7 @@ def make_batch_worker(
 
 def test_max_queue_size_zero_raises() -> None:
     with pytest.raises(ValueError, match="max_queue_size"):
-        BatchWorker(
+        TestableBatchWorker(
             FakeBatchExecutor(),
             BatchExecutorConfig(
                 max_queue_size=0,
@@ -170,7 +83,7 @@ def test_max_queue_size_zero_raises() -> None:
 
 def test_max_active_requests_zero_raises() -> None:
     with pytest.raises(ValueError, match="max_active_requests"):
-        BatchWorker(
+        TestableBatchWorker(
             FakeBatchExecutor(),
             BatchExecutorConfig(
                 max_queue_size=1,
@@ -183,7 +96,7 @@ def test_max_active_requests_zero_raises() -> None:
 
 def test_max_prefill_batch_size_zero_raises() -> None:
     with pytest.raises(ValueError, match="max_prefill_batch_size"):
-        BatchWorker(
+        TestableBatchWorker(
             FakeBatchExecutor(),
             BatchExecutorConfig(
                 max_queue_size=1,
@@ -196,7 +109,7 @@ def test_max_prefill_batch_size_zero_raises() -> None:
 
 def test_max_decode_batch_size_zero_raises() -> None:
     with pytest.raises(ValueError, match="max_decode_batch_size"):
-        BatchWorker(
+        TestableBatchWorker(
             FakeBatchExecutor(),
             BatchExecutorConfig(
                 max_queue_size=1,
@@ -209,7 +122,7 @@ def test_max_decode_batch_size_zero_raises() -> None:
 
 def test_prefill_batch_exceeds_active_raises() -> None:
     with pytest.raises(ValueError, match="max_prefill_batch_size cannot be greater"):
-        BatchWorker(
+        TestableBatchWorker(
             FakeBatchExecutor(),
             BatchExecutorConfig(
                 max_queue_size=8,
@@ -222,7 +135,7 @@ def test_prefill_batch_exceeds_active_raises() -> None:
 
 def test_decode_batch_exceeds_active_raises() -> None:
     with pytest.raises(ValueError, match="max_decode_batch_size cannot be greater"):
-        BatchWorker(
+        TestableBatchWorker(
             FakeBatchExecutor(),
             BatchExecutorConfig(
                 max_queue_size=8,
@@ -246,7 +159,7 @@ def test_decode_batch_exceeds_active_raises() -> None:
 )
 def test_invalid_config_parametrized(qs: int, mar: int, pbs: int, dbs: int) -> None:
     with pytest.raises(ValueError):
-        BatchWorker(
+        TestableBatchWorker(
             FakeBatchExecutor(),
             BatchExecutorConfig(
                 max_queue_size=qs,
@@ -258,7 +171,7 @@ def test_invalid_config_parametrized(qs: int, mar: int, pbs: int, dbs: int) -> N
 
 
 def test_minimum_valid_config_constructs() -> None:
-    worker = BatchWorker(
+    worker = TestableBatchWorker(
         FakeBatchExecutor(),
         BatchExecutorConfig(
             max_queue_size=1,

@@ -133,6 +133,19 @@ class ModelRunner:
         )
 
     @torch.inference_mode()
+    def decode_step(
+        self,
+        next_token_id: int,
+        past_key_values: DynamicCache,
+    ) -> tuple[torch.Tensor, DynamicCache]:
+        """Single-request decode forward pass. Returns (logits, past_key_values)."""
+        next_input_id = torch.tensor([[next_token_id]], device=self.model.device)
+        output = self.model(
+            next_input_id, past_key_values=past_key_values, use_cache=True
+        )
+        return output.logits, output.past_key_values
+
+    @torch.inference_mode()
     def sample_token(
         self,
         logits: torch.Tensor,

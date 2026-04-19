@@ -1,11 +1,18 @@
+"""Tests for BatchWorker._prefill_batch and BatchWorker._decode_batch_step.
+
+These tests exercise the real worker methods (which replaced the old
+BatchExecutor class) with a hand-rolled FakeModelRunner that implements only
+the small runner surface the worker consumes.
+"""
+
 import itertools
 import queue
 
 import torch
 from transformers import DynamicCache
 
-from server.executor.executor import BatchExecutor
 from server.executor.types import (
+    BatchExecutorConfig,
     DoneEvent,
     ErrorEvent,
     FinishReason,
@@ -13,6 +20,7 @@ from server.executor.types import (
     RequestStatus,
     TokenEvent,
 )
+from server.executor.worker import BatchWorker
 from server.model.batch_ops import DecodeBatchOutput, PrefillBatchOutput
 from server.model.sampling import SamplingParams
 
@@ -23,7 +31,7 @@ EOS = 2
 
 
 class FakeTokenizer:
-    """Minimal tokenizer fake for BatchExecutor tests."""
+    """Minimal tokenizer fake."""
 
     def __init__(
         self,
@@ -38,15 +46,13 @@ class FakeTokenizer:
 
 
 class FakeModelRunner:
-    """
-    Hand-crafted fake ModelRunner with sequential call control.
+    """Hand-crafted fake ModelRunner for BatchWorker tests.
 
-    sample_tokens: list[int]
-        Token IDs returned by sample_token(), consumed in order.
-    prefill_batches: list[list[PrefillBatchOutput]]
-        Each call to prefill_batch() pops the first element.
-    decode_batches: list[list[DecodeBatchOutput]]
-        Each call to decode_batch() pops the first element.
+    Exposes only the runner surface the worker actually calls:
+        - prefill_batch(prompts) -> list[PrefillBatchOutput]
+        - decode_batch(token_ids, pkvs) -> list[DecodeBatchOutput]
+        - sample_token(logits, params, generator) -> int
+        - eos_token_id, tokenizer
     """
 
     def __init__(
@@ -125,7 +131,19 @@ def _make_decode_output() -> DecodeBatchOutput:
     )
 
 
-# ─── Group 1: batched_prefill — happy path ───────────────────────────────────
+def make_worker(runner: FakeModelRunner) -> BatchWorker:
+    return BatchWorker(
+        runner,  # type: ignore[arg-type]
+        BatchExecutorConfig(
+            max_queue_size=16,
+            max_active_requests=4,
+            max_prefill_batch_size=4,
+            max_decode_batch_size=4,
+        ),
+    )
+
+
+# ─── Group 1: _prefill_batch — happy path ────────────────────────────────────
 
 
 def test_batched_prefill_transitions_to_decoding() -> None:
@@ -134,10 +152,10 @@ def test_batched_prefill_transitions_to_decoding() -> None:
             [_make_prefill_output(5), _make_prefill_output(8)],
         ],
     )
-    executor = BatchExecutor(runner)
+    worker = make_worker(runner)
     r0, r1 = make_req("r0"), make_req("r1")
 
-    executor.batched_prefill([r0, r1])
+    worker._prefill_batch([r0, r1])
 
     assert r0.status == RequestStatus.DECODING
     assert r1.status == RequestStatus.DECODING
@@ -149,10 +167,10 @@ def test_batched_prefill_sets_shared_start_ns() -> None:
             [_make_prefill_output(), _make_prefill_output()],
         ],
     )
-    executor = BatchExecutor(runner)
+    worker = make_worker(runner)
     r0, r1 = make_req("r0"), make_req("r1")
 
-    executor.batched_prefill([r0, r1])
+    worker._prefill_batch([r0, r1])
 
     assert r0.start_ns is not None
     assert r1.start_ns is not None
@@ -163,10 +181,10 @@ def test_batched_prefill_assigns_outputs_to_correct_requests() -> None:
     out0 = _make_prefill_output(5)
     out1 = _make_prefill_output(8)
     runner = FakeModelRunner(prefill_batches=[[out0, out1]])
-    executor = BatchExecutor(runner)
+    worker = make_worker(runner)
     r0, r1 = make_req("r0"), make_req("r1")
 
-    executor.batched_prefill([r0, r1])
+    worker._prefill_batch([r0, r1])
 
     assert r0.all_logits is out0.logits
     assert r0.past_key_values is out0.past_key_values
@@ -178,30 +196,28 @@ def test_batched_prefill_assigns_outputs_to_correct_requests() -> None:
 
 def test_batched_prefill_single_request() -> None:
     runner = FakeModelRunner(prefill_batches=[[_make_prefill_output(3)]])
-    executor = BatchExecutor(runner)
+    worker = make_worker(runner)
     req = make_req("r0")
 
-    executor.batched_prefill([req])
+    worker._prefill_batch([req])
 
     assert req.status == RequestStatus.DECODING
     assert req.num_prompt_tokens == 3
 
 
-# ─── Group 2: batched_prefill — error handling ───────────────────────────────
+# ─── Group 2: _prefill_batch — error handling ────────────────────────────────
 
 
 def test_batched_prefill_runner_exception_marks_all_failed() -> None:
-    runner = FakeModelRunner(
-        prefill_batches=[],
-    )
+    runner = FakeModelRunner(prefill_batches=[])
     # Override to raise
     runner.prefill_batch = lambda prompts: (_ for _ in ()).throw(
         RuntimeError("model crash")
     )
-    executor = BatchExecutor(runner)
+    worker = make_worker(runner)
     r0, r1 = make_req("r0"), make_req("r1")
 
-    executor.batched_prefill([r0, r1])
+    worker._prefill_batch([r0, r1])
 
     assert r0.status == RequestStatus.FAILED
     assert r1.status == RequestStatus.FAILED
@@ -212,14 +228,11 @@ def test_batched_prefill_runner_exception_marks_all_failed() -> None:
 
 
 def test_batched_prefill_output_count_mismatch_marks_all_failed() -> None:
-    # Runner returns 1 output for 2 requests
-    runner = FakeModelRunner(
-        prefill_batches=[[_make_prefill_output()]],
-    )
-    executor = BatchExecutor(runner)
+    runner = FakeModelRunner(prefill_batches=[[_make_prefill_output()]])
+    worker = make_worker(runner)
     r0, r1 = make_req("r0"), make_req("r1")
 
-    executor.batched_prefill([r0, r1])
+    worker._prefill_batch([r0, r1])
 
     assert r0.status == RequestStatus.FAILED
     assert r1.status == RequestStatus.FAILED
@@ -229,7 +242,7 @@ def test_batched_prefill_output_count_mismatch_marks_all_failed() -> None:
         assert isinstance(events[0], ErrorEvent)
 
 
-# ─── Group 3: batched_decode — token generation and state ────────────────────
+# ─── Group 3: _decode_batch_step — token generation and state ────────────────
 
 
 def test_batched_decode_updates_logits_and_cache() -> None:
@@ -249,9 +262,9 @@ def test_batched_decode_updates_logits_and_cache() -> None:
         ],
         token_map={42: "a"},
     )
-    executor = BatchExecutor(runner)
+    worker = make_worker(runner)
 
-    executor.batched_decode([req])
+    worker._decode_batch_step([req])
 
     assert req.all_logits is new_logits
     assert req.past_key_values is new_cache
@@ -270,9 +283,9 @@ def test_batched_decode_sets_first_token_ns_on_first_step() -> None:
         decode_batches=[[_make_decode_output()]],
         token_map={42: "a"},
     )
-    executor = BatchExecutor(runner)
+    worker = make_worker(runner)
 
-    executor.batched_decode([req])
+    worker._decode_batch_step([req])
 
     assert req.first_token_ns is not None
 
@@ -290,9 +303,9 @@ def test_batched_decode_emits_token_event() -> None:
         decode_batches=[[_make_decode_output()]],
         token_map={42: "hello"},
     )
-    executor = BatchExecutor(runner)
+    worker = make_worker(runner)
 
-    executor.batched_decode([req])
+    worker._decode_batch_step([req])
 
     events = drain_events(req)
     assert len(events) == 1
@@ -301,7 +314,6 @@ def test_batched_decode_emits_token_event() -> None:
     assert tok_event.token == "hello"
     assert tok_event.is_first is True
     assert tok_event.is_last is False
-    # 0 for the first token
     assert tok_event.index == 0
 
 
@@ -320,19 +332,18 @@ def test_batched_decode_second_step_not_first() -> None:
         decode_batches=[[_make_decode_output()]],
         token_map={42: "b"},
     )
-    executor = BatchExecutor(runner)
+    worker = make_worker(runner)
 
-    executor.batched_decode([req])
+    worker._decode_batch_step([req])
 
     events = drain_events(req)
     tok_event = events[0]
     assert isinstance(tok_event, TokenEvent)
     assert tok_event.is_first is False
-    # Index is 1 for the second token
     assert tok_event.index == 1
 
 
-# ─── Group 4: batched_decode — completion (EOS / max length) ─────────────────
+# ─── Group 4: _decode_batch_step — completion (EOS / max length) ─────────────
 
 
 def test_batched_decode_eos_finishes_request() -> None:
@@ -344,13 +355,10 @@ def test_batched_decode_eos_finishes_request() -> None:
     req.all_logits = torch.randn(1, 5, VOCAB)
     req.past_key_values = DynamicCache()
 
-    runner = FakeModelRunner(
-        sample_tokens=[EOS],  # eos_token_id
-        # No decode_batches needed — request finishes before batch decode
-    )
-    executor = BatchExecutor(runner)
+    runner = FakeModelRunner(sample_tokens=[EOS])
+    worker = make_worker(runner)
 
-    executor.batched_decode([req])
+    worker._decode_batch_step([req])
 
     assert req.status == RequestStatus.DONE
     assert req.finished_reason == FinishReason.EOS
@@ -371,9 +379,9 @@ def test_batched_decode_eos_emits_done_event() -> None:
     req.past_key_values = DynamicCache()
 
     runner = FakeModelRunner(sample_tokens=[EOS])
-    executor = BatchExecutor(runner)
+    worker = make_worker(runner)
 
-    executor.batched_decode([req])
+    worker._decode_batch_step([req])
 
     events = drain_events(req)
     assert len(events) == 2
@@ -390,21 +398,20 @@ def test_batched_decode_max_length_finishes_request() -> None:
     req.num_prompt_tokens = 5
     req.all_logits = torch.randn(1, 5, VOCAB)
     req.past_key_values = DynamicCache()
-    # max_new_tokens=1 means the first generated token is also the last
     req.sampling_params = SamplingParams(max_new_tokens=1, temperature=1.0, top_p=1.0)
 
     runner = FakeModelRunner(
         sample_tokens=[42],
         token_map={42: "a"},
     )
-    executor = BatchExecutor(runner)
+    worker = make_worker(runner)
 
-    executor.batched_decode([req])
+    worker._decode_batch_step([req])
 
     assert req.status == RequestStatus.DONE
     assert req.finished_reason == FinishReason.MAX_LENGTH
     events = drain_events(req)
-    assert len(events) == 2  # TokenEvent(is_last=True) + DoneEvent
+    assert len(events) == 2
     assert isinstance(events[0], TokenEvent)
     assert events[0].is_last is True
 
@@ -419,19 +426,16 @@ def test_batched_decode_all_finish_no_batch_decode_called() -> None:
         req.all_logits = torch.randn(1, 5, VOCAB)
         req.past_key_values = DynamicCache()
 
-    runner = FakeModelRunner(
-        sample_tokens=[EOS, EOS],
-        # decode_batches is empty — if decode_batch is called, it will raise
-    )
-    executor = BatchExecutor(runner)
+    runner = FakeModelRunner(sample_tokens=[EOS, EOS])
+    worker = make_worker(runner)
 
-    executor.batched_decode([r0, r1])
+    worker._decode_batch_step([r0, r1])
 
     assert r0.status == RequestStatus.DONE
     assert r1.status == RequestStatus.DONE
 
 
-# ─── Group 5: batched_decode — error handling ────────────────────────────────
+# ─── Group 5: _decode_batch_step — error handling ────────────────────────────
 
 
 def test_batched_decode_none_logits_marks_failed() -> None:
@@ -439,13 +443,13 @@ def test_batched_decode_none_logits_marks_failed() -> None:
     req.status = RequestStatus.DECODING
     req.start_ns = 0
     req.enqueued_ns = 0
-    req.all_logits = None  # missing logits
+    req.all_logits = None
     req.past_key_values = DynamicCache()
 
     runner = FakeModelRunner(sample_tokens=[])
-    executor = BatchExecutor(runner)
+    worker = make_worker(runner)
 
-    executor.batched_decode([req])
+    worker._decode_batch_step([req])
 
     assert req.status == RequestStatus.FAILED
     events = drain_events(req)
@@ -459,12 +463,12 @@ def test_batched_decode_none_past_key_values_marks_failed() -> None:
     req.start_ns = 0
     req.enqueued_ns = 0
     req.all_logits = torch.randn(1, 5, VOCAB)
-    req.past_key_values = None  # missing kv cache
+    req.past_key_values = None
 
     runner = FakeModelRunner(sample_tokens=[])
-    executor = BatchExecutor(runner)
+    worker = make_worker(runner)
 
-    executor.batched_decode([req])
+    worker._decode_batch_step([req])
 
     assert req.status == RequestStatus.FAILED
     events = drain_events(req)
@@ -477,7 +481,7 @@ def test_batched_decode_error_in_one_request_others_continue() -> None:
     r0.status = RequestStatus.DECODING
     r0.start_ns = 0
     r0.enqueued_ns = 0
-    r0.all_logits = None  # will fail
+    r0.all_logits = None
     r0.past_key_values = DynamicCache()
 
     r1 = make_req("r1")
@@ -492,9 +496,9 @@ def test_batched_decode_error_in_one_request_others_continue() -> None:
         decode_batches=[[_make_decode_output()]],
         token_map={42: "a"},
     )
-    executor = BatchExecutor(runner)
+    worker = make_worker(runner)
 
-    executor.batched_decode([r0, r1])
+    worker._decode_batch_step([r0, r1])
 
     assert r0.status == RequestStatus.FAILED
     assert r1.status == RequestStatus.DECODING
@@ -513,17 +517,15 @@ def test_batched_decode_decode_batch_exception_marks_unfinished_failed() -> None
         decode_batches=[],
         token_map={42: "a"},
     )
-    # Override to raise on decode_batch
     runner.decode_batch = lambda tids, pvs: (_ for _ in ()).throw(
         RuntimeError("batch decode crash")
     )
-    executor = BatchExecutor(runner)
+    worker = make_worker(runner)
 
-    executor.batched_decode([req])
+    worker._decode_batch_step([req])
 
     assert req.status == RequestStatus.FAILED
     events = drain_events(req)
-    # TokenEvent emitted before the batch decode, then ErrorEvent
     assert any(isinstance(e, ErrorEvent) for e in events)
 
 
@@ -537,12 +539,12 @@ def test_batched_decode_decode_batch_output_mismatch_marks_failed() -> None:
 
     runner = FakeModelRunner(
         sample_tokens=[42],
-        decode_batches=[[]],  # empty list — 0 outputs for 1 request
+        decode_batches=[[]],
         token_map={42: "a"},
     )
-    executor = BatchExecutor(runner)
+    worker = make_worker(runner)
 
-    executor.batched_decode([req])
+    worker._decode_batch_step([req])
 
     assert req.status == RequestStatus.FAILED
     events = drain_events(req)
@@ -556,29 +558,25 @@ def test_full_prefill_decode_cycle() -> None:
     runner = FakeModelRunner(
         prefill_batches=[[_make_prefill_output(5)]],
         sample_tokens=[42, EOS],
-        decode_batches=[[_make_decode_output()]],  # for first decode step
+        decode_batches=[[_make_decode_output()]],
         token_map={42: "hi"},
     )
-    executor = BatchExecutor(runner)
+    worker = make_worker(runner)
     req = make_req("r0")
     req.enqueued_ns = 0
 
-    # Step 1: prefill
-    executor.batched_prefill([req])
+    worker._prefill_batch([req])
     assert req.status == RequestStatus.DECODING
     assert req.num_prompt_tokens == 5
 
-    # Step 2: first decode — produces token "hi"
-    executor.batched_decode([req])
+    worker._decode_batch_step([req])
     assert req.status == RequestStatus.DECODING
     assert req.output_tokens == ["hi"]
 
-    # Step 3: second decode — EOS
-    executor.batched_decode([req])
+    worker._decode_batch_step([req])
     assert req.status == RequestStatus.DONE
     assert req.finished_reason == FinishReason.EOS
 
-    # Collect all events
     events = drain_events(req)
     token_events = [e for e in events if isinstance(e, TokenEvent)]
     done_events = [e for e in events if isinstance(e, DoneEvent)]
@@ -602,22 +600,22 @@ def test_full_cycle_multiple_requests() -> None:
         ],
         token_map={42: "a", 43: "b"},
     )
-    executor = BatchExecutor(runner)
+    worker = make_worker(runner)
     r0, r1 = make_req("r0"), make_req("r1")
     r0.enqueued_ns = 0
     r1.enqueued_ns = 0
 
-    executor.batched_prefill([r0, r1])
+    worker._prefill_batch([r0, r1])
     assert r0.status == RequestStatus.DECODING
     assert r1.status == RequestStatus.DECODING
 
-    executor.batched_decode([r0, r1])
+    worker._decode_batch_step([r0, r1])
     assert r0.status == RequestStatus.DECODING
     assert r1.status == RequestStatus.DECODING
     assert r0.output_tokens == ["a"]
     assert r1.output_tokens == ["b"]
 
-    executor.batched_decode([r0, r1])
+    worker._decode_batch_step([r0, r1])
     assert r0.status == RequestStatus.DONE
     assert r1.status == RequestStatus.DONE
 

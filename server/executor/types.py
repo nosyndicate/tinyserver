@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from queue import Queue
-from typing import Protocol
 
 import torch
 from torch import Tensor
@@ -133,7 +132,7 @@ class GenerationRequestState:
     # Decoding state
     first_token_ns: int | None = None
     start_ns: int | None = None
-    # Set in routes.py before submit(), read in executor._finish().
+    # Set in routes.py before submit(), read in worker._finish().
     # Queue.put/get provides happens-before guarantee, no extra sync needed.
     enqueued_ns: int | None = None
     output_tokens: list[str] = field(default_factory=list)
@@ -149,18 +148,6 @@ class GenerationRequestState:
     @property
     def num_output_tokens(self) -> int:
         return len(self.output_tokens)
-
-
-class BaseExecutor(Protocol):
-    def prefill(self, request_state: GenerationRequestState) -> None: ...
-
-    def decode(self, request_state: GenerationRequestState) -> None: ...
-
-
-class BaseBatchExecutor(Protocol):
-    def batched_prefill(self, request_states: list[GenerationRequestState]) -> None: ...
-
-    def batched_decode(self, request_states: list[GenerationRequestState]) -> None: ...
 
 
 @dataclass
