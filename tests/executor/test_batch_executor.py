@@ -4,12 +4,16 @@ import queue
 import torch
 from transformers import DynamicCache
 
+from server.executor.events import RequestEventEmitter
 from server.executor.executor import BatchExecutor
 from server.executor.types import (
+    DecodeResult,
     DoneEvent,
     ErrorEvent,
     FinishReason,
     GenerationRequestState,
+    PrefillResult,
+    RequestFailure,
     RequestStatus,
     TokenEvent,
 )
@@ -108,6 +112,45 @@ def drain_events(req: GenerationRequestState) -> list:
     return events
 
 
+def _apply_prefill_result(
+    req: GenerationRequestState, result: PrefillResult | RequestFailure
+) -> None:
+    emitter = RequestEventEmitter()
+    if isinstance(result, RequestFailure):
+        emitter.on_failed(req, result.error)
+        return
+    emitter.on_prefill_started(req, result.start_ns)
+    emitter.on_prefill_succeeded(req, result)
+
+
+def _apply_decode_result(
+    req: GenerationRequestState, result: DecodeResult | RequestFailure
+) -> None:
+    emitter = RequestEventEmitter()
+    if isinstance(result, RequestFailure):
+        emitter.on_failed(req, result.error)
+        return
+    emitter.on_token(req, result)
+
+
+def apply_batched_prefill(
+    executor: BatchExecutor, reqs: list[GenerationRequestState]
+) -> list[PrefillResult | RequestFailure]:
+    results = executor.batched_prefill(reqs)
+    for req, result in zip(reqs, results):
+        _apply_prefill_result(req, result)
+    return results
+
+
+def apply_batched_decode(
+    executor: BatchExecutor, reqs: list[GenerationRequestState]
+) -> list[DecodeResult | RequestFailure]:
+    results = executor.batched_decode(reqs)
+    for req, result in zip(reqs, results):
+        _apply_decode_result(req, result)
+    return results
+
+
 def _make_prefill_output(
     num_prompt_tokens: int = 5,
 ) -> PrefillBatchOutput:
@@ -137,7 +180,7 @@ def test_batched_prefill_transitions_to_decoding() -> None:
     executor = BatchExecutor(runner)
     r0, r1 = make_req("r0"), make_req("r1")
 
-    executor.batched_prefill([r0, r1])
+    apply_batched_prefill(executor, [r0, r1])
 
     assert r0.status == RequestStatus.DECODING
     assert r1.status == RequestStatus.DECODING
@@ -152,7 +195,7 @@ def test_batched_prefill_sets_shared_start_ns() -> None:
     executor = BatchExecutor(runner)
     r0, r1 = make_req("r0"), make_req("r1")
 
-    executor.batched_prefill([r0, r1])
+    apply_batched_prefill(executor, [r0, r1])
 
     assert r0.start_ns is not None
     assert r1.start_ns is not None
@@ -166,7 +209,7 @@ def test_batched_prefill_assigns_outputs_to_correct_requests() -> None:
     executor = BatchExecutor(runner)
     r0, r1 = make_req("r0"), make_req("r1")
 
-    executor.batched_prefill([r0, r1])
+    apply_batched_prefill(executor, [r0, r1])
 
     assert r0.all_logits is out0.logits
     assert r0.past_key_values is out0.past_key_values
@@ -181,7 +224,7 @@ def test_batched_prefill_single_request() -> None:
     executor = BatchExecutor(runner)
     req = make_req("r0")
 
-    executor.batched_prefill([req])
+    apply_batched_prefill(executor, [req])
 
     assert req.status == RequestStatus.DECODING
     assert req.num_prompt_tokens == 3
@@ -201,7 +244,7 @@ def test_batched_prefill_runner_exception_marks_all_failed() -> None:
     executor = BatchExecutor(runner)
     r0, r1 = make_req("r0"), make_req("r1")
 
-    executor.batched_prefill([r0, r1])
+    apply_batched_prefill(executor, [r0, r1])
 
     assert r0.status == RequestStatus.FAILED
     assert r1.status == RequestStatus.FAILED
@@ -219,7 +262,7 @@ def test_batched_prefill_output_count_mismatch_marks_all_failed() -> None:
     executor = BatchExecutor(runner)
     r0, r1 = make_req("r0"), make_req("r1")
 
-    executor.batched_prefill([r0, r1])
+    apply_batched_prefill(executor, [r0, r1])
 
     assert r0.status == RequestStatus.FAILED
     assert r1.status == RequestStatus.FAILED
@@ -251,7 +294,7 @@ def test_batched_decode_updates_logits_and_cache() -> None:
     )
     executor = BatchExecutor(runner)
 
-    executor.batched_decode([req])
+    apply_batched_decode(executor, [req])
 
     assert req.all_logits is new_logits
     assert req.past_key_values is new_cache
@@ -272,7 +315,7 @@ def test_batched_decode_sets_first_token_ns_on_first_step() -> None:
     )
     executor = BatchExecutor(runner)
 
-    executor.batched_decode([req])
+    apply_batched_decode(executor, [req])
 
     assert req.first_token_ns is not None
 
@@ -292,7 +335,7 @@ def test_batched_decode_emits_token_event() -> None:
     )
     executor = BatchExecutor(runner)
 
-    executor.batched_decode([req])
+    apply_batched_decode(executor, [req])
 
     events = drain_events(req)
     assert len(events) == 1
@@ -322,7 +365,7 @@ def test_batched_decode_second_step_not_first() -> None:
     )
     executor = BatchExecutor(runner)
 
-    executor.batched_decode([req])
+    apply_batched_decode(executor, [req])
 
     events = drain_events(req)
     tok_event = events[0]
@@ -350,7 +393,7 @@ def test_batched_decode_eos_finishes_request() -> None:
     )
     executor = BatchExecutor(runner)
 
-    executor.batched_decode([req])
+    apply_batched_decode(executor, [req])
 
     assert req.status == RequestStatus.DONE
     assert req.finished_reason == FinishReason.EOS
@@ -373,7 +416,7 @@ def test_batched_decode_eos_emits_done_event() -> None:
     runner = FakeModelRunner(sample_tokens=[EOS])
     executor = BatchExecutor(runner)
 
-    executor.batched_decode([req])
+    apply_batched_decode(executor, [req])
 
     events = drain_events(req)
     assert len(events) == 2
@@ -399,7 +442,7 @@ def test_batched_decode_max_length_finishes_request() -> None:
     )
     executor = BatchExecutor(runner)
 
-    executor.batched_decode([req])
+    apply_batched_decode(executor, [req])
 
     assert req.status == RequestStatus.DONE
     assert req.finished_reason == FinishReason.MAX_LENGTH
@@ -425,7 +468,7 @@ def test_batched_decode_all_finish_no_batch_decode_called() -> None:
     )
     executor = BatchExecutor(runner)
 
-    executor.batched_decode([r0, r1])
+    apply_batched_decode(executor, [r0, r1])
 
     assert r0.status == RequestStatus.DONE
     assert r1.status == RequestStatus.DONE
@@ -445,7 +488,7 @@ def test_batched_decode_none_logits_marks_failed() -> None:
     runner = FakeModelRunner(sample_tokens=[])
     executor = BatchExecutor(runner)
 
-    executor.batched_decode([req])
+    apply_batched_decode(executor, [req])
 
     assert req.status == RequestStatus.FAILED
     events = drain_events(req)
@@ -464,7 +507,7 @@ def test_batched_decode_none_past_key_values_marks_failed() -> None:
     runner = FakeModelRunner(sample_tokens=[])
     executor = BatchExecutor(runner)
 
-    executor.batched_decode([req])
+    apply_batched_decode(executor, [req])
 
     assert req.status == RequestStatus.FAILED
     events = drain_events(req)
@@ -494,7 +537,7 @@ def test_batched_decode_error_in_one_request_others_continue() -> None:
     )
     executor = BatchExecutor(runner)
 
-    executor.batched_decode([r0, r1])
+    apply_batched_decode(executor, [r0, r1])
 
     assert r0.status == RequestStatus.FAILED
     assert r1.status == RequestStatus.DECODING
@@ -519,7 +562,7 @@ def test_batched_decode_decode_batch_exception_marks_unfinished_failed() -> None
     )
     executor = BatchExecutor(runner)
 
-    executor.batched_decode([req])
+    apply_batched_decode(executor, [req])
 
     assert req.status == RequestStatus.FAILED
     events = drain_events(req)
@@ -542,7 +585,7 @@ def test_batched_decode_decode_batch_output_mismatch_marks_failed() -> None:
     )
     executor = BatchExecutor(runner)
 
-    executor.batched_decode([req])
+    apply_batched_decode(executor, [req])
 
     assert req.status == RequestStatus.FAILED
     events = drain_events(req)
@@ -564,17 +607,17 @@ def test_full_prefill_decode_cycle() -> None:
     req.enqueued_ns = 0
 
     # Step 1: prefill
-    executor.batched_prefill([req])
+    apply_batched_prefill(executor, [req])
     assert req.status == RequestStatus.DECODING
     assert req.num_prompt_tokens == 5
 
     # Step 2: first decode — produces token "hi"
-    executor.batched_decode([req])
+    apply_batched_decode(executor, [req])
     assert req.status == RequestStatus.DECODING
     assert req.output_tokens == ["hi"]
 
     # Step 3: second decode — EOS
-    executor.batched_decode([req])
+    apply_batched_decode(executor, [req])
     assert req.status == RequestStatus.DONE
     assert req.finished_reason == FinishReason.EOS
 
@@ -607,17 +650,17 @@ def test_full_cycle_multiple_requests() -> None:
     r0.enqueued_ns = 0
     r1.enqueued_ns = 0
 
-    executor.batched_prefill([r0, r1])
+    apply_batched_prefill(executor, [r0, r1])
     assert r0.status == RequestStatus.DECODING
     assert r1.status == RequestStatus.DECODING
 
-    executor.batched_decode([r0, r1])
+    apply_batched_decode(executor, [r0, r1])
     assert r0.status == RequestStatus.DECODING
     assert r1.status == RequestStatus.DECODING
     assert r0.output_tokens == ["a"]
     assert r1.output_tokens == ["b"]
 
-    executor.batched_decode([r0, r1])
+    apply_batched_decode(executor, [r0, r1])
     assert r0.status == RequestStatus.DONE
     assert r1.status == RequestStatus.DONE
 
