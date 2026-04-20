@@ -70,7 +70,6 @@ def test_first_token_emits_token_event_and_updates_decode_state() -> None:
         DecodeResult(
             token_id=7,
             token="a",
-            is_last=False,
             finish_reason=None,
             all_logits=logits,
             past_key_values=cache,
@@ -97,7 +96,7 @@ def test_second_token_is_not_first() -> None:
 
     RequestEventEmitter().on_token(
         req,
-        DecodeResult(token_id=8, token="b", is_last=False, finish_reason=None),
+        DecodeResult(token_id=8, token="b", finish_reason=None),
     )
 
     event = drain_events(req)[0]
@@ -116,9 +115,8 @@ def test_eos_emits_final_empty_token_and_done_event() -> None:
     RequestEventEmitter().on_token(
         req,
         DecodeResult(
-            token_id=None,
+            token_id=2,
             token="",
-            is_last=True,
             finish_reason=FinishReason.EOS,
         ),
     )
@@ -143,9 +141,8 @@ def test_max_length_emits_final_token_and_done_event() -> None:
     RequestEventEmitter().on_token(
         req,
         DecodeResult(
-            token_id=None,
+            token_id=2,
             token="a",
-            is_last=True,
             finish_reason=FinishReason.MAX_LENGTH,
         ),
     )
@@ -182,9 +179,8 @@ def test_finish_requires_start_ns() -> None:
         RequestEventEmitter().on_token(
             req,
             DecodeResult(
-                token_id=None,
+                token_id=2,
                 token="",
-                is_last=True,
                 finish_reason=FinishReason.EOS,
             ),
         )
@@ -200,9 +196,8 @@ def test_finish_requires_enqueued_ns() -> None:
         RequestEventEmitter().on_token(
             req,
             DecodeResult(
-                token_id=None,
+                token_id=2,
                 token="",
-                is_last=True,
                 finish_reason=FinishReason.EOS,
             ),
         )
@@ -216,9 +211,8 @@ def test_finish_requires_prompt_tokens() -> None:
         RequestEventEmitter().on_token(
             req,
             DecodeResult(
-                token_id=None,
+                token_id=2,
                 token="",
-                is_last=True,
                 finish_reason=FinishReason.EOS,
             ),
         )

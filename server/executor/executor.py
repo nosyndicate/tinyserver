@@ -34,9 +34,8 @@ def _sample(
 
     if next_token_id == runner.eos_token_id:
         return DecodeResult(
-            token_id=None,
+            token_id=next_token_id,
             token="",
-            is_last=True,
             finish_reason=FinishReason.EOS,
         )
 
@@ -47,9 +46,8 @@ def _sample(
     )
 
     return DecodeResult(
-        token_id=None if is_last else next_token_id,
+        token_id=next_token_id,
         token=next_token,
-        is_last=is_last,
         finish_reason=FinishReason.MAX_LENGTH if is_last else None,
     )
 
@@ -84,7 +82,7 @@ class Executor(BaseExecutor):
                 raise ValueError("No logits available for decoding step")
 
             result = _sample(self._runner, request_state)
-            if result.token_id is None:
+            if result.is_finished:
                 return result
 
             next_input_id = torch.tensor(
@@ -98,7 +96,6 @@ class Executor(BaseExecutor):
             return DecodeResult(
                 token_id=result.token_id,
                 token=result.token,
-                is_last=result.is_last,
                 finish_reason=result.finish_reason,
                 all_logits=output.logits,
                 past_key_values=output.past_key_values,
@@ -155,7 +152,7 @@ class BatchExecutor(BaseBatchExecutor):
                     raise ValueError("No past_key_values available for decoding step")
 
                 result = _sample(self._runner, request_state)
-                if result.token_id is None:
+                if result.is_finished:
                     results[i] = result
                 else:
                     unfinished_request_states.append(
@@ -194,7 +191,6 @@ class BatchExecutor(BaseBatchExecutor):
                 results[index] = DecodeResult(
                     token_id=result.token_id,
                     token=result.token,
-                    is_last=result.is_last,
                     finish_reason=result.finish_reason,
                     all_logits=decode_output.logits,
                     past_key_values=decode_output.past_key_values,

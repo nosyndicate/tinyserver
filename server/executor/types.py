@@ -82,12 +82,15 @@ class PrefillResult:
 
 @dataclass(frozen=True)
 class DecodeResult:
-    token_id: int | None
+    token_id: int
     token: str
-    is_last: bool
     finish_reason: FinishReason | None
     all_logits: Tensor | None = None
     past_key_values: DynamicCache | None = None
+
+    @property
+    def is_finished(self) -> bool:
+        return self.finish_reason is not None
 
 
 @dataclass(frozen=True)

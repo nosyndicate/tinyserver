@@ -97,7 +97,7 @@ def test_decode_returns_decode_result_with_updated_model_state() -> None:
     assert isinstance(result, DecodeResult)
     assert result.token_id == 42
     assert result.token == "a"
-    assert result.is_last is False
+    assert result.is_finished is False
     assert result.all_logits is runner._decode_output.logits
     assert result.past_key_values is runner._decode_output.past_key_values
     assert req.output_queue.empty()

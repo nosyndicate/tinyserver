@@ -51,12 +51,12 @@ class RequestEventEmitter:
             TokenEvent(
                 token=result.token,
                 is_first=is_first,
-                is_last=result.is_last,
+                is_last=result.is_finished,
                 index=request_state.num_output_tokens - 1,
             )
         )
 
-        if result.finish_reason is not None:
+        if result.is_finished:
             request_state.finished_reason = result.finish_reason
             self._finish(request_state)
             return

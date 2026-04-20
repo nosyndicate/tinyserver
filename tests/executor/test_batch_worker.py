@@ -61,9 +61,8 @@ def _prefill_result() -> PrefillResult:
 
 def _decode_result(done: bool) -> DecodeResult:
     return DecodeResult(
-        token_id=None if done else 0,
+        token_id=0,
         token="",
-        is_last=done,
         finish_reason=FinishReason.MAX_LENGTH if done else None,
         all_logits=None if done else torch.empty(1, 1, 1),
         past_key_values=None if done else DynamicCache(),
