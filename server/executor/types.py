@@ -73,6 +73,32 @@ Event = TokenEvent | DoneEvent | ErrorEvent
 
 
 @dataclass(frozen=True)
+class PrefillResult:
+    all_logits: Tensor
+    past_key_values: DynamicCache
+    num_prompt_tokens: int
+    start_ns: int
+
+
+@dataclass(frozen=True)
+class DecodeResult:
+    token_id: int
+    token: str
+    finish_reason: FinishReason | None
+    all_logits: Tensor | None = None
+    past_key_values: DynamicCache | None = None
+
+    @property
+    def is_finished(self) -> bool:
+        return self.finish_reason is not None
+
+
+@dataclass(frozen=True)
+class RequestFailure:
+    error: str
+
+
+@dataclass(frozen=True)
 class ExecutorConfig:
     """
     The configuration for the executor, controls the backpressure.
@@ -133,7 +159,7 @@ class GenerationRequestState:
     # Decoding state
     first_token_ns: int | None = None
     start_ns: int | None = None
-    # Set in routes.py before submit(), read in executor._finish().
+    # Set in routes.py before submit(), read by RequestEventEmitter when finishing.
     # Queue.put/get provides happens-before guarantee, no extra sync needed.
     enqueued_ns: int | None = None
     output_tokens: list[str] = field(default_factory=list)
@@ -152,15 +178,23 @@ class GenerationRequestState:
 
 
 class BaseExecutor(Protocol):
-    def prefill(self, request_state: GenerationRequestState) -> None: ...
+    def prefill(
+        self, request_state: GenerationRequestState
+    ) -> PrefillResult | RequestFailure: ...
 
-    def decode(self, request_state: GenerationRequestState) -> None: ...
+    def decode(
+        self, request_state: GenerationRequestState
+    ) -> DecodeResult | RequestFailure: ...
 
 
 class BaseBatchExecutor(Protocol):
-    def batched_prefill(self, request_states: list[GenerationRequestState]) -> None: ...
+    def batched_prefill(
+        self, request_states: list[GenerationRequestState]
+    ) -> list[PrefillResult | RequestFailure]: ...
 
-    def batched_decode(self, request_states: list[GenerationRequestState]) -> None: ...
+    def batched_decode(
+        self, request_states: list[GenerationRequestState]
+    ) -> list[DecodeResult | RequestFailure]: ...
 
 
 @dataclass

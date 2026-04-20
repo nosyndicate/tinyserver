@@ -3,6 +3,12 @@ import threading
 from abc import ABC, abstractmethod
 from queue import Empty, Queue
 
+from server.executor.engine import (
+    BatchInferenceEngine,
+    EngineCallbacks,
+    EngineControl,
+    SimpleInferenceEngine,
+)
 from server.executor.types import (
     BaseBatchExecutor,
     BaseExecutor,
@@ -142,97 +148,27 @@ class SimpleWorker(Worker):
             raise ValueError("max_active_requests must be positive")
 
         super().__init__(config.max_queue_size)
-        self._executor = executor
-        self._config = config
-        self._active: list[GenerationRequestState] = []
+        self._engine = SimpleInferenceEngine(executor, config)
+
+    @property
+    def _active(self) -> list[GenerationRequestState]:
+        return self._engine._active
 
     def _cancel_inflight(self, message: str) -> None:
-        for pending in self._active:
-            try:
-                self._cancel_request(pending, message)
-            except Exception:
-                logger.exception(
-                    "Failed to emit error event for active request %s",
-                    pending.request_id,
-                )
-        self._active.clear()
+        self._engine.cancel_inflight(message, self._cancel_request)
 
     def _run_loop(self) -> None:
-        try:
-            while not self._shutdown_event.is_set():
-                # Fetch all the new requests from the inbound queue and add them to the active list
-                new_requests: list[GenerationRequestState] = []
-                while (
-                    len(self._active) + len(new_requests)
-                    < self._config.max_active_requests
-                ):
-                    try:
-                        request_state = self._inbound.get_nowait()
-                        new_requests.append(request_state)
-                    except Empty:
-                        break
-
-                # Process the new requests: run prefill and move to active if successful
-                for i, req in enumerate(new_requests):
-                    # If the worker is shutting down, reject the new request with an error event
-                    if self._shutdown_event.is_set():
-                        # Cancel this request and all remaining new + active requests
-                        for pending in new_requests[i:] + self._active:
-                            try:
-                                self._cancel_request(
-                                    pending,
-                                    "Worker is shutting down, request cancelled",
-                                )
-                            except Exception:
-                                logger.exception(
-                                    "Failed to clean up request %s during prefill",
-                                    pending.request_id,
-                                )
-                        self._active.clear()
-                        return
-
-                    try:
-                        self._executor.prefill(req)
-                    except Exception as e:
-                        self._handle_fatal_error(e, extra_requests=new_requests[i:])
-                        return
-                    if req.status == RequestStatus.DECODING:
-                        self._active.append(req)
-
-                # Decode one step for each active request
-                for req in self._active:
-                    if self._shutdown_event.is_set():
-                        # Cancel all active requests before exiting
-                        for pending in self._active:
-                            try:
-                                self._cancel_request(
-                                    pending,
-                                    "Worker is shutting down, request cancelled",
-                                )
-                            except Exception:
-                                logger.exception(
-                                    "Failed to clean up request %s during decoding",
-                                    pending.request_id,
-                                )
-                        self._active.clear()
-                        return
-
-                    if req.status == RequestStatus.DECODING:
-                        self._executor.decode(req)
-
-                # After the decoding, some requests may have finished or failed, remove them from the active list
-                self._active = [
-                    req for req in self._active if req.status == RequestStatus.DECODING
-                ]
-
-                # If there are still active, we directly continue to the next loop iteration without
-                # sleeping, to maximize throughput and minimize latency. Otherwise, we sleep for a
-                # short while to avoid busy loop. Use the sleep on _shutdown_event so when shutdown
-                # signal is set, it can break the sleep immediately and exit the loop.
-                if not self._active:
-                    self._shutdown_event.wait(timeout=0.01)
-        except Exception as e:
-            self._handle_fatal_error(e)
+        self._engine.run(
+            inbound=self._inbound,
+            control=EngineControl(
+                should_stop=self._shutdown_event.is_set,
+                wait_idle=self._shutdown_event.wait,
+            ),
+            callbacks=EngineCallbacks(
+                cancel_request=self._cancel_request,
+                handle_fatal_error=self._handle_fatal_error,
+            ),
+        )
 
 
 class BatchWorker(Worker):
@@ -265,87 +201,40 @@ class BatchWorker(Worker):
     ) -> None:
         self._check_config(config)
         super().__init__(config.max_queue_size)
-        self._executor = executor
-        self._config = config
-        self._waiting: list[GenerationRequestState] = []
-        self._active: list[GenerationRequestState] = []
+        self._engine = BatchInferenceEngine(executor, config)
+
+    @property
+    def _waiting(self) -> list[GenerationRequestState]:
+        return self._engine._waiting
+
+    @property
+    def _active(self) -> list[GenerationRequestState]:
+        return self._engine._active
 
     def _cancel_inflight(self, message: str) -> None:
-        for pending in self._waiting + self._active:
-            try:
-                self._cancel_request(pending, message)
-            except Exception:
-                logger.exception(
-                    "Failed to emit error event for request %s",
-                    pending.request_id,
-                )
-        self._waiting.clear()
-        self._active.clear()
+        self._engine.cancel_inflight(message, self._cancel_request)
 
     def _drain_inbound(self) -> None:
         """Move all requests from the inbound queue to the waiting list, up to max_active_requests."""
-        max_num_reqs = self._config.max_active_requests
-        while len(self._waiting) + len(self._active) < max_num_reqs:
-            try:
-                req = self._inbound.get_nowait()
-                self._waiting.append(req)
-            except Empty:
-                break
+        self._engine.drain_inbound(self._inbound)
 
     def _select_prefill_batch(self) -> list[GenerationRequestState]:
         """Select a batch of requests from the waiting list for prefill, up to max_prefill_batch_size."""
-        batch_size = min(
-            self._config.max_prefill_batch_size,
-            self._config.max_active_requests - len(self._active),
-            len(self._waiting),
-        )
-        batch = self._waiting[:batch_size]
-        self._waiting = self._waiting[batch_size:]
-        return batch
+        return self._engine.select_prefill_batch()
 
     def _select_decode_batch(self) -> list[GenerationRequestState]:
         """Select a batch of requests from the active list for decode, up to max_decode_batch_size."""
-        # This is just being defensive; in the current implementation all active requests should be in DECODING status
-        decoding = [req for req in self._active if req.status == RequestStatus.DECODING]
-        return decoding[: self._config.max_decode_batch_size]
+        return self._engine.select_decode_batch()
 
     def _run_loop(self) -> None:
-        prefill_batch: list[GenerationRequestState] = []
-        try:
-            while not self._shutdown_event.is_set():
-                # Move new requests from the inbound queue to the waiting list
-                self._drain_inbound()
-
-                if not self._shutdown_event.is_set():
-                    prefill_batch = self._select_prefill_batch()
-                    if prefill_batch:
-                        self._executor.batched_prefill(prefill_batch)
-                        self._active.extend(
-                            req
-                            for req in prefill_batch
-                            if req.status == RequestStatus.DECODING
-                        )
-                        prefill_batch = []
-
-                if not self._shutdown_event.is_set():
-                    # If there are active requests, select a batch and decode one step
-                    decoding_batch = self._select_decode_batch()
-                    if decoding_batch:
-                        self._executor.batched_decode(decoding_batch)
-
-                # After the decoding, some requests may have finished or failed, remove them from the active list
-                self._active = [
-                    req for req in self._active if req.status == RequestStatus.DECODING
-                ]
-
-                # If there are still waiting or active requests, we directly continue to the next loop iteration without
-                # sleeping, to maximize throughput and minimize latency. Otherwise, we sleep for a
-                # short while to avoid busy loop. Use the sleep on _shutdown_event so when shutdown
-                # signal is set, it can break the sleep immediately and exit the loop.
-                if not self._waiting and not self._active:
-                    self._shutdown_event.wait(timeout=0.01)
-
-            # Graceful shutdown: cancel any remaining waiting and active requests
-            self._cancel_inflight("Worker is shutting down, request cancelled")
-        except Exception as e:
-            self._handle_fatal_error(e, extra_requests=prefill_batch)
+        self._engine.run(
+            inbound=self._inbound,
+            control=EngineControl(
+                should_stop=self._shutdown_event.is_set,
+                wait_idle=self._shutdown_event.wait,
+            ),
+            callbacks=EngineCallbacks(
+                cancel_request=self._cancel_request,
+                handle_fatal_error=self._handle_fatal_error,
+            ),
+        )

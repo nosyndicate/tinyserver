@@ -21,12 +21,18 @@ import time
 from typing import Any
 
 import pytest
+import torch
+from transformers import DynamicCache
 
 from server.executor.types import (
     BaseBatchExecutor,
     BatchExecutorConfig,
+    DecodeResult,
     ErrorEvent,
+    FinishReason,
     GenerationRequestState,
+    PrefillResult,
+    RequestFailure,
     RequestStatus,
 )
 from server.executor.worker import BatchWorker
@@ -42,6 +48,37 @@ from .worker_helpers import (
 )
 
 # ─── Test infrastructure ──────────────────────────────────────────────────────
+
+
+def _prefill_result() -> PrefillResult:
+    return PrefillResult(
+        all_logits=torch.empty(1, 1, 1),
+        past_key_values=DynamicCache(),
+        num_prompt_tokens=1,
+        start_ns=time.monotonic_ns(),
+    )
+
+
+def _decode_result(done: bool) -> DecodeResult:
+    return DecodeResult(
+        token_id=0,
+        token="",
+        finish_reason=FinishReason.MAX_LENGTH if done else None,
+        all_logits=None if done else torch.empty(1, 1, 1),
+        past_key_values=None if done else DynamicCache(),
+    )
+
+
+def _result_from_status(
+    req: GenerationRequestState,
+) -> PrefillResult | DecodeResult | RequestFailure | None:
+    if req.status == RequestStatus.FAILED:
+        return RequestFailure(error=req.error or "request failed")
+    if req.status == RequestStatus.DECODING:
+        return _prefill_result()
+    if req.status == RequestStatus.DONE:
+        return _decode_result(done=True)
+    return None
 
 
 class FakeBatchExecutor(BaseBatchExecutor):
@@ -92,23 +129,36 @@ class FakeBatchExecutor(BaseBatchExecutor):
         self.prefill_call_sizes: list[int] = []
         self.decode_call_sizes: list[int] = []
 
-    def batched_prefill(self, request_states: list[GenerationRequestState]) -> None:
+    def batched_prefill(
+        self, request_states: list[GenerationRequestState]
+    ) -> list[PrefillResult | RequestFailure | None]:
         self.prefill_call_sizes.append(len(request_states))
 
         if self._prefill_hook is not None:
             self._prefill_hook.set()
             self._prefill_hook = None  # fire once
 
+        results: list[PrefillResult | RequestFailure | None] = []
         for req in request_states:
             fx = self._prefill_fx.get(req.request_id)
             if isinstance(fx, BaseException):
                 raise fx
             elif callable(fx):
-                fx(req)
+                result = fx(req)
+                if isinstance(result, PrefillResult | RequestFailure):
+                    results.append(result)
+                    continue
+                result = _result_from_status(req)
+                results.append(
+                    _prefill_result() if isinstance(result, DecodeResult) else result
+                )
             else:
-                req.status = RequestStatus.DECODING
+                results.append(_prefill_result())
+        return results
 
-    def batched_decode(self, request_states: list[GenerationRequestState]) -> None:
+    def batched_decode(
+        self, request_states: list[GenerationRequestState]
+    ) -> list[DecodeResult | RequestFailure | None]:
         self.decode_call_sizes.append(len(request_states))
 
         if self._decode_hook is not None:
@@ -118,18 +168,24 @@ class FakeBatchExecutor(BaseBatchExecutor):
         if self._decode_gate is not None:
             self._decode_gate.wait(timeout=5.0)
 
+        results: list[DecodeResult | RequestFailure | None] = []
         for req in request_states:
             fx = self._decode_fx.get(req.request_id)
             if isinstance(fx, BaseException):
                 raise fx
             elif callable(fx):
-                fx(req)
+                result = fx(req)
+                if isinstance(result, DecodeResult | RequestFailure):
+                    results.append(result)
+                    continue
+                result = _result_from_status(req)
+                results.append(None if isinstance(result, PrefillResult) else result)
             else:
                 n = self._decode_counts.get(req.request_id, 0) + 1
                 self._decode_counts[req.request_id] = n
                 steps = self._decode_steps.get(req.request_id, 1)
-                if n >= steps:
-                    req.status = RequestStatus.DONE
+                results.append(_decode_result(done=n >= steps))
+        return results
 
 
 def make_batch_worker(
@@ -675,14 +731,13 @@ def test_shutdown_after_prefill_batch_cancels_remaining() -> None:
     test_can_proceed.set()
     assert worker._thread is not None
     worker._thread.join(timeout=2.0)
+    worker.stop()
 
     for req in [r0, r1]:
         events = drain_events(req)
         assert len(events) == 1
         assert isinstance(events[0], ErrorEvent)
         assert req.status == RequestStatus.FAILED
-
-    worker.stop()
 
 
 def test_shutdown_set_during_prefill_cancels_batch() -> None:
@@ -705,14 +760,13 @@ def test_shutdown_set_during_prefill_cancels_batch() -> None:
     worker.start()
     assert worker._thread is not None
     worker._thread.join(timeout=2.0)
+    worker.stop()
 
     for req in [r0, r1]:
         events = drain_events(req)
         assert len(events) == 1
         assert isinstance(events[0], ErrorEvent)
         assert req.status == RequestStatus.FAILED
-
-    worker.stop()
 
 
 def test_shutdown_during_idle_sleep_pending_request_drained() -> None:
@@ -773,7 +827,7 @@ def test_decode_completes_before_shutdown_check_request_is_done() -> None:
         worker.stop()
 
     assert r0.status == RequestStatus.DONE
-    assert drain_events(r0) == []
+    assert not any(isinstance(event, ErrorEvent) for event in drain_events(r0))
 
 
 def test_shutdown_between_decode_phases_cancels_all() -> None:
@@ -805,14 +859,13 @@ def test_shutdown_between_decode_phases_cancels_all() -> None:
     worker.start()
     assert worker._thread is not None
     worker._thread.join(timeout=2.0)
+    worker.stop()
 
     for req in [r0, r1]:
         events = drain_events(req)
         assert len(events) == 1, f"{req.request_id} should have one ErrorEvent"
         assert isinstance(events[0], ErrorEvent)
         assert req.status == RequestStatus.FAILED
-
-    worker.stop()
 
 
 def test_stop_cancels_active_request_blocked_in_decode() -> None:

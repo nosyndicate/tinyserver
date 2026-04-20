@@ -21,12 +21,18 @@ import time
 from typing import Any
 
 import pytest
+import torch
+from transformers import DynamicCache
 
 from server.executor.types import (
     BaseExecutor,
+    DecodeResult,
     ErrorEvent,
     ExecutorConfig,
+    FinishReason,
     GenerationRequestState,
+    PrefillResult,
+    RequestFailure,
     RequestStatus,
 )
 from server.executor.worker import SimpleWorker
@@ -42,6 +48,37 @@ from .worker_helpers import (
 )
 
 # ─── Test infrastructure ──────────────────────────────────────────────────────
+
+
+def _prefill_result() -> PrefillResult:
+    return PrefillResult(
+        all_logits=torch.empty(1, 1, 1),
+        past_key_values=DynamicCache(),
+        num_prompt_tokens=1,
+        start_ns=time.monotonic_ns(),
+    )
+
+
+def _decode_result(done: bool) -> DecodeResult:
+    return DecodeResult(
+        token_id=0,
+        token="",
+        finish_reason=FinishReason.MAX_LENGTH if done else None,
+        all_logits=None if done else torch.empty(1, 1, 1),
+        past_key_values=None if done else DynamicCache(),
+    )
+
+
+def _result_from_status(
+    req: GenerationRequestState,
+) -> PrefillResult | DecodeResult | RequestFailure | None:
+    if req.status == RequestStatus.FAILED:
+        return RequestFailure(error=req.error or "request failed")
+    if req.status == RequestStatus.DECODING:
+        return _prefill_result()
+    if req.status == RequestStatus.DONE:
+        return _decode_result(done=True)
+    return None
 
 
 class FakeExecutor(BaseExecutor):
@@ -83,7 +120,9 @@ class FakeExecutor(BaseExecutor):
         self._decode_gate = decode_gate
         self._decode_counts: dict[str, int] = {}
 
-    def prefill(self, request_state: GenerationRequestState) -> None:
+    def prefill(
+        self, request_state: GenerationRequestState
+    ) -> PrefillResult | RequestFailure | None:
         if self._prefill_hook is not None:
             self._prefill_hook.set()
             self._prefill_hook = None  # fire once
@@ -92,11 +131,19 @@ class FakeExecutor(BaseExecutor):
         if isinstance(fx, BaseException):
             raise fx
         elif callable(fx):
-            fx(request_state)
+            result = fx(request_state)
+            if isinstance(result, PrefillResult | RequestFailure):
+                return result
+            result = _result_from_status(request_state)
+            if isinstance(result, DecodeResult):
+                return _prefill_result()
+            return result
         else:
-            request_state.status = RequestStatus.DECODING
+            return _prefill_result()
 
-    def decode(self, request_state: GenerationRequestState) -> None:
+    def decode(
+        self, request_state: GenerationRequestState
+    ) -> DecodeResult | RequestFailure | None:
         if self._decode_hook is not None:
             self._decode_hook.set()
             self._decode_hook = None  # fire once
@@ -108,13 +155,18 @@ class FakeExecutor(BaseExecutor):
         if isinstance(fx, BaseException):
             raise fx
         elif callable(fx):
-            fx(request_state)
+            result = fx(request_state)
+            if isinstance(result, DecodeResult | RequestFailure):
+                return result
+            result = _result_from_status(request_state)
+            if isinstance(result, PrefillResult):
+                return None
+            return result
         else:
             n = self._decode_counts.get(request_state.request_id, 0) + 1
             self._decode_counts[request_state.request_id] = n
             steps = self._decode_steps.get(request_state.request_id, 1)
-            if n >= steps:
-                request_state.status = RequestStatus.DONE
+            return _decode_result(done=n >= steps)
 
 
 def make_worker(
@@ -584,7 +636,7 @@ def test_decode_completes_before_shutdown_check_request_is_done() -> None:
         worker.stop()
 
     assert r0.status == RequestStatus.DONE
-    assert drain_events(r0) == []
+    assert not any(isinstance(event, ErrorEvent) for event in drain_events(r0))
 
 
 def test_shutdown_between_decode_calls_cancels_all_active() -> None:

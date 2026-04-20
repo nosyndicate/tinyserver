@@ -59,23 +59,21 @@ def wait_for_status(
 
 
 def _make_fail_prefill() -> Callable[[GenerationRequestState], None]:
-    """Returns a prefill side-effect that sets FAILED and emits an ErrorEvent."""
+    """Returns a prefill side-effect that marks the request as failed."""
 
     def fail_prefill(req: GenerationRequestState) -> None:
         req.status = RequestStatus.FAILED
         req.error = "model error during prefill"
-        req.output_queue.put(ErrorEvent(request_id=req.request_id, error=req.error))
 
     return fail_prefill
 
 
 def _make_fail_decode() -> Callable[[GenerationRequestState], None]:
-    """Returns a decode side-effect that sets FAILED and emits an ErrorEvent."""
+    """Returns a decode side-effect that marks the request as failed."""
 
     def fail_decode(req: GenerationRequestState) -> None:
         req.status = RequestStatus.FAILED
         req.error = "model error during decode"
-        req.output_queue.put(ErrorEvent(request_id=req.request_id, error=req.error))
 
     return fail_decode
 
