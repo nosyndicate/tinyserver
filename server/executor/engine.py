@@ -205,19 +205,16 @@ class BatchInferenceEngine:
                     prefill_batch = self.select_prefill_batch()
                     if prefill_batch:
                         results = self._executor.batched_prefill(prefill_batch)
-                        if results is not None:
-                            if len(results) != len(prefill_batch):
-                                raise ValueError(
-                                    f"Expected {len(prefill_batch)} prefill results, but got {len(results)}"
-                                )
-                            for req, result in zip(prefill_batch, results):
-                                if isinstance(result, RequestFailure):
-                                    self._emitter.on_failed(req, result.error)
-                                elif isinstance(result, PrefillResult):
-                                    self._emitter.on_prefill_started(
-                                        req, result.start_ns
-                                    )
-                                    self._emitter.on_prefill_succeeded(req, result)
+                        if len(results) != len(prefill_batch):
+                            raise ValueError(
+                                f"Expected {len(prefill_batch)} prefill results, but got {len(results)}"
+                            )
+                        for req, result in zip(prefill_batch, results):
+                            if isinstance(result, RequestFailure):
+                                self._emitter.on_failed(req, result.error)
+                            elif isinstance(result, PrefillResult):
+                                self._emitter.on_prefill_started(req, result.start_ns)
+                                self._emitter.on_prefill_succeeded(req, result)
                         self._active.extend(
                             req
                             for req in prefill_batch
@@ -229,16 +226,15 @@ class BatchInferenceEngine:
                     decoding_batch = self.select_decode_batch()
                     if decoding_batch:
                         results = self._executor.batched_decode(decoding_batch)
-                        if results is not None:
-                            if len(results) != len(decoding_batch):
-                                raise ValueError(
-                                    f"Expected {len(decoding_batch)} decode results, but got {len(results)}"
-                                )
-                            for req, result in zip(decoding_batch, results):
-                                if isinstance(result, RequestFailure):
-                                    self._emitter.on_failed(req, result.error)
-                                elif isinstance(result, DecodeResult):
-                                    self._emitter.on_token(req, result)
+                        if len(results) != len(decoding_batch):
+                            raise ValueError(
+                                f"Expected {len(decoding_batch)} decode results, but got {len(results)}"
+                            )
+                        for req, result in zip(decoding_batch, results):
+                            if isinstance(result, RequestFailure):
+                                self._emitter.on_failed(req, result.error)
+                            elif isinstance(result, DecodeResult):
+                                self._emitter.on_token(req, result)
 
                 self._active = [
                     req for req in self._active if req.status == RequestStatus.DECODING
@@ -246,10 +242,5 @@ class BatchInferenceEngine:
 
                 if not self._waiting and not self._active:
                     control.wait_idle(0.01)
-
-            self.cancel_inflight(
-                "Worker is shutting down, request cancelled",
-                callbacks.cancel_request,
-            )
         except Exception as e:
             callbacks.handle_fatal_error(e, prefill_batch)
