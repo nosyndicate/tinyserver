@@ -15,13 +15,14 @@ from server.executor.types import (
     DecodeResult,
     ErrorEvent,
     ExecutorConfig,
-    FinishReason,
     GenerationRequestState,
     PrefillResult,
     RequestFailure,
     RequestStatus,
 )
 from server.model.sampling import SamplingParams
+
+from .worker_helpers import decode_result, prefill_result
 
 
 def make_req(request_id: str) -> GenerationRequestState:
@@ -41,25 +42,6 @@ def make_decoding_req(request_id: str) -> GenerationRequestState:
     req.all_logits = torch.empty(1, 1, 1)
     req.past_key_values = DynamicCache()
     return req
-
-
-def prefill_result() -> PrefillResult:
-    return PrefillResult(
-        all_logits=torch.empty(1, 1, 1),
-        past_key_values=DynamicCache(),
-        num_prompt_tokens=1,
-        start_ns=0,
-    )
-
-
-def decode_result(done: bool = True, token: str = "x") -> DecodeResult:
-    return DecodeResult(
-        token_id=1,
-        token=token,
-        finish_reason=FinishReason.MAX_LENGTH if done else None,
-        all_logits=None if done else torch.empty(1, 1, 1),
-        past_key_values=None if done else DynamicCache(),
-    )
 
 
 class LoopControl:

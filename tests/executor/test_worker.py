@@ -3,14 +3,11 @@ import threading
 import time
 
 import pytest
-import torch
-from transformers import DynamicCache
 
 from server.executor.types import (
     DecodeResult,
     ErrorEvent,
     ExecutorConfig,
-    FinishReason,
     GenerationRequestState,
     PrefillResult,
     RequestFailure,
@@ -21,29 +18,12 @@ from server.executor.worker import SimpleWorker
 from .worker_helpers import (
     _assert_error_event,
     _wait_for_worker_to_die,
+    decode_result,
     drain_events,
     make_req,
+    prefill_result,
     wait_for_status,
 )
-
-
-def prefill_result() -> PrefillResult:
-    return PrefillResult(
-        all_logits=torch.empty(1, 1, 1),
-        past_key_values=DynamicCache(),
-        num_prompt_tokens=1,
-        start_ns=time.monotonic_ns(),
-    )
-
-
-def decode_result(done: bool = True) -> DecodeResult:
-    return DecodeResult(
-        token_id=1,
-        token="x",
-        finish_reason=FinishReason.MAX_LENGTH if done else None,
-        all_logits=None if done else torch.empty(1, 1, 1),
-        past_key_values=None if done else DynamicCache(),
-    )
 
 
 class FakeExecutor:
@@ -60,7 +40,6 @@ class FakeExecutor:
         self.decode_results = {k: list(v) for k, v in (decode_results or {}).items()}
         self.decode_gate = decode_gate
         self.decode_entered = decode_entered
-        self.decode_counts: dict[str, int] = {}
 
     def prefill(
         self, request_state: GenerationRequestState
@@ -85,8 +64,6 @@ class FakeExecutor:
                 raise result
             return result
 
-        count = self.decode_counts.get(request_state.request_id, 0) + 1
-        self.decode_counts[request_state.request_id] = count
         return decode_result(done=True)
 
 

@@ -1,13 +1,18 @@
-"""Shared test helpers for SimpleWorker and BatchWorker tests."""
+"""Shared helpers for executor tests."""
 
 import itertools
 import queue
 import time
-from typing import Callable
+
+import torch
+from transformers import DynamicCache
 
 from server.executor.types import (
+    DecodeResult,
     ErrorEvent,
+    FinishReason,
     GenerationRequestState,
+    PrefillResult,
     RequestStatus,
 )
 from server.executor.worker import BatchWorker, SimpleWorker
@@ -58,24 +63,23 @@ def wait_for_status(
     return False
 
 
-def _make_fail_prefill() -> Callable[[GenerationRequestState], None]:
-    """Returns a prefill side-effect that marks the request as failed."""
+def prefill_result() -> PrefillResult:
+    return PrefillResult(
+        all_logits=torch.empty(1, 1, 1),
+        past_key_values=DynamicCache(),
+        num_prompt_tokens=1,
+        start_ns=time.monotonic_ns(),
+    )
 
-    def fail_prefill(req: GenerationRequestState) -> None:
-        req.status = RequestStatus.FAILED
-        req.error = "model error during prefill"
 
-    return fail_prefill
-
-
-def _make_fail_decode() -> Callable[[GenerationRequestState], None]:
-    """Returns a decode side-effect that marks the request as failed."""
-
-    def fail_decode(req: GenerationRequestState) -> None:
-        req.status = RequestStatus.FAILED
-        req.error = "model error during decode"
-
-    return fail_decode
+def decode_result(done: bool = True, token: str = "x") -> DecodeResult:
+    return DecodeResult(
+        token_id=1,
+        token=token,
+        finish_reason=FinishReason.MAX_LENGTH if done else None,
+        all_logits=None if done else torch.empty(1, 1, 1),
+        past_key_values=None if done else DynamicCache(),
+    )
 
 
 def _wait_for_worker_to_die(
