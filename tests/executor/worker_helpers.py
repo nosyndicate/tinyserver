@@ -16,6 +16,7 @@ from server.executor.types import (
     RequestStatus,
 )
 from server.executor.worker import BatchWorker, SimpleWorker
+from server.metrics.timers import NS_PER_S, now_ns
 from server.model.sampling import SamplingParams
 
 _counter = itertools.count()
@@ -67,8 +68,8 @@ def drain_events(req: GenerationRequestState, timeout: float = 0.0) -> list:
 def wait_for_status(
     req: GenerationRequestState, status: RequestStatus, timeout: float = 2.0
 ) -> bool:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    deadline = now_ns() + int(timeout * NS_PER_S)
+    while now_ns() < deadline:
         if req.status == status:
             return True
         time.sleep(0.001)

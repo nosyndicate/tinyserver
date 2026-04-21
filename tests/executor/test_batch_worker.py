@@ -16,6 +16,7 @@ from server.executor.types import (
     TokenEvent,
 )
 from server.executor.worker import BatchWorker
+from server.metrics.timers import NS_PER_S, now_ns
 
 from .worker_helpers import (
     _assert_error_event,
@@ -366,8 +367,8 @@ def test_active_list_pruned_after_iteration() -> None:
         assert wait_for_status(r0, RequestStatus.DONE)
         assert wait_for_status(r1, RequestStatus.DONE)
 
-        deadline = time.monotonic() + 2.0
-        while worker._engine._active and time.monotonic() < deadline:
+        deadline = now_ns() + 2 * NS_PER_S
+        while worker._engine._active and now_ns() < deadline:
             time.sleep(0.001)
         assert worker._engine._active == []
     finally:
@@ -445,8 +446,8 @@ def test_stop_cancels_active_request_blocked_in_decode() -> None:
         target=lambda: (worker.stop(), stop_done.set()), daemon=True
     ).start()
 
-    deadline = time.monotonic() + 2.0
-    while not worker._shutdown_event.is_set() and time.monotonic() < deadline:
+    deadline = now_ns() + 2 * NS_PER_S
+    while not worker._shutdown_event.is_set() and now_ns() < deadline:
         time.sleep(0.001)
     assert worker._shutdown_event.is_set()
     decode_gate.set()
