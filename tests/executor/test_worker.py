@@ -146,7 +146,7 @@ def test_submit_without_start_enqueues_and_stop_drains() -> None:
 
     assert req.status == RequestStatus.FAILED
     events = drain_events(req)
-    assert any(isinstance(event, ErrorEvent) for event in events)
+    assert len(events) == 1 and isinstance(events[0], ErrorEvent)
 
 
 def test_submit_after_stop_is_rejected() -> None:

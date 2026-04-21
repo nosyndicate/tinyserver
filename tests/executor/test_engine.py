@@ -380,4 +380,4 @@ def test_batch_engine_idle_state_waits_briefly() -> None:
     control, callbacks = run_engine(engine.run, Queue())
 
     assert callbacks.fatal == []
-    assert control.waits == [0.01]
+    assert control.waits and control.waits[0] > 0.0

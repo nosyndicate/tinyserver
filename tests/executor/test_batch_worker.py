@@ -30,10 +30,12 @@ from .worker_helpers import (
 class FakeBatchExecutor(BaseBatchExecutor):
     def __init__(
         self,
-        prefill_results: dict[str, PrefillResult | RequestFailure | Exception]
-        | None = None,
-        decode_results: dict[str, list[DecodeResult | RequestFailure | Exception]]
-        | None = None,
+        prefill_results: (
+            dict[str, PrefillResult | RequestFailure | Exception] | None
+        ) = None,
+        decode_results: (
+            dict[str, list[DecodeResult | RequestFailure | Exception]] | None
+        ) = None,
         decode_gate: threading.Event | None = None,
         decode_entered: threading.Event | None = None,
     ) -> None:
@@ -41,10 +43,13 @@ class FakeBatchExecutor(BaseBatchExecutor):
         self.decode_results = {k: list(v) for k, v in (decode_results or {}).items()}
         self.decode_gate = decode_gate
         self.decode_entered = decode_entered
+        self.prefill_call_sizes: list[int] = []
+        self.decode_call_sizes: list[int] = []
 
     def batched_prefill(
         self, request_states: list[GenerationRequestState]
     ) -> list[PrefillResult | RequestFailure]:
+        self.prefill_call_sizes.append(len(request_states))
         results: list[PrefillResult | RequestFailure] = []
         for req in request_states:
             result = self.prefill_results.get(req.request_id, prefill_result())
@@ -56,6 +61,7 @@ class FakeBatchExecutor(BaseBatchExecutor):
     def batched_decode(
         self, request_states: list[GenerationRequestState]
     ) -> list[DecodeResult | RequestFailure]:
+        self.decode_call_sizes.append(len(request_states))
         if self.decode_entered is not None:
             self.decode_entered.set()
         if self.decode_gate is not None:
@@ -174,7 +180,7 @@ def test_submit_without_start_enqueues_and_stop_drains() -> None:
 
     assert req.status == RequestStatus.FAILED
     events = drain_events(req)
-    assert any(isinstance(event, ErrorEvent) for event in events)
+    assert len(events) == 1 and isinstance(events[0], ErrorEvent)
 
 
 def test_submit_after_stop_is_rejected() -> None:
@@ -263,6 +269,152 @@ def test_fatal_engine_callback_cancels_inbound_requests() -> None:
 
     _assert_error_event(r0)
     _assert_error_event(r1)
+
+
+def test_concurrent_submits_from_multiple_threads() -> None:
+    worker = make_batch_worker(
+        max_queue_size=50,
+        max_active_requests=10,
+        max_prefill_batch_size=5,
+        max_decode_batch_size=5,
+    )
+    num_threads = 5
+    reqs_per_thread = 5
+    all_reqs = [
+        [make_req(f"t{t}r{r}") for r in range(reqs_per_thread)]
+        for t in range(num_threads)
+    ]
+
+    worker.start()
+    try:
+        threads = [
+            threading.Thread(
+                target=lambda reqs=thread_reqs: [worker.submit(req) for req in reqs]
+            )
+            for thread_reqs in all_reqs
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        for thread_reqs in all_reqs:
+            for req in thread_reqs:
+                assert wait_for_status(req, RequestStatus.DONE)
+    finally:
+        worker.stop()
+
+
+def test_max_active_requests_never_exceed() -> None:
+    max_active = 3
+    decode_gate = threading.Event()
+    decode_entered = threading.Event()
+    worker = make_batch_worker(
+        FakeBatchExecutor(decode_gate=decode_gate, decode_entered=decode_entered),
+        max_queue_size=10,
+        max_active_requests=max_active,
+        max_prefill_batch_size=max_active,
+        max_decode_batch_size=max_active,
+    )
+    for i in range(6):
+        worker.submit(make_req(f"r{i}"))
+
+    worker.start()
+    try:
+        assert decode_entered.wait(timeout=2.0)
+        engine = worker._engine
+        assert len(engine._active) + len(engine._waiting) <= max_active
+    finally:
+        decode_gate.set()
+        worker.stop()
+
+
+def test_stop_after_decode_crash_is_safe() -> None:
+    worker = make_batch_worker(
+        FakeBatchExecutor(decode_results={"r0": [RuntimeError("decode crash")]}),
+        max_active_requests=1,
+        max_prefill_batch_size=1,
+        max_decode_batch_size=1,
+    )
+    req = make_req("r0")
+    worker.start()
+    worker.submit(req)
+
+    _wait_for_worker_to_die(worker)
+    worker.stop()  # must not raise
+
+    _assert_error_event(req)
+
+
+def test_active_list_pruned_after_iteration() -> None:
+    worker = make_batch_worker(
+        max_active_requests=2,
+        max_prefill_batch_size=2,
+        max_decode_batch_size=2,
+    )
+    r0, r1 = make_req("r0"), make_req("r1")
+
+    worker.start()
+    try:
+        worker.submit(r0)
+        worker.submit(r1)
+        assert wait_for_status(r0, RequestStatus.DONE)
+        assert wait_for_status(r1, RequestStatus.DONE)
+
+        deadline = time.monotonic() + 2.0
+        while worker._engine._active and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert worker._engine._active == []
+    finally:
+        worker.stop()
+
+
+def test_prefill_batch_size_capped_by_config() -> None:
+    executor = FakeBatchExecutor()
+    worker = make_batch_worker(
+        executor,
+        max_queue_size=16,
+        max_active_requests=5,
+        max_prefill_batch_size=2,
+        max_decode_batch_size=5,
+    )
+    reqs = [make_req(f"r{i}") for i in range(5)]
+    for req in reqs:
+        worker.submit(req)
+
+    worker.start()
+    try:
+        for req in reqs:
+            assert wait_for_status(req, RequestStatus.DONE)
+    finally:
+        worker.stop()
+
+    assert executor.prefill_call_sizes
+    assert max(executor.prefill_call_sizes) <= 2
+
+
+def test_decode_batch_size_capped_by_config() -> None:
+    executor = FakeBatchExecutor()
+    worker = make_batch_worker(
+        executor,
+        max_queue_size=16,
+        max_active_requests=5,
+        max_prefill_batch_size=5,
+        max_decode_batch_size=2,
+    )
+    reqs = [make_req(f"r{i}") for i in range(5)]
+    for req in reqs:
+        worker.submit(req)
+
+    worker.start()
+    try:
+        for req in reqs:
+            assert wait_for_status(req, RequestStatus.DONE)
+    finally:
+        worker.stop()
+
+    assert executor.decode_call_sizes
+    assert max(executor.decode_call_sizes) <= 2
 
 
 def test_stop_cancels_active_request_blocked_in_decode() -> None:
