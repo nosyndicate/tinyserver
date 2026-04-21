@@ -1,9 +1,6 @@
 from queue import Queue
 from typing import Callable
 
-import torch
-from transformers import DynamicCache
-
 from server.executor.engine import (
     BatchInferenceEngine,
     EngineCallbacks,
@@ -20,28 +17,8 @@ from server.executor.types import (
     RequestFailure,
     RequestStatus,
 )
-from server.model.sampling import SamplingParams
 
-from .worker_helpers import decode_result, prefill_result
-
-
-def make_req(request_id: str) -> GenerationRequestState:
-    return GenerationRequestState(
-        request_id=request_id,
-        sampling_params=SamplingParams(max_new_tokens=10, temperature=1.0, top_p=1.0),
-        prompt=f"prompt-{request_id}",
-        enqueued_ns=0,
-    )
-
-
-def make_decoding_req(request_id: str) -> GenerationRequestState:
-    req = make_req(request_id)
-    req.status = RequestStatus.DECODING
-    req.start_ns = 0
-    req.num_prompt_tokens = 1
-    req.all_logits = torch.empty(1, 1, 1)
-    req.past_key_values = DynamicCache()
-    return req
+from .worker_helpers import decode_result, make_decoding_req, make_req, prefill_result
 
 
 class LoopControl:

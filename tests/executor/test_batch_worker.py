@@ -5,6 +5,7 @@ import time
 import pytest
 
 from server.executor.types import (
+    BaseBatchExecutor,
     BatchExecutorConfig,
     DecodeResult,
     ErrorEvent,
@@ -26,7 +27,7 @@ from .worker_helpers import (
 )
 
 
-class FakeBatchExecutor:
+class FakeBatchExecutor(BaseBatchExecutor):
     def __init__(
         self,
         prefill_results: dict[str, PrefillResult | RequestFailure | Exception]
@@ -120,8 +121,6 @@ def test_minimum_valid_config_constructs() -> None:
     )
 
     assert worker._thread is None
-    assert worker._waiting == []
-    assert worker._active == []
     assert worker._inbound.maxsize == 1
     assert not worker._shutdown_event.is_set()
 

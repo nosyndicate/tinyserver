@@ -27,7 +27,19 @@ def make_req(request_id: str | None = None) -> GenerationRequestState:
         request_id=rid,
         sampling_params=SamplingParams(max_new_tokens=10, temperature=1.0, top_p=1.0),
         prompt="hello",
+        enqueued_ns=0,
     )
+
+
+def make_decoding_req(request_id: str) -> GenerationRequestState:
+    req = make_req(request_id)
+    req.status = RequestStatus.DECODING
+    req.start_ns = 0
+    req.enqueued_ns = 0
+    req.num_prompt_tokens = 1
+    req.all_logits = torch.empty(1, 1, 1)
+    req.past_key_values = DynamicCache()
+    return req
 
 
 def drain_events(req: GenerationRequestState, timeout: float = 0.0) -> list:
