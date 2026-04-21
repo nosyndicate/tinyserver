@@ -319,48 +319,53 @@ def test_concurrent_submits_from_multiple_threads() -> None:
 
 
 def test_concurrent_submits_exceeds_queue_size() -> None:
+    max_queue_size = 5
     worker = make_batch_worker(
-        max_queue_size=5,
+        max_queue_size=max_queue_size,
         max_active_requests=10,
         max_prefill_batch_size=5,
         max_decode_batch_size=5,
     )
-    num_threads = 10
-    reqs_per_thread = 10
-    all_reqs = [
+
+    # Fill the queue to capacity before starting the worker so concurrent submits
+    # race against a full queue rather than a racing consumer thread.
+    pre_filled = [make_req(f"pre{i}") for i in range(max_queue_size)]
+    for req in pre_filled:
+        worker.submit(req)
+
+    num_threads = 5
+    reqs_per_thread = 5
+    overflow_reqs = [
         [make_req(f"ov_t{t}r{r}") for r in range(reqs_per_thread)]
         for t in range(num_threads)
     ]
-
-    accepted: list[GenerationRequestState] = []
+    rejected_count = 0
     lock = threading.Lock()
 
     def submit_thread(thread_reqs: list[GenerationRequestState]) -> None:
+        nonlocal rejected_count
         for req in thread_reqs:
             try:
                 worker.submit(req)
-                with lock:
-                    accepted.append(req)
             except queue.Full:
-                pass
+                with lock:
+                    rejected_count += 1
 
+    threads = [
+        threading.Thread(target=submit_thread, args=(thread_reqs,))
+        for thread_reqs in overflow_reqs
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert rejected_count == num_threads * reqs_per_thread
+
+    # Start worker and verify pre-filled requests complete end-to-end.
     worker.start()
     try:
-        threads = [
-            threading.Thread(target=submit_thread, args=(thread_reqs,))
-            for thread_reqs in all_reqs
-        ]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-
-        total = num_threads * reqs_per_thread
-        assert len(accepted) < total, (
-            "Expected some requests to be rejected due to full queue"
-        )
-
-        for req in accepted:
+        for req in pre_filled:
             assert wait_for_status(req, RequestStatus.DONE)
     finally:
         worker.stop()
