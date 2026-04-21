@@ -150,10 +150,6 @@ class SimpleWorker(Worker):
         super().__init__(config.max_queue_size)
         self._engine = SimpleInferenceEngine(executor, config)
 
-    @property
-    def _active(self) -> list[GenerationRequestState]:
-        return self._engine._active
-
     def _cancel_inflight(self, message: str) -> None:
         self._engine.cancel_inflight(message, self._cancel_request)
 
@@ -202,14 +198,6 @@ class BatchWorker(Worker):
         self._check_config(config)
         super().__init__(config.max_queue_size)
         self._engine = BatchInferenceEngine(executor, config)
-
-    @property
-    def _waiting(self) -> list[GenerationRequestState]:
-        return self._engine._waiting
-
-    @property
-    def _active(self) -> list[GenerationRequestState]:
-        return self._engine._active
 
     def _cancel_inflight(self, message: str) -> None:
         self._engine.cancel_inflight(message, self._cancel_request)

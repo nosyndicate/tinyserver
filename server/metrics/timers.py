@@ -8,6 +8,9 @@ class TimerDict(TypedDict):
     end_ns: int | None
 
 
+NS_PER_S: int = 1_000_000_000
+
+
 def now_ns() -> int:
     return time.perf_counter_ns()
 
