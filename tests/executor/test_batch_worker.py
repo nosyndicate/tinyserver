@@ -13,6 +13,7 @@ from server.executor.types import (
     PrefillResult,
     RequestFailure,
     RequestStatus,
+    TokenEvent,
 )
 from server.executor.worker import BatchWorker
 
@@ -259,9 +260,11 @@ def test_fatal_engine_callback_cancels_inbound_requests() -> None:
         max_prefill_batch_size=1,
         max_decode_batch_size=1,
     )
-    r0, r1 = make_req("r0"), make_req("r1")
+    r0, r1, r2, r3 = make_req("r0"), make_req("r1"), make_req("r2"), make_req("r3")
     worker.submit(r0)
     worker.submit(r1)
+    worker.submit(r2)
+    worker.submit(r3)
 
     worker.start()
     _wait_for_worker_to_die(worker)
@@ -269,6 +272,8 @@ def test_fatal_engine_callback_cancels_inbound_requests() -> None:
 
     _assert_error_event(r0)
     _assert_error_event(r1)
+    _assert_error_event(r2)
+    _assert_error_event(r3)
 
 
 def test_concurrent_submits_from_multiple_threads() -> None:
@@ -449,4 +454,6 @@ def test_stop_cancels_active_request_blocked_in_decode() -> None:
 
     assert req.status == RequestStatus.FAILED
     events = drain_events(req)
-    assert any(isinstance(event, ErrorEvent) for event in events)
+    assert len(events) == 2
+    assert isinstance(events[0], TokenEvent)
+    assert isinstance(events[1], ErrorEvent)

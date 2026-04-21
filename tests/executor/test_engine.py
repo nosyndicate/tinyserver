@@ -33,6 +33,7 @@ class LoopControl:
         return self.stopped
 
     def wait_idle(self, timeout: float) -> bool:
+        # Sets stopped=True so the next should_stop() exits the loop, preventing infinite loops in tests.
         self.waits.append(timeout)
         self.stopped = True
         return True
@@ -266,17 +267,12 @@ def test_simple_engine_shutdown_during_decode_cancels_active_requests() -> None:
     assert engine._active == []
 
 
-def test_batch_engine_drain_and_selection_methods_respect_limits() -> None:
+def test_batch_engine_drain_inbound_respects_capacity_limit() -> None:
     engine = BatchInferenceEngine(
         FakeBatchExecutor(),
-        batch_config(
-            max_active_requests=3,
-            max_prefill_batch_size=2,
-            max_decode_batch_size=1,
-        ),
+        batch_config(max_active_requests=3, max_prefill_batch_size=2),
     )
-    active = make_decoding_req("active")
-    engine._active.append(active)
+    engine._active.append(make_decoding_req("active"))
     waiting = [make_req("w0"), make_req("w1"), make_req("w2")]
     inbound = fill_queue(waiting)
 
@@ -285,14 +281,25 @@ def test_batch_engine_drain_and_selection_methods_respect_limits() -> None:
     assert engine._waiting == waiting[:2]
     assert inbound.qsize() == 1
 
-    prefill_batch = engine.select_prefill_batch()
-    assert prefill_batch == waiting[:2]
+
+def test_batch_engine_select_prefill_batch_consumes_waiting() -> None:
+    engine = BatchInferenceEngine(FakeBatchExecutor(), batch_config())
+    waiting = [make_req("w0"), make_req("w1")]
+    engine._waiting = list(waiting)
+
+    assert engine.select_prefill_batch() == waiting
     assert engine._waiting == []
 
+
+def test_batch_engine_select_decode_batch_respects_size_limit_and_skips_done() -> None:
+    engine = BatchInferenceEngine(
+        FakeBatchExecutor(), batch_config(max_decode_batch_size=1)
+    )
     r0, r1 = make_decoding_req("r0"), make_decoding_req("r1")
     done = make_req("done")
     done.status = RequestStatus.DONE
     engine._active = [r0, done, r1]
+
     assert engine.select_decode_batch() == [r0]
 
 
