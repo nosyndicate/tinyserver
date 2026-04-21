@@ -202,18 +202,6 @@ class BatchWorker(Worker):
     def _cancel_inflight(self, message: str) -> None:
         self._engine.cancel_inflight(message, self._cancel_request)
 
-    def _drain_inbound(self) -> None:
-        """Move all requests from the inbound queue to the waiting list, up to max_active_requests."""
-        self._engine.drain_inbound(self._inbound)
-
-    def _select_prefill_batch(self) -> list[GenerationRequestState]:
-        """Select a batch of requests from the waiting list for prefill, up to max_prefill_batch_size."""
-        return self._engine.select_prefill_batch()
-
-    def _select_decode_batch(self) -> list[GenerationRequestState]:
-        """Select a batch of requests from the active list for decode, up to max_decode_batch_size."""
-        return self._engine.select_decode_batch()
-
     def _run_loop(self) -> None:
         self._engine.run(
             inbound=self._inbound,

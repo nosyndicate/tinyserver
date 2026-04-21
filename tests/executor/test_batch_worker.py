@@ -101,23 +101,30 @@ def make_batch_worker(
     )
 
 
-def test_config_validation() -> None:
-    with pytest.raises(ValueError, match="max_queue_size"):
-        make_batch_worker(max_queue_size=0)
-    with pytest.raises(ValueError, match="max_active_requests"):
-        make_batch_worker(max_active_requests=0)
-    with pytest.raises(ValueError, match="max_prefill_batch_size"):
-        make_batch_worker(max_prefill_batch_size=0)
-    with pytest.raises(ValueError, match="max_decode_batch_size"):
-        make_batch_worker(max_decode_batch_size=0)
-    with pytest.raises(ValueError, match="max_prefill_batch_size cannot be greater"):
-        make_batch_worker(max_active_requests=2, max_prefill_batch_size=3)
-    with pytest.raises(ValueError, match="max_decode_batch_size cannot be greater"):
-        make_batch_worker(
-            max_active_requests=2,
-            max_prefill_batch_size=2,
-            max_decode_batch_size=3,
-        )
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"max_queue_size": 0}, "max_queue_size"),
+        ({"max_active_requests": 0}, "max_active_requests"),
+        ({"max_prefill_batch_size": 0}, "max_prefill_batch_size"),
+        ({"max_decode_batch_size": 0}, "max_decode_batch_size"),
+        (
+            {"max_active_requests": 2, "max_prefill_batch_size": 3},
+            "max_prefill_batch_size cannot be greater",
+        ),
+        (
+            {
+                "max_active_requests": 2,
+                "max_prefill_batch_size": 2,
+                "max_decode_batch_size": 3,
+            },
+            "max_decode_batch_size cannot be greater",
+        ),
+    ],
+)
+def test_config_validation(kwargs: dict, match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        make_batch_worker(**kwargs)
 
 
 def test_minimum_valid_config_constructs() -> None:
@@ -307,6 +314,54 @@ def test_concurrent_submits_from_multiple_threads() -> None:
         for thread_reqs in all_reqs:
             for req in thread_reqs:
                 assert wait_for_status(req, RequestStatus.DONE)
+    finally:
+        worker.stop()
+
+
+def test_concurrent_submits_exceeds_queue_size() -> None:
+    worker = make_batch_worker(
+        max_queue_size=5,
+        max_active_requests=10,
+        max_prefill_batch_size=5,
+        max_decode_batch_size=5,
+    )
+    num_threads = 10
+    reqs_per_thread = 10
+    all_reqs = [
+        [make_req(f"ov_t{t}r{r}") for r in range(reqs_per_thread)]
+        for t in range(num_threads)
+    ]
+
+    accepted: list[GenerationRequestState] = []
+    lock = threading.Lock()
+
+    def submit_thread(thread_reqs: list[GenerationRequestState]) -> None:
+        for req in thread_reqs:
+            try:
+                worker.submit(req)
+                with lock:
+                    accepted.append(req)
+            except queue.Full:
+                pass
+
+    worker.start()
+    try:
+        threads = [
+            threading.Thread(target=submit_thread, args=(thread_reqs,))
+            for thread_reqs in all_reqs
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        total = num_threads * reqs_per_thread
+        assert len(accepted) < total, (
+            "Expected some requests to be rejected due to full queue"
+        )
+
+        for req in accepted:
+            assert wait_for_status(req, RequestStatus.DONE)
     finally:
         worker.stop()
 
