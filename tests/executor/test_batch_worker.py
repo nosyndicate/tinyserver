@@ -101,23 +101,30 @@ def make_batch_worker(
     )
 
 
-def test_config_validation() -> None:
-    with pytest.raises(ValueError, match="max_queue_size"):
-        make_batch_worker(max_queue_size=0)
-    with pytest.raises(ValueError, match="max_active_requests"):
-        make_batch_worker(max_active_requests=0)
-    with pytest.raises(ValueError, match="max_prefill_batch_size"):
-        make_batch_worker(max_prefill_batch_size=0)
-    with pytest.raises(ValueError, match="max_decode_batch_size"):
-        make_batch_worker(max_decode_batch_size=0)
-    with pytest.raises(ValueError, match="max_prefill_batch_size cannot be greater"):
-        make_batch_worker(max_active_requests=2, max_prefill_batch_size=3)
-    with pytest.raises(ValueError, match="max_decode_batch_size cannot be greater"):
-        make_batch_worker(
-            max_active_requests=2,
-            max_prefill_batch_size=2,
-            max_decode_batch_size=3,
-        )
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"max_queue_size": 0}, "max_queue_size"),
+        ({"max_active_requests": 0}, "max_active_requests"),
+        ({"max_prefill_batch_size": 0}, "max_prefill_batch_size"),
+        ({"max_decode_batch_size": 0}, "max_decode_batch_size"),
+        (
+            {"max_active_requests": 2, "max_prefill_batch_size": 3},
+            "max_prefill_batch_size cannot be greater",
+        ),
+        (
+            {
+                "max_active_requests": 2,
+                "max_prefill_batch_size": 2,
+                "max_decode_batch_size": 3,
+            },
+            "max_decode_batch_size cannot be greater",
+        ),
+    ],
+)
+def test_config_validation(kwargs: dict, match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        make_batch_worker(**kwargs)
 
 
 def test_minimum_valid_config_constructs() -> None:
@@ -307,6 +314,59 @@ def test_concurrent_submits_from_multiple_threads() -> None:
         for thread_reqs in all_reqs:
             for req in thread_reqs:
                 assert wait_for_status(req, RequestStatus.DONE)
+    finally:
+        worker.stop()
+
+
+def test_concurrent_submits_exceeds_queue_size() -> None:
+    max_queue_size = 5
+    worker = make_batch_worker(
+        max_queue_size=max_queue_size,
+        max_active_requests=10,
+        max_prefill_batch_size=5,
+        max_decode_batch_size=5,
+    )
+
+    # Fill the queue to capacity before starting the worker so concurrent submits
+    # race against a full queue rather than a racing consumer thread.
+    pre_filled = [make_req(f"pre{i}") for i in range(max_queue_size)]
+    for req in pre_filled:
+        worker.submit(req)
+
+    num_threads = 5
+    reqs_per_thread = 5
+    overflow_reqs = [
+        [make_req(f"ov_t{t}r{r}") for r in range(reqs_per_thread)]
+        for t in range(num_threads)
+    ]
+    rejected_count = 0
+    lock = threading.Lock()
+
+    def submit_thread(thread_reqs: list[GenerationRequestState]) -> None:
+        nonlocal rejected_count
+        for req in thread_reqs:
+            try:
+                worker.submit(req)
+            except queue.Full:
+                with lock:
+                    rejected_count += 1
+
+    threads = [
+        threading.Thread(target=submit_thread, args=(thread_reqs,))
+        for thread_reqs in overflow_reqs
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert rejected_count == num_threads * reqs_per_thread
+
+    # Start worker and verify pre-filled requests complete end-to-end.
+    worker.start()
+    try:
+        for req in pre_filled:
+            assert wait_for_status(req, RequestStatus.DONE)
     finally:
         worker.stop()
 

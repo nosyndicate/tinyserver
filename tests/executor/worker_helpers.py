@@ -81,7 +81,7 @@ def prefill_result() -> PrefillResult:
         all_logits=torch.empty(1, 1, 1),
         past_key_values=DynamicCache(),
         num_prompt_tokens=1,
-        start_ns=time.monotonic_ns(),
+        start_ns=now_ns(),
     )
 
 

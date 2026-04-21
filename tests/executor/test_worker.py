@@ -86,11 +86,16 @@ def make_worker(
     )
 
 
-def test_config_validation() -> None:
-    with pytest.raises(ValueError, match="max_queue_size"):
-        make_worker(max_queue_size=0)
-    with pytest.raises(ValueError, match="max_active_requests"):
-        make_worker(max_active_requests=0)
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"max_queue_size": 0}, "max_queue_size"),
+        ({"max_active_requests": 0}, "max_active_requests"),
+    ],
+)
+def test_config_validation(kwargs: dict, match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        make_worker(**kwargs)
 
 
 def test_minimum_valid_config_constructs() -> None:

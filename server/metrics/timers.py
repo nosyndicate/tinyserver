@@ -9,6 +9,7 @@ class TimerDict(TypedDict):
 
 
 NS_PER_S: int = 1_000_000_000
+NS_PER_MS: int = 1_000_000
 
 
 def now_ns() -> int:
@@ -16,7 +17,7 @@ def now_ns() -> int:
 
 
 def ns_to_ms(ns: int) -> float:
-    return ns / 1_000_000.0
+    return ns / NS_PER_MS
 
 
 @contextmanager
