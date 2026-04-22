@@ -1,7 +1,7 @@
 import logging
 from dataclasses import dataclass
 from queue import Empty, Queue
-from typing import Callable
+from typing import Callable, Protocol
 
 from server.executor.events import RequestEventEmitter
 from server.executor.types import (
@@ -29,6 +29,21 @@ class EngineControl:
 class EngineCallbacks:
     cancel_request: Callable[[GenerationRequestState, str], None]
     handle_fatal_error: Callable[[Exception, list[GenerationRequestState] | None], None]
+
+
+class InferenceEngine(Protocol):
+    def run(
+        self,
+        inbound: Queue[GenerationRequestState],
+        control: EngineControl,
+        callbacks: EngineCallbacks,
+    ) -> None: ...
+
+    def cancel_inflight(
+        self,
+        message: str,
+        cancel_request: Callable[[GenerationRequestState, str], None],
+    ) -> None: ...
 
 
 class SimpleInferenceEngine:

@@ -13,7 +13,7 @@ from server.executor.types import (
     GenerationRequestState,
     TokenEvent,
 )
-from server.executor.worker import BatchWorker, SimpleWorker
+from server.executor.worker import Worker
 from server.metrics.logging import log_event
 from server.metrics.timers import now_ns, ns_to_ms, timed
 from server.model.determinism import make_generator
@@ -44,24 +44,17 @@ def _get_runner(request: Request) -> ModelRunner:
     return runner
 
 
-def _get_worker(request: Request) -> SimpleWorker:
+def _get_worker(request: Request) -> Worker:
     """
     Retrieve the worker instance from the request's app state.
     """
     worker = request.app.state.worker
-    if worker is None:
-        raise RuntimeError("Worker not found in app state")
-    return worker
-
-
-def _get_batch_worker(request: Request) -> BatchWorker:
-    """
-    Retrieve the batch worker instance from the request's app state.
-    """
-    batch_worker = request.app.state.batch_worker
-    if batch_worker is None:
-        raise RuntimeError("Batch worker not found in app state")
-    return batch_worker
+    if worker is not None:
+        return worker
+    worker = request.app.state.batch_worker
+    if worker is not None:
+        return worker
+    raise RuntimeError("Worker not found in app state")
 
 
 def _build_request_state(req: GenerateRequest, device: str) -> GenerationRequestState:
@@ -195,11 +188,11 @@ def generate_v2(req: GenerateRequest, request: Request) -> GenerateResponse:
 
 @v3_router.post("/generate_v3", response_model=GenerateResponse)
 def generate_v3(req: GenerateRequest, request: Request) -> GenerateResponse:
-    batch_worker = _get_batch_worker(request)
+    worker = _get_worker(request)
     state = _build_request_state(req, device=request.app.state.device)
 
     try:
-        batch_worker.submit(state)
+        worker.submit(state)
     except Full:
         raise HTTPException(
             status_code=503,
@@ -394,7 +387,7 @@ def generate_stream_v2(req: GenerateRequest, request: Request) -> StreamingRespo
 
 @v3_router.post("/generate/stream_v3", response_model=None)
 def generate_stream_v3(req: GenerateRequest, request: Request) -> StreamingResponse:
-    worker = _get_batch_worker(request)
+    worker = _get_worker(request)
     state = _build_request_state(req, device=request.app.state.device)
 
     try:

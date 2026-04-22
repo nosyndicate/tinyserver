@@ -4,6 +4,7 @@ import time
 
 import pytest
 
+from server.executor.engine import BatchInferenceEngine
 from server.executor.types import (
     BaseBatchExecutor,
     BatchExecutorConfig,
@@ -15,7 +16,7 @@ from server.executor.types import (
     RequestStatus,
     TokenEvent,
 )
-from server.executor.worker import BatchWorker
+from server.executor.worker import Worker
 from server.metrics.timers import NS_PER_S, now_ns
 
 from .worker_helpers import (
@@ -89,16 +90,15 @@ def make_batch_worker(
     max_active_requests: int = 4,
     max_prefill_batch_size: int = 4,
     max_decode_batch_size: int = 4,
-) -> BatchWorker:
-    return BatchWorker(
-        executor or FakeBatchExecutor(),
-        BatchExecutorConfig(
-            max_queue_size=max_queue_size,
-            max_active_requests=max_active_requests,
-            max_prefill_batch_size=max_prefill_batch_size,
-            max_decode_batch_size=max_decode_batch_size,
-        ),
+) -> Worker:
+    exec_impl = executor or FakeBatchExecutor()
+    config = BatchExecutorConfig(
+        max_queue_size=max_queue_size,
+        max_active_requests=max_active_requests,
+        max_prefill_batch_size=max_prefill_batch_size,
+        max_decode_batch_size=max_decode_batch_size,
     )
+    return Worker(BatchInferenceEngine(exec_impl, config), config)
 
 
 @pytest.mark.parametrize(

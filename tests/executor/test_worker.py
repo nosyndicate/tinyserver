@@ -4,6 +4,7 @@ import time
 
 import pytest
 
+from server.executor.engine import SimpleInferenceEngine
 from server.executor.types import (
     BaseExecutor,
     DecodeResult,
@@ -15,7 +16,7 @@ from server.executor.types import (
     RequestStatus,
     TokenEvent,
 )
-from server.executor.worker import SimpleWorker
+from server.executor.worker import Worker
 from server.metrics.timers import NS_PER_S, now_ns
 
 from .worker_helpers import (
@@ -76,14 +77,13 @@ def make_worker(
     executor: FakeExecutor | None = None,
     max_queue_size: int = 16,
     max_active_requests: int = 4,
-) -> SimpleWorker:
-    return SimpleWorker(
-        executor or FakeExecutor(),
-        ExecutorConfig(
-            max_queue_size=max_queue_size,
-            max_active_requests=max_active_requests,
-        ),
+) -> Worker:
+    exec_impl = executor or FakeExecutor()
+    config = ExecutorConfig(
+        max_queue_size=max_queue_size,
+        max_active_requests=max_active_requests,
     )
+    return Worker(SimpleInferenceEngine(exec_impl, config), config)
 
 
 @pytest.mark.parametrize(
