@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, auto
 from queue import Queue
 from typing import Protocol
 
@@ -126,17 +126,17 @@ class BatchEngineConfig(EngineConfig):
 
 
 class RequestStatus(Enum):
-    QUEUED = "queued"
-    PREFILLING = "prefilling"
-    DECODING = "decoding"
-    DONE = "done"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
+    QUEUED = auto()
+    PREFILLING = auto()
+    DECODING = auto()
+    DONE = auto()
+    FAILED = auto()
+    CANCELLED = auto()
 
 
 class FinishReason(Enum):
-    EOS = "eos"
-    MAX_LENGTH = "max_length"
+    EOS = auto()
+    MAX_LENGTH = auto()
 
 
 @dataclass

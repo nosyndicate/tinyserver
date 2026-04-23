@@ -21,33 +21,62 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class EngineControl:
+    """Handle for the runner loop to check shutdown and idle conditions.
+
+    Attributes:
+        should_stop: Returns True when the engine should terminate.
+        wait_idle: Called when no work is available; returns True if shutdown was requested during the wait.
+    """
+
     should_stop: Callable[[], bool]
     wait_idle: Callable[[float], bool]
 
 
 @dataclass(frozen=True)
 class EngineCallbacks:
+    """Callbacks from the engine to the surrounding worker/runtime.
+
+    Attributes:
+        cancel_request: Marks a single request as failed with an error message.
+        handle_fatal_error: Propagates an irrecoverable error; optionally receives the batch of requests that were being processed.
+    """
+
     cancel_request: Callable[[GenerationRequestState, str], None]
     handle_fatal_error: Callable[[Exception, list[GenerationRequestState] | None], None]
 
 
 @runtime_checkable
 class InferenceEngine(Protocol):
+    """Protocol that any inference engine must implement.
+
+    An engine drives the request lifecycle: draining an inbound queue,
+    running prefill/decode phases on an executor, and emitting events.
+    """
+
     def run(
         self,
         inbound: Queue[GenerationRequestState],
         control: EngineControl,
         callbacks: EngineCallbacks,
-    ) -> None: ...
+    ) -> None:
+        """Main event loop: process requests until shutdown."""
 
     def cancel_inflight(
         self,
         message: str,
         cancel_request: Callable[[GenerationRequestState, str], None],
-    ) -> None: ...
+    ) -> None:
+        """Cancel all in-flight requests with the given error message."""
 
 
 class SimpleInferenceEngine:
+    """Process requests one at a time through prefill, then decode one-by-one.
+
+    Drains the inbound queue up to `max_active_requests`, runs prefill
+    sequentially, then iterates over all active decode requests individually.
+    Suitable for workloads where batching provides little benefit.
+    """
+
     def __init__(self, executor: BaseExecutor, config: EngineConfig) -> None:
         if config.max_active_requests <= 0:
             raise ValueError("max_active_requests must be positive")
@@ -78,6 +107,7 @@ class SimpleInferenceEngine:
         cancel_request: Callable[[GenerationRequestState, str], None],
         phase: str,
     ) -> None:
+        """Cancel a list of requests, logging failures with phase context."""
         for pending in requests:
             try:
                 cancel_request(pending, message)
@@ -160,6 +190,14 @@ class SimpleInferenceEngine:
 
 
 class BatchInferenceEngine:
+    """Process requests in batches for both prefill and decode phases.
+
+    Drains the inbound queue into a waiting list, then groups waiting
+    requests into prefill batches (up to `max_prefill_batch_size`) and
+    active decode requests into decode batches (up to `max_decode_batch_size`).
+    Reduces per-request overhead when many requests share the same model.
+    """
+
     def __init__(self, executor: BaseBatchExecutor, config: BatchEngineConfig) -> None:
         if config.max_active_requests <= 0:
             raise ValueError("max_active_requests must be positive")
