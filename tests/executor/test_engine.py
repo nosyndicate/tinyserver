@@ -10,10 +10,10 @@ from server.executor.engine import (
     SimpleInferenceEngine,
 )
 from server.executor.types import (
-    BatchExecutorConfig,
+    BatchEngineConfig,
     DecodeResult,
+    EngineConfig,
     ErrorEvent,
-    ExecutorConfig,
     GenerationRequestState,
     PrefillResult,
     RequestFailure,
@@ -136,16 +136,16 @@ def fill_queue(reqs: list[GenerationRequestState]) -> Queue[GenerationRequestSta
     return inbound
 
 
-def simple_config(max_active_requests: int = 2) -> ExecutorConfig:
-    return ExecutorConfig(max_active_requests=max_active_requests)
+def simple_config(max_active_requests: int = 2) -> EngineConfig:
+    return EngineConfig(max_active_requests=max_active_requests)
 
 
 def batch_config(
     max_active_requests: int = 4,
     max_prefill_batch_size: int = 2,
     max_decode_batch_size: int = 2,
-) -> BatchExecutorConfig:
-    return BatchExecutorConfig(
+) -> BatchEngineConfig:
+    return BatchEngineConfig(
         max_active_requests=max_active_requests,
         max_prefill_batch_size=max_prefill_batch_size,
         max_decode_batch_size=max_decode_batch_size,
@@ -398,7 +398,7 @@ def test_batch_engine_idle_state_waits_briefly() -> None:
     ],
 )
 def test_simple_engine_config_validation(kwargs: dict, match: str) -> None:
-    config = ExecutorConfig(**kwargs)
+    config = EngineConfig(**kwargs)
     with pytest.raises(ValueError, match=match):
         SimpleInferenceEngine(FakeSimpleExecutor(), config)
 
@@ -424,6 +424,6 @@ def test_simple_engine_config_validation(kwargs: dict, match: str) -> None:
     ],
 )
 def test_batch_engine_config_validation(kwargs: dict, match: str) -> None:
-    config = BatchExecutorConfig(**kwargs)
+    config = BatchEngineConfig(**kwargs)
     with pytest.raises(ValueError, match=match):
         BatchInferenceEngine(FakeBatchExecutor(), config)

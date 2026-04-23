@@ -8,10 +8,10 @@ from server.executor.engine import BatchInferenceEngine, SimpleInferenceEngine
 from server.executor.types import (
     BaseBatchExecutor,
     BaseExecutor,
-    BatchExecutorConfig,
+    BatchEngineConfig,
     DecodeResult,
+    EngineConfig,
     ErrorEvent,
-    ExecutorConfig,
     GenerationRequestState,
     PrefillResult,
     RequestFailure,
@@ -81,7 +81,7 @@ def make_worker(
     max_active_requests: int = 4,
 ) -> Worker:
     exec_impl = executor or FakeExecutor()
-    config = ExecutorConfig(
+    config = EngineConfig(
         max_active_requests=max_active_requests,
     )
     return Worker(
@@ -349,7 +349,7 @@ def make_batch_worker(
     max_decode_batch_size: int = 4,
 ) -> Worker:
     exec_impl = executor or FakeBatchExecutor()
-    config = BatchExecutorConfig(
+    config = BatchEngineConfig(
         max_active_requests=max_active_requests,
         max_prefill_batch_size=max_prefill_batch_size,
         max_decode_batch_size=max_decode_batch_size,

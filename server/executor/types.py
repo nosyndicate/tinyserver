@@ -99,9 +99,9 @@ class RequestFailure:
 
 
 @dataclass(frozen=True)
-class ExecutorConfig:
+class EngineConfig:
     """
-    The configuration for the executor, controls concurrency.
+    The configuration for the inference engine, controls concurrency.
 
     Attributes:
         max_active_requests: The maximum number of requests that the worker can process concurrently.
@@ -112,9 +112,9 @@ class ExecutorConfig:
 
 
 @dataclass(frozen=True)
-class BatchExecutorConfig(ExecutorConfig):
+class BatchEngineConfig(EngineConfig):
     """
-    The configuration for the batch executor.
+    The configuration for the batch inference engine.
 
     Attributes:
         max_prefill_batch_size: The maximum batch size for prefill. Requests will be grouped into batches of this size for the prefill step.
