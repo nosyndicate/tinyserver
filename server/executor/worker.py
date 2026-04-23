@@ -8,9 +8,7 @@ from server.executor.engine import (
     InferenceEngine,
 )
 from server.executor.types import (
-    BatchExecutorConfig,
     ErrorEvent,
-    ExecutorConfig,
     GenerationRequestState,
     RequestStatus,
 )
@@ -19,34 +17,13 @@ from server.metrics.timers import now_ns
 logger = logging.getLogger(__name__)
 
 
-def _validate_config(config: ExecutorConfig) -> None:
-    if config.max_queue_size <= 0:
-        raise ValueError("max_queue_size must be positive")
-    if config.max_active_requests <= 0:
-        raise ValueError("max_active_requests must be positive")
-    if isinstance(config, BatchExecutorConfig):
-        if config.max_prefill_batch_size <= 0:
-            raise ValueError("max_prefill_batch_size must be positive")
-        if config.max_decode_batch_size <= 0:
-            raise ValueError("max_decode_batch_size must be positive")
-        if config.max_prefill_batch_size > config.max_active_requests:
-            raise ValueError(
-                "max_prefill_batch_size cannot be greater than max_active_requests"
-            )
-        if config.max_decode_batch_size > config.max_active_requests:
-            raise ValueError(
-                "max_decode_batch_size cannot be greater than max_active_requests"
-            )
-
-
 class Worker:
     """Manages the lifecycle of generation requests using an inference engine."""
 
-    def __init__(self, engine: InferenceEngine, config: ExecutorConfig) -> None:
-        _validate_config(config)
-        self._inbound: Queue[GenerationRequestState] = Queue(
-            maxsize=config.max_queue_size
-        )
+    def __init__(self, engine: InferenceEngine, max_queue_size: int) -> None:
+        if max_queue_size <= 0:
+            raise ValueError("max_queue_size must be positive")
+        self._inbound: Queue[GenerationRequestState] = Queue(maxsize=max_queue_size)
         self._shutdown_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._engine = engine

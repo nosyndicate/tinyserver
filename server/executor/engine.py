@@ -48,6 +48,10 @@ class InferenceEngine(Protocol):
 
 class SimpleInferenceEngine:
     def __init__(self, executor: BaseExecutor, config: ExecutorConfig) -> None:
+        if config.max_queue_size <= 0:
+            raise ValueError("max_queue_size must be positive")
+        if config.max_active_requests <= 0:
+            raise ValueError("max_active_requests must be positive")
         self._executor = executor
         self._config = config
         self._active: list[GenerationRequestState] = []
@@ -160,6 +164,22 @@ class BatchInferenceEngine:
     def __init__(
         self, executor: BaseBatchExecutor, config: BatchExecutorConfig
     ) -> None:
+        if config.max_queue_size <= 0:
+            raise ValueError("max_queue_size must be positive")
+        if config.max_active_requests <= 0:
+            raise ValueError("max_active_requests must be positive")
+        if config.max_prefill_batch_size <= 0:
+            raise ValueError("max_prefill_batch_size must be positive")
+        if config.max_decode_batch_size <= 0:
+            raise ValueError("max_decode_batch_size must be positive")
+        if config.max_prefill_batch_size > config.max_active_requests:
+            raise ValueError(
+                "max_prefill_batch_size cannot be greater than max_active_requests"
+            )
+        if config.max_decode_batch_size > config.max_active_requests:
+            raise ValueError(
+                "max_decode_batch_size cannot be greater than max_active_requests"
+            )
         self._executor = executor
         self._config = config
         self._waiting: list[GenerationRequestState] = []

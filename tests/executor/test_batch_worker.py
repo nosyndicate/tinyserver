@@ -98,7 +98,9 @@ def make_batch_worker(
         max_prefill_batch_size=max_prefill_batch_size,
         max_decode_batch_size=max_decode_batch_size,
     )
-    return Worker(BatchInferenceEngine(exec_impl, config), config)
+    return Worker(
+        BatchInferenceEngine(exec_impl, config), max_queue_size=config.max_queue_size
+    )
 
 
 @pytest.mark.parametrize(

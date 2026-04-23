@@ -69,13 +69,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if version == "v2":
         executor = Executor(runner)
         config = ExecutorConfig()
-        worker = Worker(SimpleInferenceEngine(executor, config), config)
+        worker = Worker(
+            SimpleInferenceEngine(executor, config),
+            max_queue_size=config.max_queue_size,
+        )
         worker.start()
         app.state.worker = worker
     elif version == "v3":
         batch_executor = BatchExecutor(runner)
         config = BatchExecutorConfig()
-        batch_worker = Worker(BatchInferenceEngine(batch_executor, config), config)
+        batch_worker = Worker(
+            BatchInferenceEngine(batch_executor, config),
+            max_queue_size=config.max_queue_size,
+        )
         batch_worker.start()
         app.state.batch_worker = batch_worker
 

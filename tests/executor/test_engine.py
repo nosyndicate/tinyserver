@@ -1,6 +1,8 @@
 from queue import Queue
 from typing import Callable
 
+import pytest
+
 from server.executor.engine import (
     BatchInferenceEngine,
     EngineCallbacks,
@@ -388,3 +390,43 @@ def test_batch_engine_idle_state_waits_briefly() -> None:
 
     assert callbacks.fatal == []
     assert control.waits and control.waits[0] > 0.0
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"max_queue_size": 0}, "max_queue_size"),
+        ({"max_active_requests": 0}, "max_active_requests"),
+    ],
+)
+def test_simple_engine_config_validation(kwargs: dict, match: str) -> None:
+    config = ExecutorConfig(**kwargs)
+    with pytest.raises(ValueError, match=match):
+        SimpleInferenceEngine(FakeSimpleExecutor(), config)
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"max_queue_size": 0}, "max_queue_size"),
+        ({"max_active_requests": 0}, "max_active_requests"),
+        ({"max_prefill_batch_size": 0}, "max_prefill_batch_size"),
+        ({"max_decode_batch_size": 0}, "max_decode_batch_size"),
+        (
+            {"max_active_requests": 2, "max_prefill_batch_size": 3},
+            "max_prefill_batch_size cannot be greater",
+        ),
+        (
+            {
+                "max_active_requests": 2,
+                "max_prefill_batch_size": 2,
+                "max_decode_batch_size": 3,
+            },
+            "max_decode_batch_size cannot be greater",
+        ),
+    ],
+)
+def test_batch_engine_config_validation(kwargs: dict, match: str) -> None:
+    config = BatchExecutorConfig(**kwargs)
+    with pytest.raises(ValueError, match=match):
+        BatchInferenceEngine(FakeBatchExecutor(), config)

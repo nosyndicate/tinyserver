@@ -83,7 +83,9 @@ def make_worker(
         max_queue_size=max_queue_size,
         max_active_requests=max_active_requests,
     )
-    return Worker(SimpleInferenceEngine(exec_impl, config), config)
+    return Worker(
+        SimpleInferenceEngine(exec_impl, config), max_queue_size=max_queue_size
+    )
 
 
 @pytest.mark.parametrize(
