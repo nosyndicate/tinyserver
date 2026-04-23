@@ -7,9 +7,9 @@ from server.executor.events import RequestEventEmitter
 from server.executor.types import (
     BaseBatchExecutor,
     BaseExecutor,
-    BatchExecutorConfig,
+    BatchEngineConfig,
     DecodeResult,
-    ExecutorConfig,
+    EngineConfig,
     GenerationRequestState,
     PrefillResult,
     RequestFailure,
@@ -48,7 +48,7 @@ class InferenceEngine(Protocol):
 
 
 class SimpleInferenceEngine:
-    def __init__(self, executor: BaseExecutor, config: ExecutorConfig) -> None:
+    def __init__(self, executor: BaseExecutor, config: EngineConfig) -> None:
         if config.max_active_requests <= 0:
             raise ValueError("max_active_requests must be positive")
         self._executor = executor
@@ -160,9 +160,7 @@ class SimpleInferenceEngine:
 
 
 class BatchInferenceEngine:
-    def __init__(
-        self, executor: BaseBatchExecutor, config: BatchExecutorConfig
-    ) -> None:
+    def __init__(self, executor: BaseBatchExecutor, config: BatchEngineConfig) -> None:
         if config.max_active_requests <= 0:
             raise ValueError("max_active_requests must be positive")
         if config.max_prefill_batch_size <= 0:

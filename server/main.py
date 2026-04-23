@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from server.api.routes import health_router, v1_router, v2_router, v3_router
 from server.executor.engine import BatchInferenceEngine, SimpleInferenceEngine
 from server.executor.executor import BatchExecutor, Executor
-from server.executor.types import BatchExecutorConfig, ExecutorConfig
+from server.executor.types import BatchEngineConfig, EngineConfig
 from server.executor.worker import Worker
 from server.model.hf_runner import ModelConfig, load_hf_model
 
@@ -67,18 +67,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     if version == "v2":
         executor = Executor(runner)
-        executor_config = ExecutorConfig()
+        engine_config = EngineConfig()
         worker = Worker(
-            SimpleInferenceEngine(executor, executor_config),
+            SimpleInferenceEngine(executor, engine_config),
             max_queue_size=64,
         )
         worker.start()
         app.state.worker = worker
     elif version == "v3":
         batch_executor = BatchExecutor(runner)
-        executor_config = BatchExecutorConfig()
+        engine_config = BatchEngineConfig()
         worker = Worker(
-            BatchInferenceEngine(batch_executor, executor_config),
+            BatchInferenceEngine(batch_executor, engine_config),
             max_queue_size=64,
         )
         worker.start()
