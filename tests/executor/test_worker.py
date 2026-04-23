@@ -426,6 +426,8 @@ def test_concurrent_submits_exceeds_queue_size() -> None:
         max_decode_batch_size=5,
     )
 
+    # Fill the queue to capacity before starting the worker so concurrent submits
+    # race against a full queue rather than a racing consumer thread.
     pre_filled = [make_req(f"pre{i}") for i in range(max_queue_size)]
     for req in pre_filled:
         worker.submit(req)
