@@ -362,6 +362,8 @@ def make_batch_worker(
 @pytest.mark.parametrize(
     "kwargs, match",
     [
+        ({"max_queue_size": 0}, "max_queue_size"),
+        ({"max_active_requests": 0}, "max_active_requests"),
         ({"max_prefill_batch_size": 0}, "max_prefill_batch_size"),
         ({"max_decode_batch_size": 0}, "max_decode_batch_size"),
         (
@@ -381,6 +383,147 @@ def make_batch_worker(
 def test_batch_config_validation(kwargs: dict, match: str) -> None:
     with pytest.raises(ValueError, match=match):
         make_batch_worker(**kwargs)
+
+
+def test_batch_start_stop_and_double_start() -> None:
+    worker = make_batch_worker()
+    try:
+        worker.start()
+        first_thread = worker._thread
+        assert first_thread is not None
+        assert first_thread.is_alive()
+        assert first_thread.daemon is True
+        assert first_thread.name == "inference-worker"
+
+        worker.start()
+        assert worker._thread is first_thread
+        assert worker._thread.is_alive()
+    finally:
+        worker.stop()
+
+    assert worker._thread is not None
+    assert not worker._thread.is_alive()
+
+
+def test_batch_worker_restart_after_stop() -> None:
+    worker = make_batch_worker()
+
+    r0 = make_req("r0")
+    worker.start()
+    worker.submit(r0)
+    assert wait_for_status(r0, RequestStatus.DONE)
+    worker.stop()
+    first_thread = worker._thread
+
+    r1 = make_req("r1")
+    worker.start()
+    assert worker._thread is not first_thread
+    worker.submit(r1)
+    assert wait_for_status(r1, RequestStatus.DONE)
+    worker.stop()
+
+
+def test_batch_submit_full_queue_while_worker_is_busy() -> None:
+    decode_gate = threading.Event()
+    decode_entered = threading.Event()
+    worker = make_batch_worker(
+        FakeBatchExecutor(decode_gate=decode_gate, decode_entered=decode_entered),
+        max_queue_size=1,
+        max_active_requests=1,
+        max_prefill_batch_size=1,
+        max_decode_batch_size=1,
+    )
+    try:
+        worker.start()
+        worker.submit(make_req("r0"))
+        assert decode_entered.wait(timeout=2.0)
+        worker.submit(make_req("r1"))
+        with pytest.raises(queue.Full):
+            worker.submit(make_req("r2"))
+    finally:
+        decode_gate.set()
+        worker.stop()
+
+
+def test_batch_request_failure_result_emits_error_event() -> None:
+    worker = make_batch_worker(
+        FakeBatchExecutor(prefill_results={"r0": RequestFailure("prefill failed")}),
+        max_prefill_batch_size=1,
+        max_decode_batch_size=1,
+    )
+    req = make_req("r0")
+    try:
+        worker.start()
+        worker.submit(req)
+        assert wait_for_status(req, RequestStatus.FAILED)
+    finally:
+        worker.stop()
+
+    events = drain_events(req)
+    assert len(events) == 1
+    assert isinstance(events[0], ErrorEvent)
+    assert events[0].error == "prefill failed"
+
+
+def test_batch_fatal_prefill_cancels_inbound_requests() -> None:
+    worker = make_batch_worker(
+        FakeBatchExecutor(prefill_results={"r0": RuntimeError("prefill boom")}),
+        max_queue_size=4,
+        max_active_requests=1,
+        max_prefill_batch_size=1,
+        max_decode_batch_size=1,
+    )
+    r0, r1, r2, r3 = make_req("r0"), make_req("r1"), make_req("r2"), make_req("r3")
+    worker.submit(r0)
+    worker.submit(r1)
+    worker.submit(r2)
+    worker.submit(r3)
+
+    worker.start()
+    _wait_for_worker_to_die(worker)
+    worker.stop()
+
+    _assert_error_event(r0)
+    _assert_error_event(r1)
+    _assert_error_event(r2)
+    _assert_error_event(r3)
+
+
+def test_batch_stop_cancels_active_request_blocked_in_decode() -> None:
+    decode_entered = threading.Event()
+    decode_gate = threading.Event()
+    worker = make_batch_worker(
+        FakeBatchExecutor(
+            decode_results={"r0": [decode_result(done=False)]},
+            decode_gate=decode_gate,
+            decode_entered=decode_entered,
+        ),
+        max_active_requests=1,
+        max_prefill_batch_size=1,
+        max_decode_batch_size=1,
+    )
+    req = make_req("r0")
+    worker.start()
+    worker.submit(req)
+    assert decode_entered.wait(timeout=2.0)
+
+    stop_done = threading.Event()
+    threading.Thread(
+        target=lambda: (worker.stop(), stop_done.set()), daemon=True
+    ).start()
+
+    deadline = now_ns() + 2 * NS_PER_S
+    while not worker._shutdown_event.is_set() and now_ns() < deadline:
+        time.sleep(0.001)
+    assert worker._shutdown_event.is_set()
+    decode_gate.set()
+    assert stop_done.wait(timeout=5.0)
+
+    assert req.status == RequestStatus.FAILED
+    events = drain_events(req)
+    assert len(events) == 2
+    assert isinstance(events[0], TokenEvent)
+    assert isinstance(events[1], ErrorEvent)
 
 
 def test_concurrent_submits_from_multiple_threads() -> None:
