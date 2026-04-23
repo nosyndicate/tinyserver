@@ -49,9 +49,9 @@ def _get_worker(request: Request) -> Worker:
     Retrieve the worker instance from the request's app state.
     """
     worker = request.app.state.worker
-    if worker is not None:
-        return worker
-    raise RuntimeError("Worker not found in app state")
+    if worker is None:
+        raise RuntimeError("Worker not found in app state")
+    return worker
 
 
 def _build_request_state(req: GenerateRequest, device: str) -> GenerationRequestState:
