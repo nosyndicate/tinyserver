@@ -1,7 +1,7 @@
 import logging
 from dataclasses import dataclass
 from queue import Empty, Queue
-from typing import Callable, Protocol
+from typing import Callable, Protocol, runtime_checkable
 
 from server.executor.events import RequestEventEmitter
 from server.executor.types import (
@@ -31,6 +31,7 @@ class EngineCallbacks:
     handle_fatal_error: Callable[[Exception, list[GenerationRequestState] | None], None]
 
 
+@runtime_checkable
 class InferenceEngine(Protocol):
     def run(
         self,
@@ -48,8 +49,6 @@ class InferenceEngine(Protocol):
 
 class SimpleInferenceEngine:
     def __init__(self, executor: BaseExecutor, config: ExecutorConfig) -> None:
-        if config.max_queue_size <= 0:
-            raise ValueError("max_queue_size must be positive")
         if config.max_active_requests <= 0:
             raise ValueError("max_active_requests must be positive")
         self._executor = executor
@@ -164,8 +163,6 @@ class BatchInferenceEngine:
     def __init__(
         self, executor: BaseBatchExecutor, config: BatchExecutorConfig
     ) -> None:
-        if config.max_queue_size <= 0:
-            raise ValueError("max_queue_size must be positive")
         if config.max_active_requests <= 0:
             raise ValueError("max_active_requests must be positive")
         if config.max_prefill_batch_size <= 0:

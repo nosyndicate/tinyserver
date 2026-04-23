@@ -51,9 +51,6 @@ def _get_worker(request: Request) -> Worker:
     worker = request.app.state.worker
     if worker is not None:
         return worker
-    worker = request.app.state.batch_worker
-    if worker is not None:
-        return worker
     raise RuntimeError("Worker not found in app state")
 
 

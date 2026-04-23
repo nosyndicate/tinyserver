@@ -62,28 +62,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.runner = runner
     app.state.device = config.device
     app.state.worker = None
-    app.state.batch_worker = None
 
     version = args.api_version
 
     if version == "v2":
         executor = Executor(runner)
-        config = ExecutorConfig()
+        executor_config = ExecutorConfig()
         worker = Worker(
-            SimpleInferenceEngine(executor, config),
-            max_queue_size=config.max_queue_size,
+            SimpleInferenceEngine(executor, executor_config),
+            max_queue_size=64,
         )
         worker.start()
         app.state.worker = worker
     elif version == "v3":
         batch_executor = BatchExecutor(runner)
-        config = BatchExecutorConfig()
-        batch_worker = Worker(
-            BatchInferenceEngine(batch_executor, config),
-            max_queue_size=config.max_queue_size,
+        executor_config = BatchExecutorConfig()
+        worker = Worker(
+            BatchInferenceEngine(batch_executor, executor_config),
+            max_queue_size=64,
         )
-        batch_worker.start()
-        app.state.batch_worker = batch_worker
+        worker.start()
+        app.state.worker = worker
 
     # App is running now
     yield
@@ -91,8 +90,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Everything after the yield runs on shutdown.
     if app.state.worker is not None:
         app.state.worker.stop()
-    if app.state.batch_worker is not None:
-        app.state.batch_worker.stop()
 
 
 def create_app(cli_args: argparse.Namespace) -> FastAPI:

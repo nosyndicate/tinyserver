@@ -101,15 +101,13 @@ class RequestFailure:
 @dataclass(frozen=True)
 class ExecutorConfig:
     """
-    The configuration for the executor, controls the backpressure.
+    The configuration for the executor, controls concurrency.
 
     Attributes:
-        max_queue_size: The maximum number of requests that can wait in the queue. If the queue is full, new requests will get an HTTP 503 error.
         max_active_requests: The maximum number of requests that the worker can process concurrently.
             If there are already max_active_requests in processing, new requests will wait in the queue until there is an available slot.
     """
 
-    max_queue_size: int = field(default=64)
     max_active_requests: int = field(default=16)
 
 

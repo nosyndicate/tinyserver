@@ -93,13 +93,12 @@ def make_batch_worker(
 ) -> Worker:
     exec_impl = executor or FakeBatchExecutor()
     config = BatchExecutorConfig(
-        max_queue_size=max_queue_size,
         max_active_requests=max_active_requests,
         max_prefill_batch_size=max_prefill_batch_size,
         max_decode_batch_size=max_decode_batch_size,
     )
     return Worker(
-        BatchInferenceEngine(exec_impl, config), max_queue_size=config.max_queue_size
+        BatchInferenceEngine(exec_impl, config), max_queue_size=max_queue_size
     )
 
 

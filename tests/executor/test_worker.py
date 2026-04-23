@@ -80,7 +80,6 @@ def make_worker(
 ) -> Worker:
     exec_impl = executor or FakeExecutor()
     config = ExecutorConfig(
-        max_queue_size=max_queue_size,
         max_active_requests=max_active_requests,
     )
     return Worker(
