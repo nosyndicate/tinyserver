@@ -12,15 +12,26 @@ from server.metrics.timers import now_ns, ns_to_ms
 
 
 class RequestEventEmitter:
+    """Translates executor results into events pushed to each request's output queue.
+
+    The engine calls the ``on_*`` methods as a request progresses through
+    prefill and decode phases.  This class updates the mutable
+    ``GenerationRequestState`` (timestamps, tokens, cache state) and pushes
+    ``TokenEvent``, ``DoneEvent``, or ``ErrorEvent`` instances so that
+    downstream consumers (e.g., the HTTP/SSE layer) can read them.
+    """
+
     def on_prefill_started(
         self, request_state: GenerationRequestState, start_ns: int
     ) -> None:
+        """Record that prefill began and transition the request to PREFILLING."""
         request_state.status = RequestStatus.PREFILLING
         request_state.start_ns = start_ns
 
     def on_prefill_succeeded(
         self, request_state: GenerationRequestState, result: PrefillResult
     ) -> None:
+        """Store prefill outputs and transition the request to DECODING."""
         request_state.all_logits = result.all_logits
         request_state.past_key_values = result.past_key_values
         request_state.num_prompt_tokens = result.num_prompt_tokens
@@ -29,6 +40,12 @@ class RequestEventEmitter:
     def on_token(
         self, request_state: GenerationRequestState, result: DecodeResult
     ) -> None:
+        """Handle a decode result: push a TokenEvent and finish if done.
+
+        On EOS the token text is emitted as an empty string (the model's EOS
+        token itself is not part of the output).  For all other finished
+        reasons (e.g. max length), the final token text is included.
+        """
         is_first = request_state.num_output_tokens == 0
         if is_first:
             request_state.first_token_ns = now_ns()
@@ -66,6 +83,7 @@ class RequestEventEmitter:
         request_state.status = RequestStatus.DECODING
 
     def on_failed(self, request_state: GenerationRequestState, error: str) -> None:
+        """Mark the request as failed and push an ErrorEvent."""
         request_state.status = RequestStatus.FAILED
         request_state.error = error
         request_state.output_queue.put(
@@ -73,6 +91,7 @@ class RequestEventEmitter:
         )
 
     def _finish(self, request_state: GenerationRequestState) -> None:
+        """Compute timing metrics and push a DoneEvent to complete the request."""
         request_state.status = RequestStatus.DONE
         end_ns = now_ns()
 
