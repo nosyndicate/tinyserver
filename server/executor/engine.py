@@ -1,7 +1,7 @@
 import logging
 from dataclasses import dataclass
 from queue import Empty, Queue
-from typing import Callable
+from typing import Callable, Protocol, runtime_checkable
 
 from server.executor.events import RequestEventEmitter
 from server.executor.types import (
@@ -31,8 +31,26 @@ class EngineCallbacks:
     handle_fatal_error: Callable[[Exception, list[GenerationRequestState] | None], None]
 
 
+@runtime_checkable
+class InferenceEngine(Protocol):
+    def run(
+        self,
+        inbound: Queue[GenerationRequestState],
+        control: EngineControl,
+        callbacks: EngineCallbacks,
+    ) -> None: ...
+
+    def cancel_inflight(
+        self,
+        message: str,
+        cancel_request: Callable[[GenerationRequestState, str], None],
+    ) -> None: ...
+
+
 class SimpleInferenceEngine:
     def __init__(self, executor: BaseExecutor, config: ExecutorConfig) -> None:
+        if config.max_active_requests <= 0:
+            raise ValueError("max_active_requests must be positive")
         self._executor = executor
         self._config = config
         self._active: list[GenerationRequestState] = []
@@ -145,6 +163,20 @@ class BatchInferenceEngine:
     def __init__(
         self, executor: BaseBatchExecutor, config: BatchExecutorConfig
     ) -> None:
+        if config.max_active_requests <= 0:
+            raise ValueError("max_active_requests must be positive")
+        if config.max_prefill_batch_size <= 0:
+            raise ValueError("max_prefill_batch_size must be positive")
+        if config.max_decode_batch_size <= 0:
+            raise ValueError("max_decode_batch_size must be positive")
+        if config.max_prefill_batch_size > config.max_active_requests:
+            raise ValueError(
+                "max_prefill_batch_size cannot be greater than max_active_requests"
+            )
+        if config.max_decode_batch_size > config.max_active_requests:
+            raise ValueError(
+                "max_decode_batch_size cannot be greater than max_active_requests"
+            )
         self._executor = executor
         self._config = config
         self._waiting: list[GenerationRequestState] = []

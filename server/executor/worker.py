@@ -1,20 +1,14 @@
 import logging
 import threading
-from abc import ABC, abstractmethod
 from queue import Empty, Queue
 
 from server.executor.engine import (
-    BatchInferenceEngine,
     EngineCallbacks,
     EngineControl,
-    SimpleInferenceEngine,
+    InferenceEngine,
 )
 from server.executor.types import (
-    BaseBatchExecutor,
-    BaseExecutor,
-    BatchExecutorConfig,
     ErrorEvent,
-    ExecutorConfig,
     GenerationRequestState,
     RequestStatus,
 )
@@ -23,13 +17,16 @@ from server.metrics.timers import now_ns
 logger = logging.getLogger(__name__)
 
 
-class Worker(ABC):
-    """Abstract base class for worker implementations that manage the lifecycle of generation requests."""
+class Worker:
+    """Manages the lifecycle of generation requests using an inference engine."""
 
-    def __init__(self, max_queue_size: int) -> None:
+    def __init__(self, engine: InferenceEngine, max_queue_size: int) -> None:
+        if max_queue_size <= 0:
+            raise ValueError("max_queue_size must be positive")
         self._inbound: Queue[GenerationRequestState] = Queue(maxsize=max_queue_size)
         self._shutdown_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._engine = engine
 
     def _cancel_request(
         self, request_state: GenerationRequestState, error_message: str
@@ -43,23 +40,14 @@ class Worker(ABC):
             )
         )
 
-    @abstractmethod
     def _cancel_inflight(self, message: str) -> None:
-        """Cancel all in-flight (active/waiting) requests and clear them."""
-        raise NotImplementedError
+        self._engine.cancel_inflight(message, self._cancel_request)
 
     def _handle_fatal_error(
         self,
         error: Exception,
         extra_requests: list[GenerationRequestState] | None = None,
     ) -> None:
-        """Cancel all active and pending requests after an unrecoverable error.
-
-        Args:
-            error: The exception that caused the fatal error.
-            extra_requests: Any additional requests that are not yet tracked by the
-                worker (e.g. new_requests[i:] when a prefill call raises).
-        """
         logger.exception("Worker thread crashed with unexpected exception: %s", error)
         error_message = f"Worker encountered an unexpected error: {error}"
         for pending in extra_requests or []:
@@ -84,9 +72,18 @@ class Worker(ABC):
                     pending.request_id,
                 )
 
-    @abstractmethod
     def _run_loop(self) -> None:
-        raise NotImplementedError
+        self._engine.run(
+            inbound=self._inbound,
+            control=EngineControl(
+                should_stop=self._shutdown_event.is_set,
+                wait_idle=self._shutdown_event.wait,
+            ),
+            callbacks=EngineCallbacks(
+                cancel_request=self._cancel_request,
+                handle_fatal_error=self._handle_fatal_error,
+            ),
+        )
 
     def start(self) -> None:
         """Create the thread and start the main loop."""
@@ -129,88 +126,3 @@ class Worker(ABC):
 
         request_state.enqueued_ns = now_ns()
         self._inbound.put_nowait(request_state)
-
-
-class SimpleWorker(Worker):
-    """
-    Usage:
-        worker = SimpleWorker(executor, config)
-        worker.start()
-        worker.submit(request_state)
-        ...
-        worker.stop()
-    """
-
-    def __init__(self, executor: BaseExecutor, config: ExecutorConfig) -> None:
-        if config.max_queue_size <= 0:
-            raise ValueError("max_queue_size must be positive")
-        if config.max_active_requests <= 0:
-            raise ValueError("max_active_requests must be positive")
-
-        super().__init__(config.max_queue_size)
-        self._engine = SimpleInferenceEngine(executor, config)
-
-    def _cancel_inflight(self, message: str) -> None:
-        self._engine.cancel_inflight(message, self._cancel_request)
-
-    def _run_loop(self) -> None:
-        self._engine.run(
-            inbound=self._inbound,
-            control=EngineControl(
-                should_stop=self._shutdown_event.is_set,
-                wait_idle=self._shutdown_event.wait,
-            ),
-            callbacks=EngineCallbacks(
-                cancel_request=self._cancel_request,
-                handle_fatal_error=self._handle_fatal_error,
-            ),
-        )
-
-
-class BatchWorker(Worker):
-    """
-    A BatchWorker implementation that batches requests together for more efficient processing.
-    The implementation is similar to SimpleWorker, but it collects new requests into batches before processing.
-    The batch size is determined by the BatchExecutorConfig (e.g., max_prefill_batch_size and max_decode_batch_size).
-    """
-
-    def _check_config(self, config: BatchExecutorConfig) -> None:
-        if config.max_queue_size <= 0:
-            raise ValueError("max_queue_size must be positive")
-        if config.max_active_requests <= 0:
-            raise ValueError("max_active_requests must be positive")
-        if config.max_prefill_batch_size <= 0:
-            raise ValueError("max_prefill_batch_size must be positive")
-        if config.max_decode_batch_size <= 0:
-            raise ValueError("max_decode_batch_size must be positive")
-        if config.max_prefill_batch_size > config.max_active_requests:
-            raise ValueError(
-                "max_prefill_batch_size cannot be greater than max_active_requests"
-            )
-        if config.max_decode_batch_size > config.max_active_requests:
-            raise ValueError(
-                "max_decode_batch_size cannot be greater than max_active_requests"
-            )
-
-    def __init__(
-        self, executor: BaseBatchExecutor, config: BatchExecutorConfig
-    ) -> None:
-        self._check_config(config)
-        super().__init__(config.max_queue_size)
-        self._engine = BatchInferenceEngine(executor, config)
-
-    def _cancel_inflight(self, message: str) -> None:
-        self._engine.cancel_inflight(message, self._cancel_request)
-
-    def _run_loop(self) -> None:
-        self._engine.run(
-            inbound=self._inbound,
-            control=EngineControl(
-                should_stop=self._shutdown_event.is_set,
-                wait_idle=self._shutdown_event.wait,
-            ),
-            callbacks=EngineCallbacks(
-                cancel_request=self._cancel_request,
-                handle_fatal_error=self._handle_fatal_error,
-            ),
-        )

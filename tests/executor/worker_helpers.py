@@ -15,7 +15,7 @@ from server.executor.types import (
     PrefillResult,
     RequestStatus,
 )
-from server.executor.worker import BatchWorker, SimpleWorker
+from server.executor.worker import Worker
 from server.metrics.timers import NS_PER_S, now_ns
 from server.model.sampling import SamplingParams
 
@@ -95,9 +95,7 @@ def decode_result(done: bool = True, token: str = "x") -> DecodeResult:
     )
 
 
-def _wait_for_worker_to_die(
-    worker: SimpleWorker | BatchWorker, timeout: float = 2.0
-) -> None:
+def _wait_for_worker_to_die(worker: Worker, timeout: float = 2.0) -> None:
     assert worker._thread is not None
     worker._thread.join(timeout=timeout)
     assert not worker._thread.is_alive(), "Worker thread did not exit within timeout"
