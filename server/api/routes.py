@@ -235,7 +235,7 @@ def generate_v3(req: GenerateRequest, request: Request) -> GenerateResponse:
         else:
             raise HTTPException(
                 status_code=500,
-                detail="Unexpected event type received from batch worker",
+                detail="Unexpected event type received from worker",
             )
 
 
