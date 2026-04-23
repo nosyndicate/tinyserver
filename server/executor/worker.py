@@ -18,7 +18,34 @@ logger = logging.getLogger(__name__)
 
 
 class Worker:
-    """Manages the lifecycle of generation requests using an inference engine."""
+    """Orchestrates generation requests by bridging a queue and an inference engine.
+
+    Lifecycle:
+        1. **Submission**: Callers invoke ``submit()`` to enqueue a ``GenerationRequestState``
+           into a bounded inbound queue.  The worker records the enqueue timestamp so that
+           queue‑wait latency can be measured later by the engine.
+        2. **Execution**: A daemon thread runs the engine's ``run()`` loop (started via
+           ``start()``).  The engine drains the inbound queue, runs prefill and decode
+           phases on the underlying executor, and emits events back to each request's
+           output queue.
+        3. **Shutdown**: ``stop()`` sets a shutdown event, joins the thread, then drains
+           any remaining queued requests and cancels all in‑flight requests by pushing
+           ``ErrorEvent`` messages to their output queues.
+
+    Error handling:
+        - **Per‑request failures** are reported by the engine via ``cancel_request``,
+          which marks the request as ``FAILED`` and pushes an ``ErrorEvent``.
+        - **Fatal (unrecoverable) errors** are handled by ``_handle_fatal_error``: it
+          logs the exception, cancels any explicitly‑passed requests, cancels all
+          in‑flight requests via the engine, and drains the inbound queue so no request
+          is silently dropped.
+
+    Threading:
+        The worker runs its engine loop in a single daemon thread.  All communication
+        with callers happens through thread‑safe queues (``Queue``), so no explicit
+        locks are needed.  ``submit()`` blocks if the queue is full (raises
+        ``queue.Full``).
+    """
 
     def __init__(self, engine: InferenceEngine, max_queue_size: int) -> None:
         if max_queue_size <= 0:
@@ -31,6 +58,7 @@ class Worker:
     def _cancel_request(
         self, request_state: GenerationRequestState, error_message: str
     ) -> None:
+        """Mark a request as failed and push an ErrorEvent to its output queue."""
         request_state.status = RequestStatus.FAILED
         request_state.error = error_message
         request_state.output_queue.put(
@@ -41,6 +69,7 @@ class Worker:
         )
 
     def _cancel_inflight(self, message: str) -> None:
+        """Ask the engine to cancel all in-flight requests."""
         self._engine.cancel_inflight(message, self._cancel_request)
 
     def _handle_fatal_error(
@@ -48,6 +77,7 @@ class Worker:
         error: Exception,
         extra_requests: list[GenerationRequestState] | None = None,
     ) -> None:
+        """Handle an irrecoverable engine error: cancel everything and drain the queue."""
         logger.exception("Worker thread crashed with unexpected exception: %s", error)
         error_message = f"Worker encountered an unexpected error: {error}"
         for pending in extra_requests or []:
@@ -73,6 +103,7 @@ class Worker:
                 )
 
     def _run_loop(self) -> None:
+        """Thread target: wire up control/callbacks and delegate to the engine."""
         self._engine.run(
             inbound=self._inbound,
             control=EngineControl(
@@ -116,10 +147,11 @@ class Worker:
         self._cancel_inflight("Worker is shutting down, request cancelled")
 
     def submit(self, request_state: GenerationRequestState) -> None:
-        """Submit a new request to the worker.
+        """Enqueue a request for the engine to process.
 
         Raises:
-            queue.Full: If the worker's inbound queue is full, indicating that the worker is overloaded.
+            RuntimeError: If the worker is shutting down.
+            queue.Full: If the inbound queue is at capacity.
         """
         if self._shutdown_event.is_set():
             raise RuntimeError("Cannot submit new request, worker is shutting down")
