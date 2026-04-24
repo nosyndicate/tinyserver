@@ -17,7 +17,7 @@ from server.model.batch_ops import (
     batched_prefill,
 )
 from server.model.determinism import make_generator
-from server.model.sampling import LOWEST_TEMPERATURE, SamplingParams
+from server.model.sampling import LOWEST_TEMPERATURE, SamplingParams, sample_token
 from server.model.types import ModelConfig
 
 
@@ -162,7 +162,7 @@ class ModelRunner:
 
         for _ in range(sampling_params.max_new_tokens):
             # 1. sample the next token ID from the logits
-            next_token_id = self.sample_token(
+            next_token_id = sample_token(
                 last_logits, sampling_params, generator=generator
             )
 

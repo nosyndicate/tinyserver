@@ -1,4 +1,5 @@
 import itertools
+from unittest.mock import patch
 
 import torch
 from transformers import DynamicCache
@@ -29,13 +30,11 @@ class FakeTokenizer:
 class FakeModelRunner:
     def __init__(
         self,
-        sample_tokens: list[int] | None = None,
         prefill_batches: list[list[PrefillBatchOutput]] | None = None,
         decode_batches: list[list[DecodeBatchOutput]] | None = None,
         token_map: dict[int, str] | None = None,
     ) -> None:
         self.tokenizer = FakeTokenizer(token_map)
-        self._sample_tokens = list(sample_tokens or [])
         self._prefill_batches = list(prefill_batches or [])
         self._decode_batches = list(decode_batches or [])
         self.decode_batch_calls: list[tuple[list[int], list[DynamicCache]]] = []
@@ -43,14 +42,6 @@ class FakeModelRunner:
     @property
     def eos_token_id(self) -> int:
         return EOS
-
-    def sample_token(
-        self,
-        logits: torch.Tensor,
-        sampling_params: SamplingParams,
-        generator: torch.Generator | None = None,
-    ) -> int:
-        return self._sample_tokens.pop(0)
 
     def prefill_batch(self, prompts: list[str]) -> list[PrefillBatchOutput]:
         return self._prefill_batches.pop(0)
@@ -186,12 +177,12 @@ def test_batched_decode_returns_token_text_and_updated_model_state() -> None:
     req = make_decode_req("r0")
     decode_output = make_decode_output()
     runner = FakeModelRunner(
-        sample_tokens=[42],
         decode_batches=[[decode_output]],
         token_map={42: "hello"},
     )
 
-    results = BatchExecutor(runner).batched_decode([req])
+    with patch("server.executor.executor.sample_token", return_value=42):
+        results = BatchExecutor(runner).batched_decode([req])
 
     assert len(results) == 1
     result = results[0]
@@ -206,9 +197,10 @@ def test_batched_decode_returns_token_text_and_updated_model_state() -> None:
 
 def test_batched_decode_eos_returns_finished_result_without_decode_batch() -> None:
     req = make_decode_req("r0")
-    runner = FakeModelRunner(sample_tokens=[EOS])
+    runner = FakeModelRunner()
 
-    results = BatchExecutor(runner).batched_decode([req])
+    with patch("server.executor.executor.sample_token", return_value=EOS):
+        results = BatchExecutor(runner).batched_decode([req])
 
     assert len(results) == 1
     result = results[0]
@@ -225,9 +217,10 @@ def test_batched_decode_max_length_returns_finished_result_without_decode_batch(
     None
 ):
     req = make_decode_req("r0", max_new_tokens=1)
-    runner = FakeModelRunner(sample_tokens=[42], token_map={42: "a"})
+    runner = FakeModelRunner(token_map={42: "a"})
 
-    results = BatchExecutor(runner).batched_decode([req])
+    with patch("server.executor.executor.sample_token", return_value=42):
+        results = BatchExecutor(runner).batched_decode([req])
 
     assert len(results) == 1
     result = results[0]
@@ -268,12 +261,12 @@ def test_batched_decode_one_bad_request_does_not_block_valid_requests() -> None:
     good = make_decode_req("good")
     decode_output = make_decode_output()
     runner = FakeModelRunner(
-        sample_tokens=[42],
         decode_batches=[[decode_output]],
         token_map={42: "a"},
     )
 
-    results = BatchExecutor(runner).batched_decode([bad, good])
+    with patch("server.executor.executor.sample_token", return_value=42):
+        results = BatchExecutor(runner).batched_decode([bad, good])
 
     assert isinstance(results[0], RequestFailure)
     assert isinstance(results[1], DecodeResult)
@@ -285,7 +278,7 @@ def test_batched_decode_one_bad_request_does_not_block_valid_requests() -> None:
 def test_batched_decode_decode_batch_exception_fails_unfinished_requests_only() -> None:
     eos = make_decode_req("eos")
     unfinished = make_decode_req("unfinished")
-    runner = FakeModelRunner(sample_tokens=[EOS, 42], token_map={42: "a"})
+    runner = FakeModelRunner(token_map={42: "a"})
 
     def raise_decode(
         token_ids: list[int], past_key_values: list[DynamicCache]
@@ -295,7 +288,8 @@ def test_batched_decode_decode_batch_exception_fails_unfinished_requests_only() 
 
     runner.decode_batch = raise_decode
 
-    results = BatchExecutor(runner).batched_decode([eos, unfinished])
+    with patch("server.executor.executor.sample_token", side_effect=[EOS, 42]):
+        results = BatchExecutor(runner).batched_decode([eos, unfinished])
 
     assert isinstance(results[0], DecodeResult)
     assert results[0].finish_reason == FinishReason.EOS
@@ -308,12 +302,12 @@ def test_batched_decode_output_count_mismatch_fails_unfinished_requests_only() -
     eos = make_decode_req("eos")
     unfinished = make_decode_req("unfinished")
     runner = FakeModelRunner(
-        sample_tokens=[EOS, 42],
         decode_batches=[[]],
         token_map={42: "a"},
     )
 
-    results = BatchExecutor(runner).batched_decode([eos, unfinished])
+    with patch("server.executor.executor.sample_token", side_effect=[EOS, 42]):
+        results = BatchExecutor(runner).batched_decode([eos, unfinished])
 
     assert isinstance(results[0], DecodeResult)
     assert results[0].finish_reason == FinishReason.EOS

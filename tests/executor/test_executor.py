@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 import torch
 from transformers import DynamicCache
 
@@ -49,7 +51,6 @@ class FakeRunner:
     def __init__(self) -> None:
         self.tokenizer = FakeTokenizer()
         self._eos_token_id = EOS
-        self._sample_tokens: list[int] = []
         self._prefill_output = (
             torch.randn(1, 3, VOCAB),
             DynamicCache(),
@@ -67,14 +68,6 @@ class FakeRunner:
         if self.prefill_exception is not None:
             raise self.prefill_exception
         return self._prefill_output
-
-    def sample_token(
-        self,
-        logits: torch.Tensor,
-        sampling_params: SamplingParams,
-        generator: torch.Generator | None = None,
-    ) -> int:
-        return self._sample_tokens.pop(0)
 
 
 def make_req() -> GenerationRequestState:
@@ -117,13 +110,13 @@ def test_prefill_returns_request_failure_when_runner_raises() -> None:
 
 def test_decode_returns_decode_result_with_updated_model_state() -> None:
     runner = FakeRunner()
-    runner._sample_tokens = [42]
     executor = Executor(runner)
     req = make_req()
     req.all_logits = torch.randn(1, 3, VOCAB)
     req.past_key_values = DynamicCache()
 
-    result = executor.decode(req)
+    with patch("server.executor.executor.sample_token", return_value=42):
+        result = executor.decode(req)
 
     assert isinstance(result, DecodeResult)
     assert result.token_id == 42
@@ -150,13 +143,13 @@ def test_decode_returns_request_failure_when_logits_missing() -> None:
 
 def test_decode_returns_eos_without_calling_model() -> None:
     runner = FakeRunner()
-    runner._sample_tokens = [EOS]
     executor = Executor(runner)
     req = make_req()
     req.all_logits = torch.randn(1, 3, VOCAB)
     req.past_key_values = DynamicCache()
 
-    result = executor.decode(req)
+    with patch("server.executor.executor.sample_token", return_value=EOS):
+        result = executor.decode(req)
 
     assert isinstance(result, DecodeResult)
     assert result.token_id == EOS
@@ -169,14 +162,14 @@ def test_decode_returns_eos_without_calling_model() -> None:
 
 def test_decode_returns_max_length_without_calling_model() -> None:
     runner = FakeRunner()
-    runner._sample_tokens = [42]
     executor = Executor(runner)
     req = make_req()
     req.sampling_params = SamplingParams(max_new_tokens=1, temperature=1.0, top_p=1.0)
     req.all_logits = torch.randn(1, 3, VOCAB)
     req.past_key_values = DynamicCache()
 
-    result = executor.decode(req)
+    with patch("server.executor.executor.sample_token", return_value=42):
+        result = executor.decode(req)
 
     assert isinstance(result, DecodeResult)
     assert result.token_id == 42
@@ -189,14 +182,14 @@ def test_decode_returns_max_length_without_calling_model() -> None:
 
 def test_decode_returns_request_failure_when_model_decode_raises() -> None:
     runner = FakeRunner()
-    runner._sample_tokens = [42]
     runner.model.exception = RuntimeError("decode boom")
     executor = Executor(runner)
     req = make_req()
     req.all_logits = torch.randn(1, 3, VOCAB)
     req.past_key_values = DynamicCache()
 
-    result = executor.decode(req)
+    with patch("server.executor.executor.sample_token", return_value=42):
+        result = executor.decode(req)
 
     assert isinstance(result, RequestFailure)
     assert "decode boom" in result.error
