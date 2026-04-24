@@ -13,6 +13,7 @@ from server.executor.types import (
 )
 from server.metrics.timers import now_ns
 from server.model.hf_runner import ModelRunner
+from server.model.sampling import sample_token
 
 T = TypeVar("T")
 
@@ -28,7 +29,7 @@ def _sample(
     request_state: GenerationRequestState,
 ) -> DecodeResult:
     logits = request_state.all_logits[:, -1, :]
-    next_token_id = runner.sample_token(
+    next_token_id = sample_token(
         logits, request_state.sampling_params, request_state.generator
     )
 
