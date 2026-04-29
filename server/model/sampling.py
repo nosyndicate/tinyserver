@@ -2,6 +2,8 @@ from dataclasses import dataclass
 
 import torch
 
+from kernels.top_p_sampling import rejection_sample_round_kernel, softmax_kernel
+
 LOWEST_TEMPERATURE = 1e-5
 
 
@@ -90,3 +92,81 @@ def sample_token(
     probs = torch.softmax(scaled_logits, dim=-1)
     next_token = torch.multinomial(probs, num_samples=1, generator=generator)
     return int(next_token.item())
+
+
+def top_p_sample(
+    logits: torch.Tensor,  # [B, V]
+    top_p: float | torch.Tensor,  # scalar or [B]
+    max_rounds: int = 100,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """
+    Sample from logits using top-p rejection sampling (sorting-free).
+
+    Algorithm outline:
+        1. Convert logits -> probabilities (softmax).
+        2. Set pivot = 0 (all tokens initially valid).
+        3. Run inverse transform sampling over tokens with prob >= pivot.
+        4. After sampling token j, set pivot = prob[j].
+        5. Compute q = sum of probs for tokens with prob >= pivot.
+           - If q < top_p: accept the token (we've narrowed enough).
+           - If q >= top_p: reject and repeat from step 3.
+        6. Repeat until accepted.
+
+    Args:
+        logits: [B, V] raw logits from the model
+        top_p:  nucleus threshold (scalar or per-row tensor)
+        max_rounds: safety cap on rejection rounds
+        temperature: temperature scaling
+
+    Returns:
+        [B] tensor of sampled token indices
+    """
+    B, V = logits.shape
+    device = logits.device
+
+    # Apply temperature
+    if temperature != 1.0:
+        logits = logits / temperature
+
+    # Softmax: logits -> probs
+    probs = torch.empty_like(logits)
+    BLOCK_SIZE = 1024
+    softmax_kernel[(B,)](logits, probs, V, BLOCK_SIZE=BLOCK_SIZE)
+
+    # Prepare per-row state
+    if isinstance(top_p, (int, float)):
+        top_p_tensor = torch.full((B,), top_p, dtype=torch.float32, device=device)
+    else:
+        top_p_tensor = top_p.to(dtype=torch.float32, device=device)
+
+    pivot = torch.zeros(B, dtype=torch.float32, device=device)
+    output = torch.zeros(B, dtype=torch.int32, device=device)
+    accepted = torch.zeros(B, dtype=torch.int32, device=device)
+
+    # RNG seeds — use random initial seeds
+    seeds = torch.randint(0, 2**31, (B,), dtype=torch.int32, device=device)
+
+    # Iteratively launch rounds until all rows are accepted
+    for round_idx in range(max_rounds):
+        rejection_sample_round_kernel[(B,)](
+            probs,
+            pivot,
+            top_p_tensor,
+            output,
+            accepted,
+            seeds,
+            V,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+
+        if accepted.all():
+            break
+
+    # For any rows that didn't converge, fall back to argmax
+    not_accepted = accepted == 0
+    if not_accepted.any():
+        fallback = probs[not_accepted].argmax(dim=-1).to(torch.int32)
+        output[not_accepted] = fallback
+
+    return output.long()
