@@ -2,8 +2,6 @@ from dataclasses import dataclass
 
 import torch
 
-from kernels.top_p_sampling import rejection_sample_round_kernel, softmax_kernel
-
 LOWEST_TEMPERATURE = 1e-5
 
 
@@ -98,7 +96,7 @@ def sample_token(
     if sampling_params.top_p < 1.0:
         # Apply top-p (nucleus) filtering when top_p < 1.0.
         # The fast path (no top-p filtering) is the implicit else case when top_p == 1.0.
-        return top_p_sampling(logits, sampling_params, generator=generator)
+        return top_p_sampling(scaled_logits, sampling_params, generator=generator)
     else:
         return int(
             torch.multinomial(
@@ -137,6 +135,8 @@ def rejection_sampling_based_top_p_sample(
     Returns:
         [B] tensor of sampled token indices
     """
+    from kernels.top_p_sampling import rejection_sample_round_kernel, softmax_kernel
+
     B, V = logits.shape
     device = logits.device
 
