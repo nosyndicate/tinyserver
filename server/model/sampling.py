@@ -33,6 +33,37 @@ def build_sampling_params(
 
 
 @torch.inference_mode()
+def top_p_sampling(
+    logits: torch.Tensor,
+    sampling_params: SamplingParams,
+    generator: torch.Generator | None = None,
+) -> int:
+    # Sort logits descending so we can compute cumulative probability mass.
+    sorted_logits, sorted_indices = torch.sort(logits, dim=-1, descending=True)
+
+    # Convert sorted logits to sorted probabilities.
+    sorted_probs = torch.softmax(sorted_logits, dim=-1)
+    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+    # Remove tokens whose cumulative mass *before this token* already exceeds top_p.
+    remove_mask_sorted = (cumulative_probs - sorted_probs) > sampling_params.top_p
+
+    # Always keep at least one token.
+    remove_mask_sorted[..., 0] = False
+
+    # Scatter the sorted removal mask back to original vocab order.
+    remove_mask = torch.zeros_like(remove_mask_sorted, dtype=torch.bool)
+    remove_mask.scatter_(dim=-1, index=sorted_indices, src=remove_mask_sorted)
+
+    # Mask logits directly.
+    scaled_logits = logits.masked_fill(remove_mask, float("-inf"))
+
+    probs = torch.softmax(scaled_logits, dim=-1)
+    next_token = torch.multinomial(probs, num_samples=1, generator=generator)
+    return int(next_token.item())
+
+
+@torch.inference_mode()
 def sample_token(
     logits: torch.Tensor,
     sampling_params: SamplingParams,
@@ -64,39 +95,22 @@ def sample_token(
         sampling_params.temperature, LOWEST_TEMPERATURE
     )
 
-    # Apply top-p (nucleus) filtering when top_p < 1.0.
-    # The fast path (no top-p filtering) is the implicit else case when top_p == 1.0.
     if sampling_params.top_p < 1.0:
-        # Sort logits descending so we can compute cumulative probability mass.
-        sorted_logits, sorted_indices = torch.sort(
-            scaled_logits, dim=-1, descending=True
+        # Apply top-p (nucleus) filtering when top_p < 1.0.
+        # The fast path (no top-p filtering) is the implicit else case when top_p == 1.0.
+        return top_p_sampling(logits, sampling_params, generator=generator)
+    else:
+        return int(
+            torch.multinomial(
+                torch.softmax(scaled_logits, dim=-1), num_samples=1, generator=generator
+            ).item()
         )
 
-        # Convert sorted logits to sorted probabilities.
-        sorted_probs = torch.softmax(sorted_logits, dim=-1)
-        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
 
-        # Remove tokens whose cumulative mass *before this token* already exceeds top_p.
-        remove_mask_sorted = (cumulative_probs - sorted_probs) > sampling_params.top_p
-
-        # Always keep at least one token.
-        remove_mask_sorted[..., 0] = False
-
-        # Scatter the sorted removal mask back to original vocab order.
-        remove_mask = torch.zeros_like(remove_mask_sorted, dtype=torch.bool)
-        remove_mask.scatter_(dim=-1, index=sorted_indices, src=remove_mask_sorted)
-
-        # Mask logits directly.
-        scaled_logits = scaled_logits.masked_fill(remove_mask, float("-inf"))
-
-    probs = torch.softmax(scaled_logits, dim=-1)
-    next_token = torch.multinomial(probs, num_samples=1, generator=generator)
-    return int(next_token.item())
-
-
-def top_p_sample(
+def rejection_sampling_based_top_p_sample(
     logits: torch.Tensor,  # [B, V]
-    top_p: float | torch.Tensor,  # scalar or [B]
+    top_p: torch.Tensor,  # [B]
+    seeds: torch.Tensor,  # [B]
     max_rounds: int = 100,
     temperature: float = 1.0,
 ) -> torch.Tensor:
@@ -115,7 +129,8 @@ def top_p_sample(
 
     Args:
         logits: [B, V] raw logits from the model
-        top_p:  nucleus threshold (scalar or per-row tensor)
+        top_p:  nucleus threshold (per-row tensor)
+        seeds: RNG seeds (per-row tensor)
         max_rounds: safety cap on rejection rounds
         temperature: temperature scaling
 
@@ -135,18 +150,14 @@ def top_p_sample(
     softmax_kernel[(B,)](logits, probs, V, BLOCK_SIZE=BLOCK_SIZE)
 
     # Prepare per-row state
-    if isinstance(top_p, (int, float)):
-        top_p_tensor = torch.full((B,), top_p, dtype=torch.float32, device=device)
-    else:
-        top_p_tensor = top_p.to(dtype=torch.float32, device=device)
+    top_p_tensor = top_p.to(dtype=torch.float32, device=device)
+    seeds = seeds.to(dtype=torch.int32, device=device)
 
     pivot = torch.zeros(B, dtype=torch.float32, device=device)
     output = torch.zeros(B, dtype=torch.int32, device=device)
     accepted = torch.zeros(B, dtype=torch.int32, device=device)
 
     # RNG seeds — use random initial seeds
-    seeds = torch.randint(0, 2**31, (B,), dtype=torch.int32, device=device)
-
     # Iteratively launch rounds until all rows are accepted
     for round_idx in range(max_rounds):
         rejection_sample_round_kernel[(B,)](
