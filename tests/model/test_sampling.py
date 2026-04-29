@@ -96,7 +96,12 @@ def test_different_seeds_can_produce_different_tokens() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _call(logit_list, top_p_list, seed_list, **kwargs) -> torch.Tensor:
+def _call(
+    logit_list: list[list[float]],
+    top_p_list: list[float],
+    seed_list: list[int],
+    **kwargs,
+) -> torch.Tensor:
     """Construct fresh CUDA tensors and call the function. Re-callable for determinism tests."""
     logits = torch.tensor(logit_list, dtype=torch.float32, device="cuda")
     top_p = torch.tensor(top_p_list, dtype=torch.float32, device="cuda")
