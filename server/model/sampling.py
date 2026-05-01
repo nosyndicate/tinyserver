@@ -166,6 +166,8 @@ def top_p_sample_rejection(
             BLOCK_SIZE=BLOCK_SIZE,
         )
 
+        # This cause CUDA sync per round
+        # TODO consider skip some rounds and only check accepted every N rounds to reduce sync overhead
         if accepted.all():
             break
 

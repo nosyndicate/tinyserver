@@ -2,6 +2,7 @@ import triton
 import triton.language as tl
 
 
+# TODO - using online softmax
 @triton.jit
 def softmax_kernel(
     logits_ptr,  # [B, V]
@@ -46,7 +47,7 @@ def rejection_sample_round_kernel(
     top_p_ptr,  # [B]    — top-p threshold per row
     output_ptr,  # [B]    — sampled token index (written on accept)
     accepted_ptr,  # [B]    — bool flag: 1 if accepted
-    seed_ptr,  # [B]    — per-row RNG seed (updated each round)
+    seed_ptr,  # [B]    — per-row RNG seed
     round_idx: tl.constexpr,  # current round index (for RNG progression)
     V: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -79,6 +80,7 @@ def rejection_sample_round_kernel(
 
     # ---- Step (b): draw u ~ Uniform(0, filtered_sum) ----
     # Use Philox-based RNG via triton
+    # prime multiplier to decorrelate (row, round) pairs into distinct RNG offsets
     rand = tl.rand(seed, row * 1_000_003 + round_idx)  # uniform in [0, 1)
     u = rand * filtered_sum
 
@@ -86,7 +88,7 @@ def rejection_sample_round_kernel(
     # Walk through vocab, accumulating CDF of filtered probs.
     # The token where running CDF first exceeds u is our sample.
     cumsum = 0.0
-    sampled_idx: tl.int32 = 0
+    sampled_idx = tl.zeros([], dtype=tl.int32)
     sampled_prob = 0.0
     found = False
 
