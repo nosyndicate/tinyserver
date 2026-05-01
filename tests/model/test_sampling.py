@@ -138,8 +138,8 @@ def test_rejection_deterministic_with_same_seeds() -> None:
 @requires_cuda
 def test_rejection_different_seeds_produce_different_outputs() -> None:
     # Strictly-decreasing logits give each token a unique probability, so multiple tokens
-    # can satisfy q < top_p (tokens 0-7 each have sum(p_i >= p_j) < 0.9).
-    # B=20 with distinct seeds via tl.rand(seed, row) guarantees RNG diversity.
+    # can satisfy q - sampled_prob < top_p. B=20 with distinct seeds via
+    # tl.rand(seed, row) guarantees RNG diversity.
     B = 20
     row_logits = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.0]
     logits = [row_logits] * B
@@ -152,21 +152,17 @@ def test_rejection_different_seeds_produce_different_outputs() -> None:
 def test_rejection_fallback_to_argmax() -> None:
     """When no row accepts within max_rounds, the host fallback picks each row's argmax.
 
-    Earlier this test used `[[0.0] * 10] * 4` and asserted the result was `0`, which
-    only passed because `torch.argmax` on a uniform tensor returns the first index —
-    accidental, not a real test of the fallback. Here we set two tokens per row to
-    the same (highest) prob, placing the lower of the tied indices at a deliberately
-    distinct, non-zero position per row. The fallback then has to pick that position.
+    Three tied-max tokens per row give equal probability ~1/3 each. Under the
+    acceptance condition q - sampled_prob < top_p: q ≈ 1.0, q - p ≈ 2/3 ≥ top_p=0.5
+    for every sampled token, so the kernel always rejects. With max_rounds=1 the
+    fallback fires and returns argmax, which for tied logits is the lowest tied index.
     """
     V = 16
-    # Each row: two tied "max" tokens (probs ~0.5 each); q = 1.0 ≥ top_p every round
-    # → kernel never accepts → fallback fires. argmax(probs) returns the *lower*
-    # tied index, which we set to a distinct non-zero value per row.
     rows = [
-        ([3, 11], 3),
-        ([5, 14], 5),
-        ([7, 9], 7),
-        ([1, 8], 1),
+        ([3, 7, 11], 3),
+        ([5, 9, 14], 5),
+        ([2, 6, 13], 2),
+        ([0, 8, 12], 0),
     ]
     logits = []
     expected = []
@@ -178,25 +174,22 @@ def test_rejection_fallback_to_argmax() -> None:
         expected.append(expected_argmax)
 
     result = _call(
-        logits, [0.9] * len(rows), list(range(1, len(rows) + 1)), max_rounds=1
+        logits, [0.5] * len(rows), list(range(1, len(rows) + 1)), max_rounds=1
     )
     assert result.tolist() == expected
 
 
 def _strict_top_p_distribution(probs: torch.Tensor, top_p: float) -> torch.Tensor:
-    """CPU sort-based reference for the *strict* top-p convention used by the
-    Triton rejection kernel: token i is in the kept set iff
-    ``sum{p_j : p_j >= p_i} < top_p``. Returns the renormalized distribution
+    """CPU sort-based reference for the top-p convention used by the Triton rejection
+    kernel: token i is in the kept set iff
+    ``sum{p_j : p_j >= p_i} - p_i < top_p``. Returns the renormalized distribution
     restricted to the kept set (zeros elsewhere).
-
-    Note: this is *not* the same as ``server.model.sampling.top_p_sampling``,
-    which keeps one extra token (the first whose cumulative mass crosses top_p).
-    The kernel implements the strict convention by construction.
     """
     sorted_probs, sorted_idx = torch.sort(probs, descending=True)
     cumprobs = torch.cumsum(sorted_probs, dim=-1)
-    keep_sorted = cumprobs < top_p
-    keep_sorted[0] = True  # always keep the most probable token
+    # exclusive cumsum: shifted[k] = sum of the k highest probs (not including position k)
+    shifted = torch.cat([torch.zeros(1), cumprobs[:-1]])
+    keep_sorted = shifted < top_p  # shifted[0] = 0 < top_p always → token 0 always kept
     truncated = torch.zeros_like(probs)
     truncated[sorted_idx[keep_sorted]] = sorted_probs[keep_sorted]
     return truncated / truncated.sum()
@@ -208,21 +201,25 @@ def test_rejection_mixed_top_p_per_row() -> None:
 
     Four rows share the same descending probability profile (0.4, 0.3, 0.2, 0.1)
     but place those probs at *different* vocab positions, with row-specific top_p
-    values that select a different number of tokens via the strict convention:
+    values that select a different number of tokens via q - sampled_prob < top_p:
 
-      - top_p=0.3  → no token satisfies q < top_p → fallback to argmax
-      - top_p=0.5  → only the prob=0.4 token is in S
-      - top_p=0.8  → prob=0.4 and prob=0.3 tokens are in S
-      - top_p=0.95 → prob=0.4, prob=0.3, and prob=0.2 tokens are in S
+      - top_p=0.3  → only the prob=0.4 token is in S (exclusive cumsum at pos 0 = 0 < 0.3)
+      - top_p=0.5  → prob=0.4 and prob=0.3 tokens are in S
+      - top_p=0.8  → prob=0.4, prob=0.3, and prob=0.2 tokens are in S
+      - top_p=0.95 → all four tokens are in S
     """
     import math
 
     rows = [
         # (logits, top_p, expected token set)
         ([math.log(0.4), math.log(0.3), math.log(0.2), math.log(0.1)], 0.3, {0}),
-        ([math.log(0.1), math.log(0.2), math.log(0.3), math.log(0.4)], 0.5, {3}),
-        ([math.log(0.1), math.log(0.4), math.log(0.3), math.log(0.2)], 0.8, {1, 2}),
-        ([math.log(0.2), math.log(0.3), math.log(0.1), math.log(0.4)], 0.95, {3, 1, 0}),
+        ([math.log(0.1), math.log(0.2), math.log(0.3), math.log(0.4)], 0.5, {3, 2}),
+        ([math.log(0.1), math.log(0.4), math.log(0.3), math.log(0.2)], 0.8, {1, 2, 3}),
+        (
+            [math.log(0.2), math.log(0.3), math.log(0.1), math.log(0.4)],
+            0.95,
+            {0, 1, 2, 3},
+        ),
     ]
     logits = [r[0] for r in rows]
     top_p = [r[1] for r in rows]
@@ -245,6 +242,9 @@ def test_rejection_mixed_top_p_per_row() -> None:
     # Rows with multi-token expected sets must actually explore more than one
     # token across {trials} runs, otherwise the per-row top_p value isn't being
     # used (the kernel would have collapsed to one row's top_p for the batch).
+    assert len(seen[1]) > 1, (
+        f"row 1 only sampled {seen[1]}; per-row top_p=0.5 not honored"
+    )
     assert len(seen[2]) > 1, (
         f"row 2 only sampled {seen[2]}; per-row top_p=0.8 not honored"
     )
@@ -338,7 +338,8 @@ def test_rejection_top_p_1_returns_valid_tokens() -> None:
 
 @requires_cuda
 def test_rejection_top_p_near_zero_returns_dominant_token() -> None:
-    # One dominant token per row; with top_p=1e-6 only the argmax can satisfy q < top_p.
+    # One dominant token per row. The dominant token has q - p ≈ 0 < top_p=1e-6;
+    # all other tokens have q - p ≈ 1.0 and are rejected.
     logits = [[-10.0] * 10 for _ in range(3)]
     logits[0][2] = 10.0
     logits[1][7] = 10.0
