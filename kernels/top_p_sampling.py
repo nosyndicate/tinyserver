@@ -157,7 +157,7 @@ def rejection_sample_round_kernel(
         q += tl.sum(tl.where(valid, p, 0.0), axis=0)
 
     # ---- Step (f): accept or reject ----
-    if q < top_p:
+    if q - sampled_prob < top_p:
         # Accept: the filtered set is now within the nucleus
         tl.store(output_ptr + row, sampled_idx)
         tl.store(accepted_ptr + row, 1)
