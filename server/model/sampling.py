@@ -167,6 +167,7 @@ def rejection_sampling_based_top_p_sample(
             output,
             accepted,
             seeds_tensor,
+            round_idx,
             V,
             BLOCK_SIZE=BLOCK_SIZE,
         )

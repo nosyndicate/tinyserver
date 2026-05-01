@@ -47,6 +47,7 @@ def rejection_sample_round_kernel(
     output_ptr,  # [B]    — sampled token index (written on accept)
     accepted_ptr,  # [B]    — bool flag: 1 if accepted
     seed_ptr,  # [B]    — per-row RNG seed (updated each round)
+    round_idx: tl.constexpr,  # current round index (for RNG progression)
     V: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -78,11 +79,8 @@ def rejection_sample_round_kernel(
 
     # ---- Step (b): draw u ~ Uniform(0, filtered_sum) ----
     # Use Philox-based RNG via triton
-    rand = tl.rand(seed, row)  # uniform in [0, 1)
+    rand = tl.rand(seed, row * 1_000_003 + round_idx)  # uniform in [0, 1)
     u = rand * filtered_sum
-
-    # Update seed for next round
-    tl.store(seed_ptr + row, seed + 1000003)  # simple seed progression
 
     # ---- Step (c): inverse transform sampling over filtered tokens ----
     # Walk through vocab, accumulating CDF of filtered probs.
