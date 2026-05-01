@@ -105,12 +105,11 @@ def sample_token(
     )
 
 
-def rejection_sampling_based_top_p_sample(
+def top_p_sample_rejection(
     logits: torch.Tensor,  # [B, V]
     top_p: torch.Tensor,  # [B]
     seeds: torch.Tensor,  # [B]
     max_rounds: int = 100,
-    temperature: float = 1.0,
 ) -> torch.Tensor:
     """
     Sample from logits using top-p rejection sampling (sorting-free).
@@ -130,7 +129,6 @@ def rejection_sampling_based_top_p_sample(
         top_p:  nucleus threshold (per-row tensor)
         seeds: RNG seeds (per-row tensor)
         max_rounds: safety cap on rejection rounds
-        temperature: temperature scaling
 
     Returns:
         [B] tensor of sampled token indices
@@ -139,10 +137,6 @@ def rejection_sampling_based_top_p_sample(
 
     B, V = logits.shape
     device = logits.device
-
-    # Apply temperature
-    if temperature != 1.0:
-        logits = logits / temperature
 
     # Softmax: logits -> probs
     probs = torch.empty(B, V, dtype=torch.float32, device=device)

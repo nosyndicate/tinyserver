@@ -4,8 +4,8 @@ import torch
 from server.model.sampling import (
     LOWEST_TEMPERATURE,
     SamplingParams,
-    rejection_sampling_based_top_p_sample,
     sample_token,
+    top_p_sample_rejection,
 )
 
 requires_cuda = pytest.mark.skipif(
@@ -106,7 +106,7 @@ def _call(
     logits = torch.tensor(logit_list, dtype=torch.float32, device="cuda")
     top_p = torch.tensor(top_p_list, dtype=torch.float32, device="cuda")
     seeds = torch.tensor(seed_list, dtype=torch.int32, device="cuda")
-    return rejection_sampling_based_top_p_sample(logits, top_p, seeds, **kwargs)
+    return top_p_sample_rejection(logits, top_p, seeds, **kwargs)
 
 
 @requires_cuda

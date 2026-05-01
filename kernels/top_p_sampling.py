@@ -122,27 +122,11 @@ def rejection_sample_round_kernel(
             else:
                 cumsum = cumsum + block_sum
 
-    # Fallback: if numerical issues prevent finding a token, pick the max-prob token
+    # If no token was found this round (numerical edge case), bail out and let
+    # the next round retry. Persistent failures are caught by the host-side
+    # argmax fallback after max_rounds.
     if not found:
-        max_p = 0.0
-        for start in range(0, V, BLOCK_SIZE):
-            offs = start + tl.arange(0, BLOCK_SIZE)
-            mask = offs < V
-            p = tl.load(probs_row + offs, mask=mask, other=0.0)
-            block_max = tl.max(p, axis=0)
-            if block_max > max_p:
-                max_p = block_max
-        # Find the index of the max
-        for start in range(0, V, BLOCK_SIZE):
-            offs = start + tl.arange(0, BLOCK_SIZE)
-            mask = offs < V
-            p = tl.load(probs_row + offs, mask=mask, other=0.0)
-            is_max = (p == max_p) & mask
-            candidate = tl.where(is_max, offs, V)
-            idx = tl.min(candidate, axis=0).to(tl.int32)
-            if idx < V:
-                sampled_idx = idx
-                sampled_prob = max_p
+        return
 
     # ---- Step (d) & (e): update pivot and check acceptance ----
     new_pivot = sampled_prob
