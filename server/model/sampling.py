@@ -97,12 +97,12 @@ def sample_token(
         # Apply top-p (nucleus) filtering when top_p < 1.0.
         # The fast path (no top-p filtering) is the implicit else case when top_p == 1.0.
         return top_p_sampling(scaled_logits, sampling_params, generator=generator)
-    else:
-        return int(
-            torch.multinomial(
-                torch.softmax(scaled_logits, dim=-1), num_samples=1, generator=generator
-            ).item()
-        )
+
+    return int(
+        torch.multinomial(
+            torch.softmax(scaled_logits, dim=-1), num_samples=1, generator=generator
+        ).item()
+    )
 
 
 def rejection_sampling_based_top_p_sample(
@@ -145,13 +145,13 @@ def rejection_sampling_based_top_p_sample(
         logits = logits / temperature
 
     # Softmax: logits -> probs
-    probs = torch.empty_like(logits)
+    probs = torch.empty(B, V, dtype=torch.float32, device=device)
     BLOCK_SIZE = 1024
     softmax_kernel[(B,)](logits, probs, V, BLOCK_SIZE=BLOCK_SIZE)
 
     # Prepare per-row state
     top_p_tensor = top_p.to(dtype=torch.float32, device=device)
-    seeds = seeds.to(dtype=torch.int32, device=device)
+    seeds_tensor = seeds.to(dtype=torch.int32, device=device)
 
     pivot = torch.zeros(B, dtype=torch.float32, device=device)
     output = torch.zeros(B, dtype=torch.int32, device=device)
@@ -166,7 +166,7 @@ def rejection_sampling_based_top_p_sample(
             top_p_tensor,
             output,
             accepted,
-            seeds,
+            seeds_tensor,
             V,
             BLOCK_SIZE=BLOCK_SIZE,
         )
