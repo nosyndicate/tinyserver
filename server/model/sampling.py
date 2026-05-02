@@ -144,7 +144,9 @@ def sample_tokens(
         device=logits.device,
         dtype=torch.int64,
     )
-    scaled_logits = logits.float() / torch.clamp(temperatures, min=LOWEST_TEMPERATURE)
+    scaled_logits = logits.float() / torch.clamp(
+        temperatures.unsqueeze(-1), min=LOWEST_TEMPERATURE
+    )
     argmax_tokens = torch.argmax(scaled_logits, dim=-1)
     sampled_tokens = top_p_sample_rejection(scaled_logits, top_ps, seeds)
     use_argmax = temperatures < LOWEST_TEMPERATURE
