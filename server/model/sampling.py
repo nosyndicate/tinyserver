@@ -126,24 +126,21 @@ def sample_tokens(
     temperatures = torch.tensor(
         [s.temperature for s in sampling_params], device=logits.device
     )
-    seeds = torch.tensor(
-        [
-            int(
-                torch.randint(
-                    0,
-                    1 << 31,
-                    (1,),
-                    generator=generators[i],
-                    device=generators[i].device,
-                ).item()
-            )
-            if generators and generators[i] is not None
-            else int(torch.randint(0, 1 << 31, (1,)).item())
-            for i in range(batch_size)
-        ],
-        device=logits.device,
-        dtype=torch.int64,
-    )
+    if generators:
+        parts = []
+        for i in range(batch_size):
+            gen = generators[i]
+            if gen is not None:
+                parts.append(
+                    torch.randint(0, 1 << 31, (1,), generator=gen, device=gen.device)
+                )
+            else:
+                parts.append(torch.randint(0, 1 << 31, (1,), device=logits.device))
+        seeds = torch.cat(parts).to(device=logits.device, dtype=torch.int64)
+    else:
+        seeds = torch.randint(
+            0, 1 << 31, (batch_size,), device=logits.device, dtype=torch.int64
+        )
     scaled_logits = logits.float() / torch.clamp(
         temperatures.unsqueeze(-1), min=LOWEST_TEMPERATURE
     )
