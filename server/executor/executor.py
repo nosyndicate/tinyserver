@@ -59,12 +59,14 @@ def _sample_batch(
 ) -> list[DecodeResult]:
     logits = torch.stack(
         [
-            assert_not_none(request_state.all_logits)[:, -1, :]
+            assert_not_none(request_state.all_logits)[0, -1, :]
             for request_state in request_states
         ]
     )
     next_token_ids = sample_tokens(
-        logits, [request_state.sampling_params for request_state in request_states]
+        logits,
+        [request_state.sampling_params for request_state in request_states],
+        [request_state.generator for request_state in request_states],
     )
 
     results = []
@@ -189,17 +191,36 @@ class BatchExecutor(BaseBatchExecutor):
             request_states
         )
         unfinished_request_states: list[tuple[int, GenerationRequestState, int]] = []
-        try:
-            decode_results = _sample_batch(self._runner, request_states)
-            for i, decode_result in enumerate(decode_results):
-                if decode_result.is_finished:
-                    results[i] = decode_result
-                else:
-                    unfinished_request_states.append(
-                        (i, request_states[i], decode_result.token_id)
-                    )
-        except Exception as e:
-            results = [RequestFailure(error=str(e)) for _ in request_states]
+        valid_indices: list[int] = []
+        valid_states: list[GenerationRequestState] = []
+        for i, request_state in enumerate(request_states):
+            if request_state.all_logits is None:
+                results[i] = RequestFailure(
+                    error="No logits available for decoding step"
+                )
+            elif request_state.past_key_values is None:
+                results[i] = RequestFailure(
+                    error="No past_key_values available for decoding step"
+                )
+            else:
+                valid_indices.append(i)
+                valid_states.append(request_state)
+
+        if valid_states:
+            try:
+                decode_results = _sample_batch(self._runner, valid_states)
+                for j, decode_result in enumerate(decode_results):
+                    i = valid_indices[j]
+                    if decode_result.is_finished:
+                        results[i] = decode_result
+                    else:
+                        results[i] = decode_result
+                        unfinished_request_states.append(
+                            (i, request_states[i], decode_result.token_id)
+                        )
+            except Exception as e:
+                for i in valid_indices:
+                    results[i] = RequestFailure(error=str(e))
 
         if not unfinished_request_states:
             return [assert_not_none(result) for result in results]

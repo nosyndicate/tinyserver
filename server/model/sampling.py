@@ -109,6 +109,7 @@ def sample_token(
 def sample_tokens(
     logits: torch.Tensor,
     sampling_params: list[SamplingParams],
+    generators: list[torch.Generator | None] | None = None,
 ) -> list[int]:
     """Sample token IDs for a batch of logits and corresponding sampling parameters."""
     if logits.ndim != 2:
@@ -127,8 +128,18 @@ def sample_tokens(
     )
     seeds = torch.tensor(
         [
-            s.seed if s.seed is not None else torch.randint(0, 1 << 31, (1,)).item()
-            for s in sampling_params
+            int(
+                torch.randint(
+                    0,
+                    1 << 31,
+                    (1,),
+                    generator=generators[i],
+                    device=generators[i].device,
+                ).item()
+            )
+            if generators and generators[i] is not None
+            else int(torch.randint(0, 1 << 31, (1,)).item())
+            for i in range(batch_size)
         ],
         device=logits.device,
         dtype=torch.int64,
@@ -136,7 +147,6 @@ def sample_tokens(
     scaled_logits = logits.float() / torch.clamp(temperatures, min=LOWEST_TEMPERATURE)
     argmax_tokens = torch.argmax(scaled_logits, dim=-1)
     sampled_tokens = top_p_sample_rejection(scaled_logits, top_ps, seeds)
-    # If temperature is very low
     use_argmax = temperatures < LOWEST_TEMPERATURE
     return torch.where(use_argmax, argmax_tokens, sampled_tokens).tolist()
 
