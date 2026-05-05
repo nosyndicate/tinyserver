@@ -5,6 +5,7 @@ from server.model.sampling import (
     LOWEST_TEMPERATURE,
     SamplingParams,
     sample_token,
+    sample_tokens,
     top_p_sample_rejection,
 )
 
@@ -369,3 +370,42 @@ def test_rejection_batch_size_1() -> None:
     assert result.shape == (1,)
     assert result.dtype == torch.long
     assert result[0] == 2
+
+
+# ---------------------------------------------------------------------------
+# sample_tokens — generator-based RNG
+# ---------------------------------------------------------------------------
+
+
+def _make_cuda_gens(n: int, base_seed: int = 0) -> list[torch.Generator]:
+    return [torch.Generator(device="cuda").manual_seed(base_seed + i) for i in range(n)]
+
+
+@requires_cuda
+def test_sample_tokens_reproducible_with_same_generators() -> None:
+    logits = torch.randn(3, 100, device="cuda")
+    params = [make_params(temperature=1.0, top_p=0.9)] * 3
+
+    result1 = sample_tokens(logits, params, _make_cuda_gens(3, base_seed=0))
+    result2 = sample_tokens(logits, params, _make_cuda_gens(3, base_seed=0))
+    assert result1 == result2
+
+
+@requires_cuda
+def test_sample_tokens_generators_advance_across_decode_steps() -> None:
+    logits = torch.randn(3, 100, device="cuda")
+    params = [make_params(temperature=1.0, top_p=0.9)] * 3
+    generators = _make_cuda_gens(3, base_seed=7)
+
+    result1 = sample_tokens(logits, params, generators)
+    result2 = sample_tokens(logits, params, generators)
+    assert result1 != result2
+
+
+@requires_cuda
+def test_sample_tokens_none_generators_does_not_raise() -> None:
+    logits = torch.randn(2, 50, device="cuda")
+    params = [make_params(temperature=1.0, top_p=0.9)] * 2
+    result = sample_tokens(logits, params, None)
+    assert len(result) == 2
+    assert all(0 <= t < 50 for t in result)
