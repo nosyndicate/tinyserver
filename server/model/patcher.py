@@ -1,3 +1,5 @@
+from typing import Callable
+
 import torch
 import torch.nn.functional as F
 from transformers import (
@@ -11,7 +13,7 @@ from transformers.processing_utils import Unpack
 from server.model.inference_context import get_inference_context
 
 
-def _patch_single_layer(layer: torch.nn.Module, layer_idx: int) -> None:
+def _patch_single_layer(layer: torch.nn.Module, rotary_emb: Callable) -> None:
     """
     Patch the attention forward pass for a single layer of the model.
     For the Qwen3 1.7B model, it is using the full attetion across all layers,
@@ -125,7 +127,7 @@ def _patch_single_layer(layer: torch.nn.Module, layer_idx: int) -> None:
 
         if position_ids is not None:
             # TODO need to figure out why this part works
-            cos, sin = attn_module.rotary_emb(v, position_ids)
+            cos, sin = rotary_emb(v, position_ids)
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         inference_context = get_inference_context()
@@ -246,6 +248,6 @@ def qwen3_model_patcher(model: Qwen3ForCausalLM) -> Qwen3ForCausalLM:
     """
 
     for layer_idx, layer in enumerate(model.model.layers):
-        _patch_single_layer(layer, layer_idx)
+        _patch_single_layer(layer, model.model.rotary_emb)
 
     return model
