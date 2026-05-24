@@ -11,6 +11,7 @@ from transformers import (
 
 from server.executor.types import Sequence
 from server.metrics.logging import log_event
+from server.model.patcher import qwen3_model_patcher
 from server.model.types import ModelBackend, ModelConfig
 
 logger = logging.getLogger(__name__)
@@ -66,8 +67,8 @@ def qwen3_cache_allocator(
         2,
         num_layers,
         num_available_kv_blocks,
-        block_size,
         num_kv_heads,
+        block_size,
         head_dim,
         device=device,
         dtype=dtype,
@@ -76,6 +77,18 @@ def qwen3_cache_allocator(
     for i in range(num_layers):
         model.model.layers[i].self_attn.k_cache = kv_cache[0, i]
         model.model.layers[i].self_attn.v_cache = kv_cache[1, i]
+
+
+def qwen3_model_loader(
+    model: Qwen3ForCausalLM,
+    config: Qwen3Config,
+    memory_utilization: float,
+    block_size: int,
+    dtype: torch.dtype,
+    device: str,
+) -> None:
+    qwen3_cache_allocator(model, config, memory_utilization, block_size, dtype, device)
+    qwen3_model_patcher(model)
 
 
 allocator_by_name = {
