@@ -1,12 +1,12 @@
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Generator
 
 
 @dataclass
 class InferenceContext:
     mode: str = "prefill"
-    sequences: list[dict[str, Any]] = []
+    sequences: list[dict[str, Any]] = field(default_factory=list)
 
 
 _inference_context = InferenceContext()
