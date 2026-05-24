@@ -65,7 +65,6 @@ def _patch_single_layer(layer: torch.nn.Module, layer_idx: int) -> None:
 
     def _page_attention_forward(
         hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
         position_ids: torch.Tensor | None,
         past_key_values: Cache | None = None,
@@ -139,11 +138,23 @@ def _patch_single_layer(layer: torch.nn.Module, layer_idx: int) -> None:
                 num_tokens = seq["num_tokens"]
                 block_table = seq["block_table"]
 
-                k_cache = k[:, :, token_offset : token_offset + num_tokens, :]
-                v_cache = v[:, :, token_offset : token_offset + num_tokens, :]
+                t_s, t_e = token_offset, token_offset + num_tokens
+                k_src = (
+                    k[:, :, t_s:t_e, :].squeeze(0).contiguous()
+                )  # shape (num_key_value_heads, num_tokens, head_dim).
+                v_src = (
+                    v[:, :, t_s:t_e, :].squeeze(0).contiguous()
+                )  # shape (num_key_value_heads, num_tokens, head_dim).
 
-                store_kv_cache(layer_idx, block_table, k_cache, v_cache)
-
+                # Since this is prefill, so the start position is 0
+                store_kv_cache(
+                    0,
+                    block_table,
+                    k_src,
+                    v_src,
+                    attn_module.k_cache,
+                    attn_module.v_cache,
+                )
                 token_offset += num_tokens
 
             # construct the mask for prefill, where tokens from different sequences should not attend to each other.
@@ -165,10 +176,9 @@ def _patch_single_layer(layer: torch.nn.Module, layer_idx: int) -> None:
                     ),
                     diagonal=1,
                 )
-                mask[
-                    block_start : block_start + num_tokens,
-                    block_start : block_start + num_tokens,
-                ] = causal_mask
+
+                b_s, b_e = block_start, block_start + num_tokens
+                mask[b_s:b_e, b_s:b_e] = causal_mask
                 block_start += num_tokens
 
             k_expanded = k.repeat_interleave(num_groups, dim=1)
@@ -188,9 +198,42 @@ def _patch_single_layer(layer: torch.nn.Module, layer_idx: int) -> None:
 
 
 def store_kv_cache(
-    layer_idx: int, block_table: list[int], k_cache: torch.Tensor, v_cache: torch.Tensor
+    start_position: int,
+    block_table: list[int],
+    k_src: torch.Tensor,
+    v_src: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
 ) -> None:
-    raise NotImplementedError()
+    """
+    Scatter freshly computed K/V projections into the paged KV cache.
+
+    For each token i in k_src the absolute sequence position is
+    (start_pos + i).  The function uses block_table to translate that
+    position into a physical cache address and writes k_src[i] / v_src[i]
+    there.
+
+    Args:
+        start_position: The position of the first token in the current sequence.
+        block_table: A list of block indices that this sequence occupies in the kv cache.
+        k_src: The key tensor for the sequence, of shape (num_key_value_heads, seq_len, head_dim).
+        v_src: The value tensor for the sequence, of shape (num_key_value_heads, seq_len, head_dim).
+        k_cache: The key cache tensor for current attention layer with shape (num_blocks, num_key_value_heads, block_size, head_dim).
+        v_cache: The value cache tensor for current attention layer with shape (num_blocks, num_key_value_heads, block_size, head_dim).
+    """
+    block_size = k_cache.shape[2]
+    seq_len = k_src.shape[1]
+
+    # We iterate all the tokens in the sequence and write them to the corresponding position
+    # in the kv cache according to the block table. This is slower than doing it in a block-wise
+    # manner, but it is much simpler and later can be optimized easily using parallel.
+    for i in range(seq_len):
+        abs_pos = start_position + i
+        logical_block_idx = abs_pos // block_size
+        block_idx = block_table[logical_block_idx]
+        pos_in_block = abs_pos % block_size
+        k_cache[block_idx, :, pos_in_block, :] = k_src[:, i, :]
+        v_cache[block_idx, :, pos_in_block, :] = v_src[:, i, :]
 
 
 def qwen3_model_patcher(model: Qwen3ForCausalLM) -> Qwen3ForCausalLM:
