@@ -8,7 +8,7 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
 from transformers.processing_utils import Unpack
 
-from server.model.inference_context import _inference_context
+from server.model.inference_context import get_inference_context
 
 
 def _patch_single_layer(layer: torch.nn.Module, layer_idx: int) -> None:
@@ -128,13 +128,15 @@ def _patch_single_layer(layer: torch.nn.Module, layer_idx: int) -> None:
             cos, sin = attn_module.rotary_emb(v, position_ids)
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        if _inference_context.mode == "prefill":
+        inference_context = get_inference_context()
+
+        if inference_context.mode == "prefill":
             # the order of the sequence in sequences should match
             # the order of the sequence in input_ids and position_ids.
             # we here to make sure the q and k will be correctly stored in the kv cache for each sequence.
 
             token_offset = 0
-            for seq in _inference_context.sequences:
+            for seq in inference_context.sequences:
                 num_tokens = seq["num_tokens"]
                 block_table = seq["block_table"]
 
@@ -165,7 +167,7 @@ def _patch_single_layer(layer: torch.nn.Module, layer_idx: int) -> None:
                 device=hidden_states.device,
             )
             block_start = 0
-            for seq in _inference_context.sequences:
+            for seq in inference_context.sequences:
                 num_tokens = seq["num_tokens"]
                 causal_mask = torch.triu(
                     torch.full(

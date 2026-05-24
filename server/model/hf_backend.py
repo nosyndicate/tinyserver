@@ -91,8 +91,8 @@ def qwen3_model_loader(
     qwen3_model_patcher(model)
 
 
-allocator_by_name = {
-    "Qwen/Qwen3-1.7B": qwen3_cache_allocator,
+loader_by_name = {
+    "Qwen/Qwen3-1.7B": qwen3_model_loader,
 }
 
 
@@ -119,7 +119,7 @@ class HFBackend(ModelBackend):
     @staticmethod
     def load_model(model_config: ModelConfig) -> "HFBackend":
 
-        if model_config.model_name_or_path not in allocator_by_name:
+        if model_config.model_name_or_path not in loader_by_name:
             raise ValueError(f"Unsupported model: {model_config.model_name_or_path}")
 
         log_event(
@@ -145,8 +145,8 @@ class HFBackend(ModelBackend):
         model.eval()
         log_event("model_init_done", model=model_config.model_name_or_path)
 
-        allocator = allocator_by_name[model_config.model_name_or_path]
-        allocator(
+        loader = loader_by_name[model_config.model_name_or_path]
+        loader(
             model,
             config,
             model_config.memory_utilization,

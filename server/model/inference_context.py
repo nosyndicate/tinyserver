@@ -12,6 +12,11 @@ class InferenceContext:
 _inference_context = InferenceContext()
 
 
+def get_inference_context() -> InferenceContext:
+    """Get the current inference context."""
+    return _inference_context
+
+
 @contextmanager
 def inference_context(
     new_context: InferenceContext,
