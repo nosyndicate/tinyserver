@@ -390,12 +390,12 @@ def gather_kv_cache(
     block_size = k_cache.shape[2]
     seq_len = next_position + 1
 
-    k_full = torch.zeros(
+    k_full = torch.empty(
         (k_cache.shape[1], seq_len, k_cache.shape[3]),
         device=k_cache.device,
         dtype=k_cache.dtype,
     )
-    v_full = torch.zeros(
+    v_full = torch.empty(
         (v_cache.shape[1], seq_len, v_cache.shape[3]),
         device=v_cache.device,
         dtype=v_cache.dtype,
