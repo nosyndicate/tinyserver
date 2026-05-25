@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 from transformers import (
     Cache,
+    Qwen3Config,
     Qwen3ForCausalLM,
 )
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
@@ -11,6 +12,50 @@ from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
 from transformers.processing_utils import Unpack
 
 from server.model.inference_context import get_inference_context
+from server.model.utils import bytes_to_gb, get_available_memory
+
+
+def qwen3_cache_allocator(
+    model: Qwen3ForCausalLM,
+    config: Qwen3Config,
+    memory_utilization: float,
+    block_size: int,
+    dtype: torch.dtype,
+    device: str,
+) -> None:
+    available_mem = get_available_memory(memory_utilization)
+
+    num_layers = config.num_hidden_layers
+    num_kv_heads = config.num_key_value_heads
+    head_dim = config.head_dim
+
+    # kv cache dtype should match the model dtype to avoid unnecessary conversions during attention computation
+    dtype_size = torch.tensor([], dtype=dtype).element_size()
+    block_bytes = (
+        2 * num_layers * block_size * num_kv_heads * head_dim * dtype_size
+    )  # 2 for key and value
+    num_available_kv_blocks = int(available_mem // block_bytes)
+
+    if num_available_kv_blocks <= 0:
+        raise MemoryError(
+            f"Not enough memory for even one block of KV cache. Available memory: {bytes_to_gb(available_mem)}, "
+            f"required memory for one block: {bytes_to_gb(block_bytes)}."
+        )
+
+    kv_cache = torch.zeros(
+        2,
+        num_layers,
+        num_available_kv_blocks,
+        num_kv_heads,
+        block_size,
+        head_dim,
+        device=device,
+        dtype=dtype,
+    )
+
+    for i in range(num_layers):
+        model.model.layers[i].self_attn.k_cache = kv_cache[0, i]
+        model.model.layers[i].self_attn.v_cache = kv_cache[1, i]
 
 
 def _patch_single_layer(
@@ -60,8 +105,16 @@ def _patch_single_layer(
         the position ids will be (suppose this is a prefill step):
         [[0, 1, 2, 0, 0, 1]]
 
+        Even in this case, we can still apply the rotary embedding in the same way as the standard input format.
+        In the rotary embedding, the cos, and sin is computed based on the position ids for each token
 
+            freqs = inv_freq @ position_ids
+            emb = concat(freqs, freqs)
+            cos = cos(emb)
+            sin = sin(emb)
 
+        So when the sin and cos is applied to the query and key, it is applied based on the position ids for
+        the token.
     """
 
     attn_module = layer.self_attn
@@ -96,7 +149,7 @@ def _patch_single_layer(
 
         [[  0,  -inf | -inf, -inf, -inf],
          [  0,    0  | -inf, -inf, -inf],
-         [------------+----------------],
+         [-----------+-----------------],
          [-inf, -inf |   0,  -inf, -inf],
          [-inf, -inf |   0,    0,  -inf],
          [-inf, -inf |   0,    0,    0 ]]
@@ -130,10 +183,12 @@ def _patch_single_layer(
         k = k.transpose(1, 2)  # (1, num_key_value_heads, seq_len, head_dim)
         v = v.transpose(1, 2)  # (1, num_key_value_heads, seq_len, head_dim)
 
-        if position_ids is not None:
-            # TODO need to figure out why this part works
-            cos, sin = rotary_emb(v, position_ids)
-            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        if position_ids is None:
+            raise ValueError(
+                "Position ids should not be None for the patched attention forward"
+            )
+        cos, sin = rotary_emb(v, position_ids)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         inference_context = get_inference_context()
 
@@ -264,3 +319,19 @@ def qwen3_model_patcher(model: Qwen3ForCausalLM) -> Qwen3ForCausalLM:
         _patch_single_layer(layer, model.model.rotary_emb)
 
     return model
+
+
+def qwen3_model_loader(
+    model: Qwen3ForCausalLM,
+    config: Qwen3Config,
+    memory_utilization: float,
+    block_size: int,
+    dtype: torch.dtype,
+    device: str,
+) -> None:
+    """
+    Allocate the kv cache for the Qwen3 model and patch the model so the attention module
+    will use the pre-allocated cache for computing attention scores.
+    """
+    qwen3_cache_allocator(model, config, memory_utilization, block_size, dtype, device)
+    qwen3_model_patcher(model)
