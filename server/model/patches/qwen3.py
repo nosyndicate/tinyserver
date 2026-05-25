@@ -259,13 +259,16 @@ def _patch_single_layer(
             )
             output = output.transpose(1, 2).reshape(batch, seq_len, -1)
         else:
-            output = []
+            output_tensors = []
+
+            # TODO this implementation calls the SDPA multiple times, need to replaced with a
+            # a more efficient implementation.
             for i, seq in enumerate(inference_context.sequences):
                 start_position = int(position_ids[0, i].item())
                 block_table = seq["block_table"]
 
-                # Since in decoding, we only need to generate 1 tokens at a time,
-                # the net new k and v for each sequence should only for one token.
+                # Since in decoding, we only need to generate 1 token at a time,
+                # the net new k and v for each sequence should only be for one token.
                 k_src = (
                     k[:, :, i : i + 1, :].squeeze(0).contiguous()
                 )  # shape (num_key_value_heads, num_tokens, head_dim).
@@ -299,17 +302,17 @@ def _patch_single_layer(
                     num_groups, dim=1
                 )  # shape (1, num_attention_heads, seq_len, head_dim)
 
-                # Compute the attention output for the current sequence, since in query, we only have the last sequence
+                # Compute the attention output for the current sequence, since the query has length 1 per sequence,
+                # so causality is trivially satisfied
                 # We actually don't need to mask anything
-
                 output_i = F.scaled_dot_product_attention(
                     q_i, k_full, v_full, attn_mask=None, scale=head_dim**-0.5
                 )  # shape: (1, num_attention_heads, 1, head_dim)
 
-                output.append(output_i)
+                output_tensors.append(output_i)
 
             output = torch.cat(
-                output, dim=2
+                output_tensors, dim=2
             )  # shape (1, num_attention_heads, seq_len, head_dim)
             output = output.transpose(1, 2).reshape(
                 batch, seq_len, -1
