@@ -13,10 +13,15 @@ from transformers.processing_utils import Unpack
 from server.model.inference_context import get_inference_context
 
 
-def _patch_single_layer(layer: torch.nn.Module, rotary_emb: Callable) -> None:
+def _patch_single_layer(
+    layer: torch.nn.Module,
+    rotary_emb: Callable[
+        [torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]
+    ],
+) -> None:
     """
     Patch the attention forward pass for a single layer of the model.
-    For the Qwen3 1.7B model, it is using the full attetion across all layers,
+    For the Qwen3 1.7B model, it is using the full attention across all layers,
     so we don't need to worry about how to patch sliding window attention.
 
     After patching the model, we expected the input to the huggingface model
@@ -31,7 +36,7 @@ def _patch_single_layer(layer: torch.nn.Module, rotary_emb: Callable) -> None:
         The input_ids will be:
         [[101, 102, 103, 201, 301, 302]]
 
-        This is differnet from the standard input format for huggingface models, where the whole
+        This is different from the standard input format for huggingface models, where the whole
         batch will be padded to the same length and the input_ids will be:
         [[101,      102,      103],
          [<pad_id>, <pad_id>, 201]
@@ -150,7 +155,9 @@ def _patch_single_layer(layer: torch.nn.Module, rotary_emb: Callable) -> None:
                     v[:, :, t_s:t_e, :].squeeze(0).contiguous()
                 )  # shape (num_key_value_heads, num_tokens, head_dim).
 
-                # Since this is prefill, so the start position is 0
+                # Since this is prefill, so the start position is hardcode to 0 now
+                # If later we want to implement prefix caching or chunked prefill
+                # we might need to change the start position to the actual position of the token in the sequence.
                 store_kv_cache(
                     0,
                     block_table,
@@ -161,7 +168,9 @@ def _patch_single_layer(layer: torch.nn.Module, rotary_emb: Callable) -> None:
                 )
                 token_offset += num_tokens
 
-            # construct the mask for prefill, where tokens from different sequences should not attend to each other.
+            # Construct the mask for prefill, where tokens from different sequences
+            # should not attend to each other.
+            # TODO this mask is same across all layers, we can compute it once and reuse across layers
             mask = torch.full(
                 (seq_len, seq_len),
                 float("-inf"),
@@ -185,6 +194,8 @@ def _patch_single_layer(layer: torch.nn.Module, rotary_emb: Callable) -> None:
                 mask[b_s:b_e, b_s:b_e] = causal_mask
                 block_start += num_tokens
 
+            # if pytorch >= 2.5, then scaled_dot_product_attention support enable_gpa,
+            # which can avoid we doing the repeat_interleave for k and v
             k_expanded = k.repeat_interleave(num_groups, dim=1)
             v_expanded = v.repeat_interleave(num_groups, dim=1)
             output = F.scaled_dot_product_attention(
@@ -231,6 +242,8 @@ def store_kv_cache(
     # We iterate all the tokens in the sequence and write them to the corresponding position
     # in the kv cache according to the block table. This is slower than doing it in a block-wise
     # manner, but it is much simpler and later can be optimized easily using parallel.
+    # TODO the block id and pos_in_block for each token is compute on the fly,
+    # we probably can pre-compute and store in the context for more efficient writing to the cache.
     for i in range(seq_len):
         abs_pos = start_position + i
         logical_block_idx = abs_pos // block_size
@@ -247,7 +260,7 @@ def qwen3_model_patcher(model: Qwen3ForCausalLM) -> Qwen3ForCausalLM:
     of the usage of dynamic cache and use our custom block manager instead.
     """
 
-    for layer_idx, layer in enumerate(model.model.layers):
+    for layer in model.model.layers:
         _patch_single_layer(layer, model.model.rotary_emb)
 
     return model

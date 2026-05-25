@@ -87,6 +87,10 @@ def qwen3_model_loader(
     dtype: torch.dtype,
     device: str,
 ) -> None:
+    """
+    Allocate the kv cache for the Qwen3 model and patch the model so the attention module
+    will use the pre-allocated cache for computing attention scores.
+    """
     qwen3_cache_allocator(model, config, memory_utilization, block_size, dtype, device)
     qwen3_model_patcher(model)
 
