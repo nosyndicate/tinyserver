@@ -11,6 +11,7 @@ from transformers import (
 
 from server.executor.types import Sequence
 from server.metrics.logging import log_event
+from server.model.patcher import qwen3_model_patcher
 from server.model.types import ModelBackend, ModelConfig
 
 logger = logging.getLogger(__name__)
@@ -66,8 +67,8 @@ def qwen3_cache_allocator(
         2,
         num_layers,
         num_available_kv_blocks,
-        block_size,
         num_kv_heads,
+        block_size,
         head_dim,
         device=device,
         dtype=dtype,
@@ -78,8 +79,24 @@ def qwen3_cache_allocator(
         model.model.layers[i].self_attn.v_cache = kv_cache[1, i]
 
 
-allocator_by_name = {
-    "Qwen/Qwen3-1.7B": qwen3_cache_allocator,
+def qwen3_model_loader(
+    model: Qwen3ForCausalLM,
+    config: Qwen3Config,
+    memory_utilization: float,
+    block_size: int,
+    dtype: torch.dtype,
+    device: str,
+) -> None:
+    """
+    Allocate the kv cache for the Qwen3 model and patch the model so the attention module
+    will use the pre-allocated cache for computing attention scores.
+    """
+    qwen3_cache_allocator(model, config, memory_utilization, block_size, dtype, device)
+    qwen3_model_patcher(model)
+
+
+loader_by_name = {
+    "Qwen/Qwen3-1.7B": qwen3_model_loader,
 }
 
 
@@ -106,7 +123,7 @@ class HFBackend(ModelBackend):
     @staticmethod
     def load_model(model_config: ModelConfig) -> "HFBackend":
 
-        if model_config.model_name_or_path not in allocator_by_name:
+        if model_config.model_name_or_path not in loader_by_name:
             raise ValueError(f"Unsupported model: {model_config.model_name_or_path}")
 
         log_event(
@@ -132,8 +149,8 @@ class HFBackend(ModelBackend):
         model.eval()
         log_event("model_init_done", model=model_config.model_name_or_path)
 
-        allocator = allocator_by_name[model_config.model_name_or_path]
-        allocator(
+        loader = loader_by_name[model_config.model_name_or_path]
+        loader(
             model,
             config,
             model_config.memory_utilization,
