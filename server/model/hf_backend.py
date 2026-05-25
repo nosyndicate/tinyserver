@@ -1,98 +1,17 @@
 import logging
 
-import torch
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
     AutoTokenizer,
-    Qwen3Config,
-    Qwen3ForCausalLM,
 )
 
 from server.executor.types import Sequence
 from server.metrics.logging import log_event
-from server.model.patcher import qwen3_model_patcher
+from server.model.patches.qwen3 import qwen3_model_loader
 from server.model.types import ModelBackend, ModelConfig
 
 logger = logging.getLogger(__name__)
-
-
-def bytes_to_gb(bytes_value: int) -> str:
-    """Converts bytes to gigabytes using the 1024 base."""
-    gb = bytes_value / (1024**3)
-    return f"{gb:.2f} GB"
-
-
-def _get_available_memory(memory_utilization: float) -> float:
-    """Returns the available GPU memory in bytes."""
-    free_mem, total_mem = torch.cuda.mem_get_info()
-    total_free_mem = free_mem * memory_utilization
-    peak_mem_usage = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-    current_mem_usage = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-    # reserve some room for peak memory usage during model execution
-    available_mem = total_free_mem - (peak_mem_usage - current_mem_usage)
-    log_event(f"available_mem: {bytes_to_gb(available_mem)}")
-
-    return available_mem
-
-
-def qwen3_cache_allocator(
-    model: Qwen3ForCausalLM,
-    config: Qwen3Config,
-    memory_utilization: float,
-    block_size: int,
-    dtype: torch.dtype,
-    device: str,
-) -> None:
-    available_mem = _get_available_memory(memory_utilization)
-
-    num_layers = config.num_hidden_layers
-    num_kv_heads = config.num_key_value_heads
-    head_dim = config.head_dim
-
-    # kv cache dtype should match the model dtype to avoid unnecessary conversions during attention computation
-    dtype_size = torch.tensor([], dtype=dtype).element_size()
-    block_bytes = (
-        2 * num_layers * block_size * num_kv_heads * head_dim * dtype_size
-    )  # 2 for key and value
-    num_available_kv_blocks = int(available_mem // block_bytes)
-
-    if num_available_kv_blocks <= 0:
-        raise MemoryError(
-            f"Not enough memory for even one block of KV cache. Available memory: {bytes_to_gb(available_mem)}, "
-            f"required memory for one block: {bytes_to_gb(block_bytes)}."
-        )
-
-    kv_cache = torch.zeros(
-        2,
-        num_layers,
-        num_available_kv_blocks,
-        num_kv_heads,
-        block_size,
-        head_dim,
-        device=device,
-        dtype=dtype,
-    )
-
-    for i in range(num_layers):
-        model.model.layers[i].self_attn.k_cache = kv_cache[0, i]
-        model.model.layers[i].self_attn.v_cache = kv_cache[1, i]
-
-
-def qwen3_model_loader(
-    model: Qwen3ForCausalLM,
-    config: Qwen3Config,
-    memory_utilization: float,
-    block_size: int,
-    dtype: torch.dtype,
-    device: str,
-) -> None:
-    """
-    Allocate the kv cache for the Qwen3 model and patch the model so the attention module
-    will use the pre-allocated cache for computing attention scores.
-    """
-    qwen3_cache_allocator(model, config, memory_utilization, block_size, dtype, device)
-    qwen3_model_patcher(model)
 
 
 loader_by_name = {
