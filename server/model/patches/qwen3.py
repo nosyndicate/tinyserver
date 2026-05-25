@@ -199,6 +199,7 @@ def _patch_single_layer(
 
             token_offset = 0
             for seq in inference_context.sequences:
+                # For prefill, num_tokens for a sequence is the total number of tokens in the prompt
                 num_tokens = seq["num_tokens"]
                 block_table = seq["block_table"]
 
@@ -258,9 +259,64 @@ def _patch_single_layer(
             )
             output = output.transpose(1, 2).reshape(batch, seq_len, -1)
         else:
-            raise NotImplementedError(
-                "Need to implement the attention calculation for decoding step"
-            )
+            output_tensors = []
+
+            # TODO this implementation calls the SDPA multiple times, need to replaced with a
+            # a more efficient implementation.
+            for i, seq in enumerate(inference_context.sequences):
+                start_position = int(position_ids[0, i].item())
+                block_table = seq["block_table"]
+
+                # Since in decoding, we only need to generate 1 token at a time,
+                # the net new k and v for each sequence should only be for one token.
+                k_src = (
+                    k[:, :, i : i + 1, :].squeeze(0).contiguous()
+                )  # shape (num_key_value_heads, num_tokens, head_dim).
+                v_src = (
+                    v[:, :, i : i + 1, :].squeeze(0).contiguous()
+                )  # shape (num_key_value_heads, num_tokens, head_dim).
+                store_kv_cache(
+                    start_position,
+                    block_table,
+                    k_src,
+                    v_src,
+                    attn_module.k_cache,
+                    attn_module.v_cache,
+                )
+
+                # Now, we need to gather the k and v from cache to make them contiguous for the attention calculation.
+                k_full, v_full = gather_kv_cache(
+                    start_position,
+                    block_table,
+                    attn_module.k_cache,
+                    attn_module.v_cache,
+                )
+
+                q_i = q[
+                    :, :, i : i + 1, :
+                ]  # shape (1, num_attention_heads, 1, head_dim)
+                k_full = k_full.unsqueeze(0).repeat_interleave(
+                    num_groups, dim=1
+                )  # shape (1, num_attention_heads, seq_len, head_dim)
+                v_full = v_full.unsqueeze(0).repeat_interleave(
+                    num_groups, dim=1
+                )  # shape (1, num_attention_heads, seq_len, head_dim)
+
+                # Compute the attention output for the current sequence, since the query has length 1 per sequence,
+                # so causality is trivially satisfied
+                # We actually don't need to mask anything
+                output_i = F.scaled_dot_product_attention(
+                    q_i, k_full, v_full, attn_mask=None, scale=head_dim**-0.5
+                )  # shape: (1, num_attention_heads, 1, head_dim)
+
+                output_tensors.append(output_i)
+
+            output = torch.cat(
+                output_tensors, dim=2
+            )  # shape (1, num_attention_heads, seq_len, head_dim)
+            output = output.transpose(1, 2).reshape(
+                batch, seq_len, -1
+            )  # shape (1, seq_len, num_attention_heads * head_dim)
 
         return attn_module.o_proj(output), None
 
@@ -276,7 +332,9 @@ def store_kv_cache(
     v_cache: torch.Tensor,
 ) -> None:
     """
-    Scatter freshly computed K/V projections into the paged KV cache.
+    For one sequence, scatter freshly computed K/V projections into the paged KV cache.
+    The quantity of the kv cache is determined by the number of tokens in the sequence,
+    which can be calculated by looking at the shape of the k_src or v_src.
 
     For each token i in k_src the absolute sequence position is
     (start_pos + i).  The function uses block_table to translate that
@@ -306,6 +364,52 @@ def store_kv_cache(
         pos_in_block = abs_pos % block_size
         k_cache[block_idx, :, pos_in_block, :] = k_src[:, i, :]
         v_cache[block_idx, :, pos_in_block, :] = v_src[:, i, :]
+
+
+def gather_kv_cache(
+    next_position: int,
+    block_table: list[int],
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    For one sequence, gather the K/V from the paged KV cache and make them contiguous for attention calculation.
+    This is the inverse operation of store_kv_cache.
+
+    Args:
+        next_position: The next position to generate for the current sequence, we should gather
+            all the kv from position 0 to next_position (inclusive) from the cache and make them contiguous.
+        block_table: A list of block indices that this sequence occupies in the kv cache.
+        k_cache: The key cache tensor for current attention layer with shape (num_blocks, num_key_value_heads, block_size, head_dim).
+        v_cache: The value cache tensor for current attention layer with shape (num_blocks, num_key_value_heads, block_size, head_dim).
+
+    Returns:
+        k_full: The gathered key tensor for the sequence, of shape (num_key_value_heads, seq_len, head_dim).
+        v_full: The gathered value tensor for the sequence, of shape (num_key_value_heads, seq_len, head_dim).
+    """
+    block_size = k_cache.shape[2]
+    seq_len = next_position + 1
+
+    k_full = torch.empty(
+        (k_cache.shape[1], seq_len, k_cache.shape[3]),
+        device=k_cache.device,
+        dtype=k_cache.dtype,
+    )
+    v_full = torch.empty(
+        (v_cache.shape[1], seq_len, v_cache.shape[3]),
+        device=v_cache.device,
+        dtype=v_cache.dtype,
+    )
+
+    for i in range(seq_len):
+        abs_pos = i
+        logical_block_idx = abs_pos // block_size
+        block_idx = block_table[logical_block_idx]
+        pos_in_block = abs_pos % block_size
+        k_full[:, i, :] = k_cache[block_idx, :, pos_in_block, :]
+        v_full[:, i, :] = v_cache[block_idx, :, pos_in_block, :]
+
+    return k_full, v_full
 
 
 def qwen3_model_patcher(model: Qwen3ForCausalLM) -> Qwen3ForCausalLM:
