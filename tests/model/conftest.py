@@ -169,7 +169,7 @@ requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="paged attention requires a CUDA GPU"
 )
 
-_PAGED_BLOCK_SIZE = 256
+_PAGED_BLOCK_SIZE = 4
 _PAGED_DTYPE = torch.float32
 
 

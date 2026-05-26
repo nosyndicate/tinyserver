@@ -16,16 +16,18 @@ from transformers import PreTrainedModel
 from server.model.inference_context import InferenceContext, inference_context
 
 
-def allocate_block_tables(capacities: list[int], block_size: int) -> list[list[int]]:
+def allocate_block_tables(
+    num_tokens_in_seqs: list[int], block_size: int
+) -> list[list[int]]:
     """Assign each sequence a disjoint run of physical block ids.
 
-    ``capacities[i]`` is the maximum number of tokens sequence ``i`` will ever hold
+    ``num_tokens_in_seqs[i]`` is the maximum number of tokens sequence ``i`` will ever hold
     (prompt + generated), so decode steps never run past the allocated blocks.
     """
     block_tables: list[list[int]] = []
     next_block = 0
-    for cap in capacities:
-        num_blocks = max(1, math.ceil(cap / block_size))
+    for num_tokens in num_tokens_in_seqs:
+        num_blocks = max(1, math.ceil(num_tokens / block_size))
         block_tables.append(list(range(next_block, next_block + num_blocks)))
         next_block += num_blocks
     return block_tables
