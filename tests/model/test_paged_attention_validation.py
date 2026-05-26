@@ -5,6 +5,7 @@ Two levels of checking:
 - exact greedy token-match over a generation loop (single sequence and a batch).
 """
 
+import pytest
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizerFast
 
@@ -17,6 +18,9 @@ from tests.model.paged_helpers import (
     patched_greedy_batch,
     patched_prefill_logits,
 )
+
+pytestmark = pytest.mark.slow
+
 
 _DEVICE = "cuda"
 _PREFILL_ATOL = 1e-4

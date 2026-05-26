@@ -137,18 +137,22 @@ def qwen3_model_and_tokenizer() -> Generator[
 
 
 @pytest.fixture(scope="session")
-def qwen3_model(
-    qwen3_model_and_tokenizer: tuple[PreTrainedModel, PreTrainedTokenizerFast],
-) -> PreTrainedModel:
-    model, _ = qwen3_model_and_tokenizer
-    return model
+def qwen3_model() -> Generator[PreTrainedModel, None, None]:
+    model = AutoModelForCausalLM.from_pretrained(
+        _QWEN3_MODEL_NAME,
+        dtype=torch.float32,
+    )
+    model.eval()
+
+    yield model
+
+    del model
+    gc.collect()
 
 
 @pytest.fixture(scope="session")
-def qwen3_tokenizer(
-    qwen3_model_and_tokenizer: tuple[PreTrainedModel, PreTrainedTokenizerFast],
-) -> PreTrainedTokenizerFast:
-    _, tokenizer = qwen3_model_and_tokenizer
+def qwen3_tokenizer() -> PreTrainedTokenizerFast:
+    tokenizer = AutoTokenizer.from_pretrained(_QWEN3_MODEL_NAME, use_fast=True)
     return tokenizer
 
 
