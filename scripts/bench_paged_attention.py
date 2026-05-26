@@ -603,6 +603,7 @@ def _build_row(
         _format_ratio(patched.decode_tokens_per_s, original.decode_tokens_per_s, True),
         f"{patched.e2e_ms:.2f}",
         f"{original.e2e_ms:.2f}",
+        _format_ratio(patched.e2e_ms, original.e2e_ms, True),
     ]
 
 
@@ -622,6 +623,7 @@ def _build_results_table() -> PrettyTable:
         "decode_tps_ratio",
         "patched_e2e_ms",
         "original_e2e_ms",
+        "e2e_ratio",
     ]
     table.align = "r"
     table.align["prompt_len"] = "l"
