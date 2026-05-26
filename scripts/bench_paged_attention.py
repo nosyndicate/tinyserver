@@ -1,3 +1,12 @@
+"""Benchmark patched paged-attention Qwen3 against the stock HuggingFace model.
+
+Measures prefill latency (ms), prefill throughput (tokens/s), decode throughput
+(tokens/s), and end-to-end latency across four workload scenarios: uniform short
+sequences, ragged serving mixes, block-boundary edge cases, and long-context decode.
+Each scenario runs both implementations under identical inputs so results are directly
+comparable.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -96,6 +105,11 @@ def _sync(device: str) -> None:
 def _median_seconds(
     fn: Callable[[], None], device: str, warmup: int, iters: int
 ) -> float:
+    """Run `warmup` un-timed calls then `iters` timed calls and return the median.
+
+    Device sync before and after each timed call ensures all GPU work has completed
+    before the timestamp is recorded.
+    """
     for _ in range(warmup):
         fn()
     _sync(device)
@@ -117,6 +131,12 @@ def _median_seconds_with_setup(
     warmup: int,
     iters: int,
 ) -> float:
+    """Like `_median_seconds` but calls `setup()` before each timed call.
+
+    The value returned by `setup()` is passed to `fn(state)`, so KV-cache state is
+    freshly initialized each iteration and the setup cost is excluded from the
+    measurement.
+    """
     for _ in range(warmup):
         fn(setup())
     _sync(device)
@@ -133,16 +153,26 @@ def _median_seconds_with_setup(
 
 
 def _stable_seed(seed: int, *parts: object) -> int:
+    """Derive a deterministic seed from a base seed and identifying parts.
+
+    Each (workload, batch) combination gets a reproducible but distinct seed without
+    needing an explicit lookup table.
+    """
     offset = 0
     for part in parts:
         for i, char in enumerate(str(part)):
             offset += (i + 1) * ord(char)
-    return seed + offset % 100_000
+    return (seed + offset) % 100_000
 
 
 def _allocate_block_tables(
     num_tokens_in_seqs: list[int], block_size: int
 ) -> list[list[int]]:
+    """Assign a contiguous run of block IDs to each sequence.
+
+    Block count is `ceil(tokens / block_size)` with a minimum of 1 so sequences
+    shorter than a single block still have space allocated.
+    """
     block_tables: list[list[int]] = []
     next_block = 0
     for num_tokens in num_tokens_in_seqs:
@@ -157,6 +187,12 @@ def _build_prefill_inputs(
     block_tables: list[list[int]],
     device: str,
 ) -> tuple[torch.Tensor, torch.Tensor, InferenceContext]:
+    """Build flattened (unpadded) inputs for the paged-attention prefill path.
+
+    All sequences are concatenated into a single 1-D token stream; position IDs
+    restart from 0 for each sequence. This is the format expected by the patched
+    model's `InferenceContext`.
+    """
     flat_input_ids: list[int] = []
     flat_position_ids: list[int] = []
     sequences = []
@@ -174,6 +210,11 @@ def _build_prefill_inputs(
 def _build_padded_inputs(
     seq_token_lists: list[list[int]], device: str
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build right-padded inputs for the stock HuggingFace model.
+
+    Returns `(input_ids, attention_mask)` with a uniform batch shape; the mask is 0
+    for padding positions.
+    """
     batch = len(seq_token_lists)
     max_len = max(len(seq) for seq in seq_token_lists)
     input_ids = torch.zeros((batch, max_len), dtype=torch.long, device=device)
@@ -193,6 +234,11 @@ def _rand_sequences(
     device: str,
     seed: int,
 ) -> list[list[int]]:
+    """Generate random token-ID sequences of the requested lengths.
+
+    Uses a seeded generator so benchmarks are reproducible; each sequence has the
+    exact requested length with no padding.
+    """
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
     seqs = []
@@ -215,6 +261,11 @@ def _rand_decode_tokens(
     device: str,
     seed: int,
 ) -> list[list[int]]:
+    """Pre-generate all decode step tokens as a list of per-step token vectors.
+
+    Pre-generating avoids perturbing decode timing with token-sampling overhead;
+    each inner list has one token per sequence in the batch.
+    """
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
     tokens = torch.randint(
@@ -387,6 +438,13 @@ def _bench_patched(
     warmup: int,
     iters: int,
 ) -> BenchResult:
+    """Benchmark the paged-attention model and return per-phase metrics.
+
+    Prefill and decode are timed independently (decode uses the setup/fn split so
+    prefill cost is excluded from the decode measurement), then a combined e2e pass
+    is timed. Returns a `BenchResult` with latency (ms) and throughput (tokens/s)
+    for each phase.
+    """
     prompt_tokens = sum(len(seq) for seq in seq_token_lists)
     decode_tokens_count = len(seq_token_lists) * len(decode_tokens)
     block_tables = _allocate_block_tables(
@@ -433,6 +491,10 @@ def _bench_original(
     warmup: int,
     iters: int,
 ) -> BenchResult:
+    """Benchmark the stock HuggingFace model using padded inputs and HF KV-cache.
+
+    Same measurement structure as `_bench_patched` so results are directly comparable.
+    """
     prompt_tokens = sum(len(seq) for seq in seq_token_lists)
     decode_tokens_count = len(seq_token_lists) * len(decode_tokens)
 
@@ -464,24 +526,24 @@ def _bench_original(
     )
 
 
-def _scenario_prompt_lengths(
-    workload: Workload, batch: int, block_size: int
-) -> list[int]:
-    if workload.name == "block_boundary":
-        base = [
-            max(1, block_size - 1),
-            block_size,
-            block_size + 1,
-            2 * block_size + 1,
-        ]
-    else:
-        base = list(workload.prompt_lengths)
+def _scenario_prompt_lengths(workload: Workload, batch: int) -> list[int]:
+    """Cycle through `workload.prompt_lengths` to produce exactly `batch` lengths.
 
+    The base set is repeated and truncated so length variety is distributed evenly
+    across all sequences in the batch.
+    """
+    base = list(workload.prompt_lengths)
     repeats = math.ceil(batch / len(base))
     return (base * repeats)[:batch]
 
 
 def _workloads(block_size: int) -> dict[str, Workload]:
+    """Return the four benchmark workload definitions.
+
+    `block_boundary` prompt lengths are derived from `block_size` at construction time
+    so they straddle block edges — the interesting case for paged-attention correctness
+    and performance.
+    """
     return {
         "uniform_short": Workload("uniform_short", (1, 4, 16), (128,), 32),
         "ragged_serving": Workload(
@@ -498,11 +560,18 @@ def _workloads(block_size: int) -> dict[str, Workload]:
 
 
 def _format_ratio(patched: float, original: float, higher_is_better: bool) -> str:
+    """Format a performance ratio with a consistent "patched speedup" convention.
+
+    Computes `patched / original` for higher-is-better metrics and `original / patched`
+    for lower-is-better metrics so >1.0 always means patched is better and <1.0 always
+    means patched is worse.
+    """
     if original == 0:
         return "n/a"
-    ratio = patched / original
     if higher_is_better:
-        return f"{ratio:6.2f}x"
+        ratio = patched / original
+    else:
+        ratio = original / patched if patched != 0 else float("inf")
     return f"{ratio:6.2f}x"
 
 
@@ -566,6 +635,12 @@ def _load_models(
     memory_utilization: float,
     block_size: int,
 ) -> tuple[PreTrainedModel, PreTrainedModel]:
+    """Load two independent model copies — original and patched — on the same device.
+
+    Both copies use the same dtype so hardware conditions are identical; the patched
+    copy has paged-attention applied via `qwen3_model_loader`. Returns `(patched,
+    original)`.
+    """
     print(f"loading original model: {model_name}")
     original = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype).to(device)
     original.eval()
@@ -590,6 +665,7 @@ def _run_workload(
     original_model: PreTrainedModel,
     args: argparse.Namespace,
 ) -> None:
+    """Run both models for each batch size in the workload and print a comparison table."""
     print(
         f"\n=== {workload.name} | decode_steps={workload.decode_steps} "
         f"| block_size={args.block_size} ==="
@@ -600,7 +676,7 @@ def _run_workload(
         if args.max_batch_size is not None and batch > args.max_batch_size:
             continue
 
-        prompt_lengths = _scenario_prompt_lengths(workload, batch, args.block_size)
+        prompt_lengths = _scenario_prompt_lengths(workload, batch)
         seqs = _rand_sequences(
             patched_model,
             prompt_lengths,
@@ -638,6 +714,7 @@ def _run_workload(
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Parse args, load models once, run selected workload(s), and free GPU memory."""
     parser = _build_parser()
     args = parser.parse_args(argv)
 
