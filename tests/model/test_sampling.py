@@ -7,10 +7,7 @@ from server.model.sampling import (
     sample_token,
     top_p_sample_rejection,
 )
-
-requires_cuda = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="requires CUDA"
-)
+from tests.model.utils import requires_cuda
 
 
 def make_params(

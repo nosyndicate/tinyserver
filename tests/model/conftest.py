@@ -119,34 +119,74 @@ _QWEN3_MODEL_NAME = "Qwen/Qwen3-0.6B"
 
 
 @pytest.fixture(scope="session")
-def qwen3_model_and_tokenizer() -> Generator[
-    tuple[PreTrainedModel, PreTrainedTokenizerFast], None, None
-]:
-    """Load Qwen/Qwen3-0.6B model and tokenizer once per test session."""
-    tokenizer = AutoTokenizer.from_pretrained(_QWEN3_MODEL_NAME, use_fast=True)
+def qwen3_model() -> Generator[PreTrainedModel, None, None]:
     model = AutoModelForCausalLM.from_pretrained(
         _QWEN3_MODEL_NAME,
         dtype=torch.float32,
     )
     model.eval()
 
-    yield model, tokenizer
+    yield model
 
     del model
     gc.collect()
 
 
 @pytest.fixture(scope="session")
-def qwen3_model(
-    qwen3_model_and_tokenizer: tuple[PreTrainedModel, PreTrainedTokenizerFast],
-) -> PreTrainedModel:
-    model, _ = qwen3_model_and_tokenizer
-    return model
+def qwen3_tokenizer() -> PreTrainedTokenizerFast:
+    tokenizer = AutoTokenizer.from_pretrained(_QWEN3_MODEL_NAME, use_fast=True)
+    return tokenizer
+
+
+# ---------------------------------------------------------------------------
+# CUDA fixtures for paged-attention validation / benchmark
+#
+# The patched attention path needs the paged KV cache, which qwen3_cache_allocator
+# sizes from torch.cuda.mem_get_info() -> CUDA only. We load two separate fp32 0.6B
+# instances on CUDA: an unpatched baseline and one with qwen3_model_loader applied
+# (it mutates the model in place, so the baseline must be a distinct instance).
+# ---------------------------------------------------------------------------
+
+
+PAGED_BLOCK_SIZE = 4
+PAGED_DTYPE = torch.float32
 
 
 @pytest.fixture(scope="session")
-def qwen3_tokenizer(
-    qwen3_model_and_tokenizer: tuple[PreTrainedModel, PreTrainedTokenizerFast],
-) -> PreTrainedTokenizerFast:
-    _, tokenizer = qwen3_model_and_tokenizer
-    return tokenizer
+def qwen3_original_cuda() -> Generator[PreTrainedModel, None, None]:
+    """Unpatched Qwen3-0.6B baseline on CUDA in fp32."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    model = AutoModelForCausalLM.from_pretrained(
+        _QWEN3_MODEL_NAME, dtype=PAGED_DTYPE
+    ).to("cuda")
+    model.eval()
+    yield model
+    del model
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+@pytest.fixture(scope="session")
+def qwen3_patched_cuda() -> Generator[PreTrainedModel, None, None]:
+    """Qwen3-0.6B on CUDA with the paged-attention patch + KV cache applied."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    from server.model.patches.qwen3 import qwen3_model_loader
+
+    model = AutoModelForCausalLM.from_pretrained(
+        _QWEN3_MODEL_NAME, dtype=PAGED_DTYPE
+    ).to("cuda")
+    model.eval()
+    qwen3_model_loader(
+        model,
+        model.config,
+        memory_utilization=0.2,
+        block_size=PAGED_BLOCK_SIZE,
+        dtype=PAGED_DTYPE,
+        device="cuda",
+    )
+    yield model
+    del model
+    gc.collect()
+    torch.cuda.empty_cache()
