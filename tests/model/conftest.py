@@ -119,24 +119,6 @@ _QWEN3_MODEL_NAME = "Qwen/Qwen3-0.6B"
 
 
 @pytest.fixture(scope="session")
-def qwen3_model_and_tokenizer() -> Generator[
-    tuple[PreTrainedModel, PreTrainedTokenizerFast], None, None
-]:
-    """Load Qwen/Qwen3-0.6B model and tokenizer once per test session."""
-    tokenizer = AutoTokenizer.from_pretrained(_QWEN3_MODEL_NAME, use_fast=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        _QWEN3_MODEL_NAME,
-        dtype=torch.float32,
-    )
-    model.eval()
-
-    yield model, tokenizer
-
-    del model
-    gc.collect()
-
-
-@pytest.fixture(scope="session")
 def qwen3_model() -> Generator[PreTrainedModel, None, None]:
     model = AutoModelForCausalLM.from_pretrained(
         _QWEN3_MODEL_NAME,
@@ -165,12 +147,9 @@ def qwen3_tokenizer() -> PreTrainedTokenizerFast:
 # (it mutates the model in place, so the baseline must be a distinct instance).
 # ---------------------------------------------------------------------------
 
-requires_cuda = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="paged attention requires a CUDA GPU"
-)
 
-_PAGED_BLOCK_SIZE = 4
-_PAGED_DTYPE = torch.float32
+PAGED_BLOCK_SIZE = 4
+PAGED_DTYPE = torch.float32
 
 
 @pytest.fixture(scope="session")
@@ -179,7 +158,7 @@ def qwen3_original_cuda() -> Generator[PreTrainedModel, None, None]:
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
     model = AutoModelForCausalLM.from_pretrained(
-        _QWEN3_MODEL_NAME, dtype=_PAGED_DTYPE
+        _QWEN3_MODEL_NAME, dtype=PAGED_DTYPE
     ).to("cuda")
     model.eval()
     yield model
@@ -196,15 +175,15 @@ def qwen3_patched_cuda() -> Generator[PreTrainedModel, None, None]:
     from server.model.patches.qwen3 import qwen3_model_loader
 
     model = AutoModelForCausalLM.from_pretrained(
-        _QWEN3_MODEL_NAME, dtype=_PAGED_DTYPE
+        _QWEN3_MODEL_NAME, dtype=PAGED_DTYPE
     ).to("cuda")
     model.eval()
     qwen3_model_loader(
         model,
         model.config,
         memory_utilization=0.2,
-        block_size=_PAGED_BLOCK_SIZE,
-        dtype=_PAGED_DTYPE,
+        block_size=PAGED_BLOCK_SIZE,
+        dtype=PAGED_DTYPE,
         device="cuda",
     )
     yield model

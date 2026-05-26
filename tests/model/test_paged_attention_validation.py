@@ -9,7 +9,7 @@ import pytest
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizerFast
 
-from tests.model.conftest import _PAGED_BLOCK_SIZE, requires_cuda
+from tests.model.conftest import PAGED_BLOCK_SIZE
 from tests.model.paged_helpers import (
     allocate_block_tables,
     original_greedy_single,
@@ -18,6 +18,7 @@ from tests.model.paged_helpers import (
     patched_greedy_batch,
     patched_prefill_logits,
 )
+from tests.model.utils import requires_cuda
 
 pytestmark = pytest.mark.slow
 
@@ -40,7 +41,7 @@ def test_prefill_single_seq_matches_original(
     qwen3_tokenizer: PreTrainedTokenizerFast,
 ) -> None:
     ids = _encode(qwen3_tokenizer, "The capital of France is")
-    block_tables = allocate_block_tables([len(ids)], _PAGED_BLOCK_SIZE)
+    block_tables = allocate_block_tables([len(ids)], PAGED_BLOCK_SIZE)
 
     patched = patched_prefill_logits(qwen3_patched_cuda, [ids], block_tables, _DEVICE)[
         0
@@ -64,7 +65,7 @@ def test_prefill_multi_seq_matches_original(
     ]
     seq_ids = [_encode(qwen3_tokenizer, p) for p in prompts]
     block_tables = allocate_block_tables(
-        [len(ids) for ids in seq_ids], _PAGED_BLOCK_SIZE
+        [len(ids) for ids in seq_ids], PAGED_BLOCK_SIZE
     )
 
     patched = patched_prefill_logits(qwen3_patched_cuda, seq_ids, block_tables, _DEVICE)
@@ -88,7 +89,7 @@ def test_decode_steps_match_original(
     num_decode_steps = 4
     ids = _encode(qwen3_tokenizer, "The capital of France is")
     block_tables = allocate_block_tables(
-        [len(ids) + num_decode_steps], _PAGED_BLOCK_SIZE
+        [len(ids) + num_decode_steps], PAGED_BLOCK_SIZE
     )
 
     # Prefill, then greedily take the first token from the patched model.
@@ -117,7 +118,7 @@ def test_greedy_generation_single_token_match(
 ) -> None:
     max_new_tokens = 20
     ids = _encode(qwen3_tokenizer, "The capital of France is")
-    block_tables = allocate_block_tables([len(ids) + max_new_tokens], _PAGED_BLOCK_SIZE)
+    block_tables = allocate_block_tables([len(ids) + max_new_tokens], PAGED_BLOCK_SIZE)
 
     patched = patched_greedy_batch(
         qwen3_patched_cuda, [ids], max_new_tokens, block_tables, _DEVICE
@@ -141,7 +142,7 @@ def test_greedy_generation_batch_token_match(
     ]
     seq_ids = [_encode(qwen3_tokenizer, p) for p in prompts]
     block_tables = allocate_block_tables(
-        [len(ids) + max_new_tokens for ids in seq_ids], _PAGED_BLOCK_SIZE
+        [len(ids) + max_new_tokens for ids in seq_ids], PAGED_BLOCK_SIZE
     )
 
     patched = patched_greedy_batch(
