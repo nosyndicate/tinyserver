@@ -150,3 +150,60 @@ def qwen3_tokenizer(
 ) -> PreTrainedTokenizerFast:
     _, tokenizer = qwen3_model_and_tokenizer
     return tokenizer
+
+
+# ---------------------------------------------------------------------------
+# CUDA fixtures for paged-attention validation / benchmark
+#
+# The patched attention path needs the paged KV cache, which qwen3_cache_allocator
+# sizes from torch.cuda.mem_get_info() -> CUDA only. We load two separate fp32 0.6B
+# instances on CUDA: an unpatched baseline and one with qwen3_model_loader applied
+# (it mutates the model in place, so the baseline must be a distinct instance).
+# ---------------------------------------------------------------------------
+
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="paged attention requires a CUDA GPU"
+)
+
+_PAGED_BLOCK_SIZE = 256
+_PAGED_DTYPE = torch.float32
+
+
+@pytest.fixture(scope="session")
+def qwen3_original_cuda() -> Generator[PreTrainedModel, None, None]:
+    """Unpatched Qwen3-0.6B baseline on CUDA in fp32."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    model = AutoModelForCausalLM.from_pretrained(
+        _QWEN3_MODEL_NAME, dtype=_PAGED_DTYPE
+    ).to("cuda")
+    model.eval()
+    yield model
+    del model
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+@pytest.fixture(scope="session")
+def qwen3_patched_cuda() -> Generator[PreTrainedModel, None, None]:
+    """Qwen3-0.6B on CUDA with the paged-attention patch + KV cache applied."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    from server.model.patches.qwen3 import qwen3_model_loader
+
+    model = AutoModelForCausalLM.from_pretrained(
+        _QWEN3_MODEL_NAME, dtype=_PAGED_DTYPE
+    ).to("cuda")
+    model.eval()
+    qwen3_model_loader(
+        model,
+        model.config,
+        memory_utilization=0.2,
+        block_size=_PAGED_BLOCK_SIZE,
+        dtype=_PAGED_DTYPE,
+        device="cuda",
+    )
+    yield model
+    del model
+    gc.collect()
+    torch.cuda.empty_cache()
