@@ -125,6 +125,7 @@ def _patch_single_layer(
 
     def _page_attention_forward(
         hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
         position_ids: torch.Tensor | None,
         past_key_values: Cache | None = None,
@@ -183,11 +184,23 @@ def _patch_single_layer(
         k = k.transpose(1, 2)  # (1, num_key_value_heads, seq_len, head_dim)
         v = v.transpose(1, 2)  # (1, num_key_value_heads, seq_len, head_dim)
 
-        if position_ids is None:
-            raise ValueError(
-                "Position ids should not be None for the patched attention forward"
-            )
-        cos, sin = rotary_emb(v, position_ids)
+        # if position_ids is None:
+        #     raise ValueError(
+        #         "Position ids should not be None for the patched attention forward"
+        #     )
+        # cos, sin = rotary_emb(v, position_ids)
+        # q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+        else:
+            # fallback if this patched module is ever called outside normal Qwen3Model.forward
+            if position_ids is None:
+                raise ValueError(
+                    "Position ids should not be None for the patched attention forward"
+                )
+            cos, sin = rotary_emb(v, position_ids)
+
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         inference_context = get_inference_context()
@@ -252,10 +265,15 @@ def _patch_single_layer(
 
             # if pytorch >= 2.5, then scaled_dot_product_attention support enable_gpa,
             # which can avoid we doing the repeat_interleave for k and v
-            k_expanded = k.repeat_interleave(num_groups, dim=1)
-            v_expanded = v.repeat_interleave(num_groups, dim=1)
+            # k_expanded = k.repeat_interleave(num_groups, dim=1)
+            # v_expanded = v.repeat_interleave(num_groups, dim=1)
             output = F.scaled_dot_product_attention(
-                q, k_expanded, v_expanded, attn_mask=mask, scale=head_dim**-0.5
+                q,
+                k,
+                v,
+                attn_mask=mask,
+                scale=head_dim**-0.5,
+                enable_gqa=True,
             )
             output = output.transpose(1, 2).reshape(batch, seq_len, -1)
         else:
