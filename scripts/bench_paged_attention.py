@@ -169,27 +169,6 @@ def _stable_seed(seed: int, *parts: object) -> int:
     )
 
 
-def _build_padded_inputs(
-    seq_token_lists: list[list[int]], device: str
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build right-padded inputs for the stock HuggingFace model.
-
-    Returns `(input_ids, attention_mask)` with a uniform batch shape; the mask is 0
-    for padding positions.
-    """
-    batch = len(seq_token_lists)
-    max_len = max(len(seq) for seq in seq_token_lists)
-    input_ids = torch.zeros((batch, max_len), dtype=torch.long, device=device)
-    attention_mask = torch.zeros((batch, max_len), dtype=torch.long, device=device)
-
-    for i, seq in enumerate(seq_token_lists):
-        seq_tensor = torch.tensor(seq, dtype=torch.long, device=device)
-        input_ids[i, : len(seq)] = seq_tensor
-        attention_mask[i, : len(seq)] = 1
-
-    return input_ids, attention_mask
-
-
 def _rand_sequences(
     model: PreTrainedModel,
     prompt_lengths: list[int],
@@ -276,8 +255,10 @@ def _original_prefill(
     seq_token_lists: list[list[int]],
     device: str,
 ) -> None:
-    input_ids, attention_mask = _build_padded_inputs(seq_token_lists, device)
-    model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+    """Prefill each sequence on its own (batch=1, no padding); sum is wall-clock."""
+    for seq in seq_token_lists:
+        input_ids = torch.tensor([seq], dtype=torch.long, device=device)
+        model(input_ids=input_ids, use_cache=False)
 
 
 @torch.no_grad()
@@ -287,31 +268,14 @@ def _original_decode_loop(
     decode_tokens: list[list[int]],
     device: str,
 ) -> None:
-    input_ids, attention_mask = _build_padded_inputs(seq_token_lists, device)
-    out = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=True)
-    past = out.past_key_values
-
-    full_attention_mask = attention_mask
-    for next_tokens in decode_tokens:
-        nxt = torch.tensor(next_tokens, dtype=torch.long, device=device).unsqueeze(1)
-        full_attention_mask = torch.cat(
-            [
-                full_attention_mask,
-                torch.ones(
-                    (len(seq_token_lists), 1),
-                    dtype=full_attention_mask.dtype,
-                    device=device,
-                ),
-            ],
-            dim=1,
-        )
-        out = model(
-            input_ids=nxt,
-            attention_mask=full_attention_mask,
-            past_key_values=past,
-            use_cache=True,
-        )
+    for i, seq in enumerate(seq_token_lists):
+        input_ids = torch.tensor([seq], dtype=torch.long, device=device)
+        out = model(input_ids=input_ids, use_cache=True)
         past = out.past_key_values
+        for next_tokens in decode_tokens:
+            nxt = torch.tensor([[next_tokens[i]]], dtype=torch.long, device=device)
+            out = model(input_ids=nxt, past_key_values=past, use_cache=True)
+            past = out.past_key_values
 
 
 @torch.no_grad()
@@ -319,40 +283,28 @@ def _original_decode_setup(
     model: PreTrainedModel,
     seq_token_lists: list[list[int]],
     device: str,
-) -> tuple[object, torch.Tensor]:
-    input_ids, attention_mask = _build_padded_inputs(seq_token_lists, device)
-    out = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=True)
-    return out.past_key_values, attention_mask
+) -> list[object]:
+    """Build one HF KV-cache per sequence via batch=1 prefills."""
+    states: list[object] = []
+    for seq in seq_token_lists:
+        input_ids = torch.tensor([seq], dtype=torch.long, device=device)
+        out = model(input_ids=input_ids, use_cache=True)
+        states.append(out.past_key_values)
+    return states
 
 
 @torch.no_grad()
 def _original_decode_cached(
     model: PreTrainedModel,
     decode_tokens: list[list[int]],
-    state: tuple[object, torch.Tensor],
+    states: list[object],
     device: str,
 ) -> None:
-    past, full_attention_mask = state
-    for next_tokens in decode_tokens:
-        nxt = torch.tensor(next_tokens, dtype=torch.long, device=device).unsqueeze(1)
-        full_attention_mask = torch.cat(
-            [
-                full_attention_mask,
-                torch.ones(
-                    (len(next_tokens), 1),
-                    dtype=full_attention_mask.dtype,
-                    device=device,
-                ),
-            ],
-            dim=1,
-        )
-        out = model(
-            input_ids=nxt,
-            attention_mask=full_attention_mask,
-            past_key_values=past,
-            use_cache=True,
-        )
-        past = out.past_key_values
+    for i, past in enumerate(states):
+        for next_tokens in decode_tokens:
+            nxt = torch.tensor([[next_tokens[i]]], dtype=torch.long, device=device)
+            out = model(input_ids=nxt, past_key_values=past, use_cache=True)
+            past = out.past_key_values
 
 
 def _patched_decode_loop(
@@ -453,9 +405,11 @@ def _bench_original(
     warmup: int,
     iters: int,
 ) -> BenchResult:
-    """Benchmark the stock HuggingFace model using padded inputs and HF KV-cache.
+    """Benchmark the stock HuggingFace model one sequence at a time (no padding).
 
-    Same measurement structure as `_bench_patched` so results are directly comparable.
+    Each sequence is prefilled/decoded unbatched so HF wastes no compute on padding;
+    the timed wall-clock is the sum of per-sequence latencies. Same measurement
+    structure as `_bench_patched` so results are directly comparable.
     """
     prompt_tokens = sum(len(seq) for seq in seq_token_lists)
     decode_tokens_count = len(seq_token_lists) * len(decode_tokens)
