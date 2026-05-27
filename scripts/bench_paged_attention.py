@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import math
 import statistics
 import time
@@ -159,11 +160,7 @@ def _stable_seed(seed: int, *parts: object) -> int:
     Each (workload, batch) combination gets a reproducible but distinct seed without
     needing an explicit lookup table.
     """
-    offset = 0
-    for part in parts:
-        for i, char in enumerate(str(part)):
-            offset += (i + 1) * ord(char)
-    return (seed + offset) % 100_000
+    return hashlib.blake2b(repr(parts).encode(), digest_size=8).intdigest() % 100_000
 
 
 def _build_padded_inputs(
@@ -525,12 +522,14 @@ def _format_ratio(patched: float, original: float, higher_is_better: bool) -> st
     for lower-is-better metrics so >1.0 always means patched is better and <1.0 always
     means patched is worse.
     """
-    if original == 0:
-        return "n/a"
     if higher_is_better:
+        if original == 0:
+            return "n/a"
         ratio = patched / original
     else:
-        ratio = original / patched if patched != 0 else float("inf")
+        if patched == 0:
+            return "n/a"
+        ratio = original / patched
     return f"{ratio:6.2f}x"
 
 
