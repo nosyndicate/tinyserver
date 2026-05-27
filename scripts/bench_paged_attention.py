@@ -160,7 +160,12 @@ def _stable_seed(seed: int, *parts: object) -> int:
     Each (workload, batch) combination gets a reproducible but distinct seed without
     needing an explicit lookup table.
     """
-    return hashlib.blake2b(repr(parts).encode(), digest_size=8).intdigest() % 100_000
+    return (
+        int.from_bytes(
+            hashlib.blake2b(repr(parts).encode(), digest_size=8).digest(), "big"
+        )
+        % 100_000
+    )
 
 
 def _build_padded_inputs(
