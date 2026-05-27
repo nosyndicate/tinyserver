@@ -162,7 +162,8 @@ def _stable_seed(seed: int, *parts: object) -> int:
     """
     return (
         int.from_bytes(
-            hashlib.blake2b(repr(parts).encode(), digest_size=8).digest(), "big"
+            hashlib.blake2b(repr((seed,) + parts).encode(), digest_size=8).digest(),
+            "big",
         )
         % 100_000
     )
