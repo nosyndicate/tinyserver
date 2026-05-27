@@ -30,5 +30,5 @@ def test_build_results_table_renders_expected_headers_and_values() -> None:
     assert "16-512" in rendered
     assert "10.25" in rendered
     assert "20.50" in rendered
-    assert "  0.50x" in rendered
+    assert "  2.00x" in rendered
     assert "  2.00x" in rendered

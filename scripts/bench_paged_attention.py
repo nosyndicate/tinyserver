@@ -24,6 +24,7 @@ from transformers import AutoModelForCausalLM, PreTrainedModel
 
 from server.model.inference_context import InferenceContext, inference_context
 from server.model.patches.qwen3 import qwen3_model_loader
+from tests.model.paged_helpers import allocate_block_tables, build_prefill_inputs
 
 DEFAULT_MODEL_NAME = "Qwen/Qwen3-0.6B"
 DEFAULT_DEVICE = "cuda"
@@ -165,48 +166,6 @@ def _stable_seed(seed: int, *parts: object) -> int:
     return (seed + offset) % 100_000
 
 
-def _allocate_block_tables(
-    num_tokens_in_seqs: list[int], block_size: int
-) -> list[list[int]]:
-    """Assign a contiguous run of block IDs to each sequence.
-
-    Block count is `ceil(tokens / block_size)` with a minimum of 1 so sequences
-    shorter than a single block still have space allocated.
-    """
-    block_tables: list[list[int]] = []
-    next_block = 0
-    for num_tokens in num_tokens_in_seqs:
-        num_blocks = max(1, math.ceil(num_tokens / block_size))
-        block_tables.append(list(range(next_block, next_block + num_blocks)))
-        next_block += num_blocks
-    return block_tables
-
-
-def _build_prefill_inputs(
-    seq_token_lists: list[list[int]],
-    block_tables: list[list[int]],
-    device: str,
-) -> tuple[torch.Tensor, torch.Tensor, InferenceContext]:
-    """Build flattened (unpadded) inputs for the paged-attention prefill path.
-
-    All sequences are concatenated into a single 1-D token stream; position IDs
-    restart from 0 for each sequence. This is the format expected by the patched
-    model's `InferenceContext`.
-    """
-    flat_input_ids: list[int] = []
-    flat_position_ids: list[int] = []
-    sequences = []
-    for toks, block_table in zip(seq_token_lists, block_tables):
-        flat_input_ids.extend(toks)
-        flat_position_ids.extend(range(len(toks)))
-        sequences.append({"num_tokens": len(toks), "block_table": block_table})
-
-    input_ids = torch.tensor([flat_input_ids], dtype=torch.long, device=device)
-    position_ids = torch.tensor([flat_position_ids], dtype=torch.long, device=device)
-    ctx = InferenceContext(mode="prefill", sequences=sequences)
-    return input_ids, position_ids, ctx
-
-
 def _build_padded_inputs(
     seq_token_lists: list[list[int]], device: str
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -285,7 +244,7 @@ def _patched_prefill(
     block_tables: list[list[int]],
     device: str,
 ) -> None:
-    input_ids, position_ids, ctx = _build_prefill_inputs(
+    input_ids, position_ids, ctx = build_prefill_inputs(
         seq_token_lists, block_tables, device
     )
     with inference_context(ctx):
@@ -447,7 +406,7 @@ def _bench_patched(
     """
     prompt_tokens = sum(len(seq) for seq in seq_token_lists)
     decode_tokens_count = len(seq_token_lists) * len(decode_tokens)
-    block_tables = _allocate_block_tables(
+    block_tables = allocate_block_tables(
         [len(seq) + len(decode_tokens) for seq in seq_token_lists], block_size
     )
 
