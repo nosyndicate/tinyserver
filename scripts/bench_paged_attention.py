@@ -17,7 +17,7 @@ import statistics
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from prettytable import PrettyTable
@@ -35,6 +35,9 @@ DEFAULT_MEMORY_UTILIZATION = 0.2
 DEFAULT_WARMUP = 2
 DEFAULT_ITERS = 5
 DEFAULT_SEED = 1234
+DEFAULT_PHASE = "all"
+
+Phase = Literal["prefill", "decode", "all"]
 
 
 @dataclass(frozen=True)
@@ -47,11 +50,11 @@ class Workload:
 
 @dataclass(frozen=True)
 class BenchResult:
-    prefill_ms: float
-    prefill_tokens_per_s: float
-    decode_tokens_per_s: float
-    e2e_ms: float
-    e2e_tokens_per_s: float
+    prefill_ms: float | None = None
+    prefill_tokens_per_s: float | None = None
+    decode_tokens_per_s: float | None = None
+    e2e_ms: float | None = None
+    e2e_tokens_per_s: float | None = None
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -82,6 +85,12 @@ def _build_parser() -> argparse.ArgumentParser:
             "all",
         ],
         default="all",
+    )
+    parser.add_argument(
+        "--phase",
+        choices=["prefill", "decode", "all"],
+        default=DEFAULT_PHASE,
+        help="Benchmark prefill, decode, or all phases (default: all).",
     )
     parser.add_argument(
         "--max-batch-size",
@@ -351,6 +360,7 @@ def _bench_patched(
     device: str,
     warmup: int,
     iters: int,
+    phase: Phase,
 ) -> BenchResult:
     """Benchmark the paged-attention model and return per-phase metrics.
 
@@ -365,35 +375,48 @@ def _bench_patched(
         [len(seq) + len(decode_tokens) for seq in seq_token_lists], block_size
     )
 
-    prefill_s = _median_seconds(
-        lambda: _patched_prefill(model, seq_token_lists, block_tables, device),
-        device,
-        warmup,
-        iters,
-    )
-    decode_s = _median_seconds_with_setup(
-        lambda: _patched_decode_setup(model, seq_token_lists, block_tables, device),
-        lambda positions: _patched_decode_cached(
-            model, block_tables, decode_tokens, positions, device
-        ),
-        device,
-        warmup,
-        iters,
-    )
-    e2e_s = _median_seconds(
-        lambda: _patched_decode_loop(
-            model, seq_token_lists, block_tables, decode_tokens, device
-        ),
-        device,
-        warmup,
-        iters,
-    )
+    prefill_s: float | None = None
+    decode_s: float | None = None
+    e2e_s: float | None = None
+
+    if phase in ("prefill", "all"):
+        prefill_s = _median_seconds(
+            lambda: _patched_prefill(model, seq_token_lists, block_tables, device),
+            device,
+            warmup,
+            iters,
+        )
+    if phase in ("decode", "all"):
+        decode_s = _median_seconds_with_setup(
+            lambda: _patched_decode_setup(model, seq_token_lists, block_tables, device),
+            lambda positions: _patched_decode_cached(
+                model, block_tables, decode_tokens, positions, device
+            ),
+            device,
+            warmup,
+            iters,
+        )
+    if phase == "all":
+        e2e_s = _median_seconds(
+            lambda: _patched_decode_loop(
+                model, seq_token_lists, block_tables, decode_tokens, device
+            ),
+            device,
+            warmup,
+            iters,
+        )
     return BenchResult(
-        prefill_ms=prefill_s * 1e3,
-        prefill_tokens_per_s=prompt_tokens / prefill_s,
-        decode_tokens_per_s=decode_tokens_count / decode_s,
-        e2e_ms=e2e_s * 1e3,
-        e2e_tokens_per_s=(prompt_tokens + decode_tokens_count) / e2e_s,
+        prefill_ms=prefill_s * 1e3 if prefill_s is not None else None,
+        prefill_tokens_per_s=prompt_tokens / prefill_s
+        if prefill_s is not None
+        else None,
+        decode_tokens_per_s=(
+            decode_tokens_count / decode_s if decode_s is not None else None
+        ),
+        e2e_ms=e2e_s * 1e3 if e2e_s is not None else None,
+        e2e_tokens_per_s=(
+            (prompt_tokens + decode_tokens_count) / e2e_s if e2e_s is not None else None
+        ),
     )
 
 
@@ -404,6 +427,7 @@ def _bench_original(
     device: str,
     warmup: int,
     iters: int,
+    phase: Phase,
 ) -> BenchResult:
     """Benchmark the stock HuggingFace model one sequence at a time (no padding).
 
@@ -414,31 +438,46 @@ def _bench_original(
     prompt_tokens = sum(len(seq) for seq in seq_token_lists)
     decode_tokens_count = len(seq_token_lists) * len(decode_tokens)
 
-    prefill_s = _median_seconds(
-        lambda: _original_prefill(model, seq_token_lists, device),
-        device,
-        warmup,
-        iters,
-    )
-    decode_s = _median_seconds_with_setup(
-        lambda: _original_decode_setup(model, seq_token_lists, device),
-        lambda state: _original_decode_cached(model, decode_tokens, state, device),
-        device,
-        warmup,
-        iters,
-    )
-    e2e_s = _median_seconds(
-        lambda: _original_decode_loop(model, seq_token_lists, decode_tokens, device),
-        device,
-        warmup,
-        iters,
-    )
+    prefill_s: float | None = None
+    decode_s: float | None = None
+    e2e_s: float | None = None
+
+    if phase in ("prefill", "all"):
+        prefill_s = _median_seconds(
+            lambda: _original_prefill(model, seq_token_lists, device),
+            device,
+            warmup,
+            iters,
+        )
+    if phase in ("decode", "all"):
+        decode_s = _median_seconds_with_setup(
+            lambda: _original_decode_setup(model, seq_token_lists, device),
+            lambda state: _original_decode_cached(model, decode_tokens, state, device),
+            device,
+            warmup,
+            iters,
+        )
+    if phase == "all":
+        e2e_s = _median_seconds(
+            lambda: _original_decode_loop(
+                model, seq_token_lists, decode_tokens, device
+            ),
+            device,
+            warmup,
+            iters,
+        )
     return BenchResult(
-        prefill_ms=prefill_s * 1e3,
-        prefill_tokens_per_s=prompt_tokens / prefill_s,
-        decode_tokens_per_s=decode_tokens_count / decode_s,
-        e2e_ms=e2e_s * 1e3,
-        e2e_tokens_per_s=(prompt_tokens + decode_tokens_count) / e2e_s,
+        prefill_ms=prefill_s * 1e3 if prefill_s is not None else None,
+        prefill_tokens_per_s=prompt_tokens / prefill_s
+        if prefill_s is not None
+        else None,
+        decode_tokens_per_s=(
+            decode_tokens_count / decode_s if decode_s is not None else None
+        ),
+        e2e_ms=e2e_s * 1e3 if e2e_s is not None else None,
+        e2e_tokens_per_s=(
+            (prompt_tokens + decode_tokens_count) / e2e_s if e2e_s is not None else None
+        ),
     )
 
 
@@ -504,45 +543,82 @@ def _build_row(
     prompt_lengths: list[int],
     patched: BenchResult,
     original: BenchResult,
+    phase: Phase,
 ) -> list[str | int]:
-    return [
-        batch,
-        _prompt_summary(prompt_lengths),
-        f"{patched.prefill_ms:.2f}",
-        f"{original.prefill_ms:.2f}",
-        _format_ratio(patched.prefill_ms, original.prefill_ms, False),
-        f"{patched.prefill_tokens_per_s:.1f}",
-        f"{original.prefill_tokens_per_s:.1f}",
-        _format_ratio(
-            patched.prefill_tokens_per_s, original.prefill_tokens_per_s, True
-        ),
-        f"{patched.decode_tokens_per_s:.1f}",
-        f"{original.decode_tokens_per_s:.1f}",
-        _format_ratio(patched.decode_tokens_per_s, original.decode_tokens_per_s, True),
-        f"{patched.e2e_ms:.2f}",
-        f"{original.e2e_ms:.2f}",
-        _format_ratio(patched.e2e_ms, original.e2e_ms, True),
-    ]
+    row: list[str | int] = [batch, _prompt_summary(prompt_lengths)]
+    if phase in ("prefill", "all"):
+        assert patched.prefill_ms is not None
+        assert original.prefill_ms is not None
+        assert patched.prefill_tokens_per_s is not None
+        assert original.prefill_tokens_per_s is not None
+        row.extend(
+            [
+                f"{patched.prefill_ms:.2f}",
+                f"{original.prefill_ms:.2f}",
+                _format_ratio(patched.prefill_ms, original.prefill_ms, False),
+                f"{patched.prefill_tokens_per_s:.1f}",
+                f"{original.prefill_tokens_per_s:.1f}",
+                _format_ratio(
+                    patched.prefill_tokens_per_s, original.prefill_tokens_per_s, True
+                ),
+            ]
+        )
+    if phase in ("decode", "all"):
+        assert patched.decode_tokens_per_s is not None
+        assert original.decode_tokens_per_s is not None
+        row.extend(
+            [
+                f"{patched.decode_tokens_per_s:.1f}",
+                f"{original.decode_tokens_per_s:.1f}",
+                _format_ratio(
+                    patched.decode_tokens_per_s, original.decode_tokens_per_s, True
+                ),
+            ]
+        )
+    if phase == "all":
+        assert patched.e2e_ms is not None
+        assert original.e2e_ms is not None
+        row.extend(
+            [
+                f"{patched.e2e_ms:.2f}",
+                f"{original.e2e_ms:.2f}",
+                _format_ratio(patched.e2e_ms, original.e2e_ms, False),
+            ]
+        )
+    return row
 
 
-def _build_results_table() -> PrettyTable:
+def _build_results_table(phase: Phase) -> PrettyTable:
     table = PrettyTable()
-    table.field_names = [
-        "batch",
-        "prompt_len",
-        "patched_pre_ms",
-        "original_pre_ms",
-        "pre_ratio",
-        "patched_ptok/s",
-        "original_ptok/s",
-        "pre_tps_ratio",
-        "patched_dtok/s",
-        "original_dtok/s",
-        "decode_tps_ratio",
-        "patched_e2e_ms",
-        "original_e2e_ms",
-        "e2e_ratio",
-    ]
+    field_names = ["batch", "prompt_len"]
+    if phase in ("prefill", "all"):
+        field_names.extend(
+            [
+                "patched_pre_ms",
+                "original_pre_ms",
+                "pre_ratio",
+                "patched_ptok/s",
+                "original_ptok/s",
+                "pre_tps_ratio",
+            ]
+        )
+    if phase in ("decode", "all"):
+        field_names.extend(
+            [
+                "patched_dtok/s",
+                "original_dtok/s",
+                "decode_tps_ratio",
+            ]
+        )
+    if phase == "all":
+        field_names.extend(
+            [
+                "patched_e2e_ms",
+                "original_e2e_ms",
+                "e2e_ratio",
+            ]
+        )
+    table.field_names = field_names
     table.align = "r"
     table.align["prompt_len"] = "l"
     return table
@@ -587,10 +663,10 @@ def _run_workload(
 ) -> None:
     """Run both models for each batch size in the workload and print a comparison table."""
     print(
-        f"\n=== {workload.name} | decode_steps={workload.decode_steps} "
+        f"\n=== {workload.name} | phase={args.phase} | decode_steps={workload.decode_steps} "
         f"| block_size={args.block_size} ==="
     )
-    table = _build_results_table()
+    table = _build_results_table(args.phase)
 
     for batch in workload.batch_sizes:
         if args.max_batch_size is not None and batch > args.max_batch_size:
@@ -619,6 +695,7 @@ def _run_workload(
             args.device,
             args.warmup,
             args.iters,
+            args.phase,
         )
         original = _bench_original(
             original_model,
@@ -627,8 +704,9 @@ def _run_workload(
             args.device,
             args.warmup,
             args.iters,
+            args.phase,
         )
-        table.add_row(_build_row(batch, prompt_lengths, patched, original))
+        table.add_row(_build_row(batch, prompt_lengths, patched, original, args.phase))
 
     print(table)
 
@@ -665,7 +743,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(
         f"\nmodel={args.model_name} device={args.device} dtype={args.dtype} "
-        f"warmup={args.warmup} iters={args.iters} seed={args.seed}"
+        f"warmup={args.warmup} iters={args.iters} seed={args.seed} phase={args.phase}"
     )
     try:
         for workload in selected:
