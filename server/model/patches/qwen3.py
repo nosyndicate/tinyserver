@@ -287,6 +287,9 @@ def _patch_single_layer(
             for i, seq in enumerate(inference_context.sequences):
                 start_position = int(position_ids[0, i].item())
                 block_table = seq["block_table"]
+                block_table_tensor = torch.tensor(
+                    block_table, device=hidden_states.device, dtype=torch.long
+                )
 
                 # Since in decoding, we only need to generate 1 token at a time,
                 # the net new k and v for each sequence should only be for one token.
@@ -298,7 +301,7 @@ def _patch_single_layer(
                 )  # shape (num_key_value_heads, num_tokens, head_dim).
                 store_kv_cache(
                     start_position,
-                    block_table,
+                    block_table_tensor,
                     k_src,
                     v_src,
                     attn_module.k_cache,
