@@ -185,13 +185,6 @@ def _patch_single_layer(
         k = k.transpose(1, 2)  # (1, num_key_value_heads, seq_len, head_dim)
         v = v.transpose(1, 2)  # (1, num_key_value_heads, seq_len, head_dim)
 
-        # if position_ids is None:
-        #     raise ValueError(
-        #         "Position ids should not be None for the patched attention forward"
-        #     )
-        # cos, sin = rotary_emb(v, position_ids)
-        # q, k = apply_rotary_pos_emb(q, k, cos, sin)
-
         if position_embeddings is not None:
             cos, sin = position_embeddings
         else:
@@ -215,7 +208,9 @@ def _patch_single_layer(
             for seq in inference_context.sequences:
                 # For prefill, num_tokens for a sequence is the total number of tokens in the prompt
                 num_tokens = seq["num_tokens"]
-                block_table = seq["block_table"]
+                block_table = torch.tensor(
+                    seq["block_table"], device=hidden_states.device, dtype=torch.long
+                )
 
                 t_s, t_e = token_offset, token_offset + num_tokens
                 k_src = (
@@ -230,9 +225,7 @@ def _patch_single_layer(
                 # we might need to change the start position to the actual position of the token in the sequence.
                 store_kv_cache(
                     0,
-                    torch.tensor(
-                        block_table, device=hidden_states.device, dtype=torch.long
-                    ),
+                    block_table,
                     k_src,
                     v_src,
                     attn_module.k_cache,
@@ -268,8 +261,6 @@ def _patch_single_layer(
 
             # if pytorch >= 2.5, then scaled_dot_product_attention support enable_gpa,
             # which can avoid we doing the repeat_interleave for k and v
-            # k_expanded = k.repeat_interleave(num_groups, dim=1)
-            # v_expanded = v.repeat_interleave(num_groups, dim=1)
             output = F.scaled_dot_product_attention(
                 q,
                 k,
@@ -286,9 +277,8 @@ def _patch_single_layer(
             # a more efficient implementation.
             for i, seq in enumerate(inference_context.sequences):
                 start_position = int(position_ids[0, i].item())
-                block_table = seq["block_table"]
-                block_table_tensor = torch.tensor(
-                    block_table, device=hidden_states.device, dtype=torch.long
+                block_table = torch.tensor(
+                    seq["block_table"], device=hidden_states.device, dtype=torch.long
                 )
 
                 # Since in decoding, we only need to generate 1 token at a time,
@@ -301,7 +291,7 @@ def _patch_single_layer(
                 )  # shape (num_key_value_heads, num_tokens, head_dim).
                 store_kv_cache(
                     start_position,
-                    block_table_tensor,
+                    block_table,
                     k_src,
                     v_src,
                     attn_module.k_cache,

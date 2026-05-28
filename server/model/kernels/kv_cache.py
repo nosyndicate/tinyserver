@@ -26,6 +26,12 @@ def _store_kv_kernel(
     stride_src_tok,  # stride along the token dimension
     stride_src_dim,  # stride along the head dimension
 ):
+    """
+    One Triton program = one (token, kv_head) pair.
+
+    Grid:  (num_tokens, num_kv_heads)
+    Block: single thread group loading head_dim elements at once.
+    """
     # Each block processes one (token, kv-head) pair
     token_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
@@ -41,9 +47,17 @@ def _store_kv_kernel(
     v = tl.load(v_src_ptr + src_offset)
 
     # Compute the destination address in the cache
+
+    # The absolute position of the token in the sequence is (start_position + token_idx).
     token_pos = start_position + token_idx
+
+    # Use the block table to find the physical block index corresponding to this token position.
     logical_blk_idx = token_pos // block_size
+
+    # Which physical block this corresponds to in the cache
     physical_blk_idx = tl.load(block_table_ptr + logical_blk_idx)
+
+    # Within the block, the slot index is the position modulo the block size
     slot_idx = token_pos % block_size
 
     cache_offsets = (
