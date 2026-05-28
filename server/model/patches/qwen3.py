@@ -12,6 +12,7 @@ from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
 from transformers.processing_utils import Unpack
 
 from server.model.inference_context import get_inference_context
+from server.model.kernels.kv_cache import store_kv_cache
 from server.model.utils import bytes_to_gb, get_available_memory
 
 
@@ -229,7 +230,9 @@ def _patch_single_layer(
                 # we might need to change the start position to the actual position of the token in the sequence.
                 store_kv_cache(
                     0,
-                    block_table,
+                    torch.tensor(
+                        block_table, device=hidden_states.device, dtype=torch.long
+                    ),
                     k_src,
                     v_src,
                     attn_module.k_cache,
@@ -341,47 +344,47 @@ def _patch_single_layer(
     layer.self_attn.forward = _page_attention_forward
 
 
-def store_kv_cache(
-    start_position: int,
-    block_table: list[int],
-    k_src: torch.Tensor,
-    v_src: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-) -> None:
-    """
-    For one sequence, scatter freshly computed K/V projections into the paged KV cache.
-    The quantity of the kv cache is determined by the number of tokens in the sequence,
-    which can be calculated by looking at the shape of the k_src or v_src.
+# def store_kv_cache(
+#     start_position: int,
+#     block_table: list[int],
+#     k_src: torch.Tensor,
+#     v_src: torch.Tensor,
+#     k_cache: torch.Tensor,
+#     v_cache: torch.Tensor,
+# ) -> None:
+#     """
+#     For one sequence, scatter freshly computed K/V projections into the paged KV cache.
+#     The quantity of the kv cache is determined by the number of tokens in the sequence,
+#     which can be calculated by looking at the shape of the k_src or v_src.
 
-    For each token i in k_src the absolute sequence position is
-    (start_pos + i).  The function uses block_table to translate that
-    position into a physical cache address and writes k_src[i] / v_src[i]
-    there.
+#     For each token i in k_src the absolute sequence position is
+#     (start_pos + i).  The function uses block_table to translate that
+#     position into a physical cache address and writes k_src[i] / v_src[i]
+#     there.
 
-    Args:
-        start_position: The position of the first token in the current sequence.
-        block_table: A list of block indices that this sequence occupies in the kv cache.
-        k_src: The key tensor for the sequence, of shape (num_key_value_heads, seq_len, head_dim).
-        v_src: The value tensor for the sequence, of shape (num_key_value_heads, seq_len, head_dim).
-        k_cache: The key cache tensor for current attention layer with shape (num_blocks, num_key_value_heads, block_size, head_dim).
-        v_cache: The value cache tensor for current attention layer with shape (num_blocks, num_key_value_heads, block_size, head_dim).
-    """
-    block_size = k_cache.shape[2]
-    seq_len = k_src.shape[1]
+#     Args:
+#         start_position: The position of the first token in the current sequence.
+#         block_table: A list of block indices that this sequence occupies in the kv cache.
+#         k_src: The key tensor for the sequence, of shape (num_key_value_heads, seq_len, head_dim).
+#         v_src: The value tensor for the sequence, of shape (num_key_value_heads, seq_len, head_dim).
+#         k_cache: The key cache tensor for current attention layer with shape (num_blocks, num_key_value_heads, block_size, head_dim).
+#         v_cache: The value cache tensor for current attention layer with shape (num_blocks, num_key_value_heads, block_size, head_dim).
+#     """
+#     block_size = k_cache.shape[2]
+#     seq_len = k_src.shape[1]
 
-    # We iterate all the tokens in the sequence and write them to the corresponding position
-    # in the kv cache according to the block table. This is slower than doing it in a block-wise
-    # manner, but it is much simpler and later can be optimized easily using parallel.
-    # TODO the block id and pos_in_block for each token is compute on the fly,
-    # we probably can pre-compute and store in the context for more efficient writing to the cache.
-    for i in range(seq_len):
-        abs_pos = start_position + i
-        logical_block_idx = abs_pos // block_size
-        block_idx = block_table[logical_block_idx]
-        pos_in_block = abs_pos % block_size
-        k_cache[block_idx, :, pos_in_block, :] = k_src[:, i, :]
-        v_cache[block_idx, :, pos_in_block, :] = v_src[:, i, :]
+#     # We iterate all the tokens in the sequence and write them to the corresponding position
+#     # in the kv cache according to the block table. This is slower than doing it in a block-wise
+#     # manner, but it is much simpler and later can be optimized easily using parallel.
+#     # TODO the block id and pos_in_block for each token is compute on the fly,
+#     # we probably can pre-compute and store in the context for more efficient writing to the cache.
+#     for i in range(seq_len):
+#         abs_pos = start_position + i
+#         logical_block_idx = abs_pos // block_size
+#         block_idx = block_table[logical_block_idx]
+#         pos_in_block = abs_pos % block_size
+#         k_cache[block_idx, :, pos_in_block, :] = k_src[:, i, :]
+#         v_cache[block_idx, :, pos_in_block, :] = v_src[:, i, :]
 
 
 def gather_kv_cache(
