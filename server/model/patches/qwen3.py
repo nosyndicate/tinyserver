@@ -12,6 +12,7 @@ from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
 from transformers.processing_utils import Unpack
 
 from server.model.inference_context import get_inference_context
+from server.model.kernels.kv_cache import store_kv_cache
 from server.model.utils import bytes_to_gb, get_available_memory
 
 
@@ -125,6 +126,7 @@ def _patch_single_layer(
 
     def _page_attention_forward(
         hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
         position_ids: torch.Tensor | None,
         past_key_values: Cache | None = None,
@@ -183,11 +185,16 @@ def _patch_single_layer(
         k = k.transpose(1, 2)  # (1, num_key_value_heads, seq_len, head_dim)
         v = v.transpose(1, 2)  # (1, num_key_value_heads, seq_len, head_dim)
 
-        if position_ids is None:
-            raise ValueError(
-                "Position ids should not be None for the patched attention forward"
-            )
-        cos, sin = rotary_emb(v, position_ids)
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+        else:
+            # fallback if this patched module is ever called outside normal Qwen3Model.forward
+            if position_ids is None:
+                raise ValueError(
+                    "Position ids should not be None for the patched attention forward"
+                )
+            cos, sin = rotary_emb(v, position_ids)
+
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         inference_context = get_inference_context()
@@ -201,7 +208,9 @@ def _patch_single_layer(
             for seq in inference_context.sequences:
                 # For prefill, num_tokens for a sequence is the total number of tokens in the prompt
                 num_tokens = seq["num_tokens"]
-                block_table = seq["block_table"]
+                block_table = torch.tensor(
+                    seq["block_table"], device=hidden_states.device, dtype=torch.long
+                )
 
                 t_s, t_e = token_offset, token_offset + num_tokens
                 k_src = (
@@ -250,12 +259,13 @@ def _patch_single_layer(
                 mask[b_s:b_e, b_s:b_e] = causal_mask
                 block_start += num_tokens
 
-            # if pytorch >= 2.5, then scaled_dot_product_attention support enable_gpa,
-            # which can avoid we doing the repeat_interleave for k and v
-            k_expanded = k.repeat_interleave(num_groups, dim=1)
-            v_expanded = v.repeat_interleave(num_groups, dim=1)
             output = F.scaled_dot_product_attention(
-                q, k_expanded, v_expanded, attn_mask=mask, scale=head_dim**-0.5
+                q,
+                k,
+                v,
+                attn_mask=mask,
+                scale=head_dim**-0.5,
+                enable_gqa=True,  # Using enale_gqa to avoid manually repeating k and v for each attention head
             )
             output = output.transpose(1, 2).reshape(batch, seq_len, -1)
         else:
@@ -265,7 +275,9 @@ def _patch_single_layer(
             # a more efficient implementation.
             for i, seq in enumerate(inference_context.sequences):
                 start_position = int(position_ids[0, i].item())
-                block_table = seq["block_table"]
+                block_table = torch.tensor(
+                    seq["block_table"], device=hidden_states.device, dtype=torch.long
+                )
 
                 # Since in decoding, we only need to generate 1 token at a time,
                 # the net new k and v for each sequence should only be for one token.
@@ -321,49 +333,6 @@ def _patch_single_layer(
         return attn_module.o_proj(output), None
 
     layer.self_attn.forward = _page_attention_forward
-
-
-def store_kv_cache(
-    start_position: int,
-    block_table: list[int],
-    k_src: torch.Tensor,
-    v_src: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-) -> None:
-    """
-    For one sequence, scatter freshly computed K/V projections into the paged KV cache.
-    The quantity of the kv cache is determined by the number of tokens in the sequence,
-    which can be calculated by looking at the shape of the k_src or v_src.
-
-    For each token i in k_src the absolute sequence position is
-    (start_pos + i).  The function uses block_table to translate that
-    position into a physical cache address and writes k_src[i] / v_src[i]
-    there.
-
-    Args:
-        start_position: The position of the first token in the current sequence.
-        block_table: A list of block indices that this sequence occupies in the kv cache.
-        k_src: The key tensor for the sequence, of shape (num_key_value_heads, seq_len, head_dim).
-        v_src: The value tensor for the sequence, of shape (num_key_value_heads, seq_len, head_dim).
-        k_cache: The key cache tensor for current attention layer with shape (num_blocks, num_key_value_heads, block_size, head_dim).
-        v_cache: The value cache tensor for current attention layer with shape (num_blocks, num_key_value_heads, block_size, head_dim).
-    """
-    block_size = k_cache.shape[2]
-    seq_len = k_src.shape[1]
-
-    # We iterate all the tokens in the sequence and write them to the corresponding position
-    # in the kv cache according to the block table. This is slower than doing it in a block-wise
-    # manner, but it is much simpler and later can be optimized easily using parallel.
-    # TODO the block id and pos_in_block for each token is compute on the fly,
-    # we probably can pre-compute and store in the context for more efficient writing to the cache.
-    for i in range(seq_len):
-        abs_pos = start_position + i
-        logical_block_idx = abs_pos // block_size
-        block_idx = block_table[logical_block_idx]
-        pos_in_block = abs_pos % block_size
-        k_cache[block_idx, :, pos_in_block, :] = k_src[:, i, :]
-        v_cache[block_idx, :, pos_in_block, :] = v_src[:, i, :]
 
 
 def gather_kv_cache(
