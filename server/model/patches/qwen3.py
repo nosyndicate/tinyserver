@@ -13,6 +13,7 @@ from transformers.processing_utils import Unpack
 
 from server.model.inference_context import get_inference_context
 from server.model.kernels.kv_cache import store_kv_cache
+from server.model.kernels.varlen_attention import flash_attn_varlen_func
 from server.model.utils import bytes_to_gb, get_available_memory
 
 
@@ -124,6 +125,90 @@ def _patch_single_layer(
     head_dim = attn_module.config.head_dim
     num_groups = num_attention_heads // num_key_value_heads
 
+    def _prefill_sdpa_with_block_mask(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        sequences: list[dict],
+        batch: int,
+        seq_len: int,
+    ) -> torch.Tensor:
+        mask = torch.full(
+            (seq_len, seq_len),
+            float("-inf"),
+            dtype=q.dtype,
+            device=q.device,
+        )
+        block_start = 0
+        for seq in sequences:
+            num_tokens = seq["num_tokens"]
+            causal_mask = torch.triu(
+                torch.full(
+                    (num_tokens, num_tokens),
+                    float("-inf"),
+                    dtype=q.dtype,
+                    device=q.device,
+                ),
+                diagonal=1,
+            )
+
+            b_s, b_e = block_start, block_start + num_tokens
+            mask[b_s:b_e, b_s:b_e] = causal_mask
+            block_start += num_tokens
+
+        output = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=mask,
+            scale=head_dim**-0.5,
+            enable_gqa=True,  # Using enable_gqa to avoid manually repeating k and v for each attention head
+        )
+        return output.transpose(1, 2).reshape(batch, seq_len, -1)
+
+    def _prefill_varlen_attention(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        sequences: list[dict],
+        batch: int,
+        seq_len: int,
+    ) -> torch.Tensor:
+        seq_lengths = [int(seq["num_tokens"]) for seq in sequences]
+        if sum(seq_lengths) != seq_len:
+            raise ValueError(
+                f"Prefill sequence lengths sum to {sum(seq_lengths)}, expected flattened seq_len {seq_len}"
+            )
+        if any(num_tokens <= 0 for num_tokens in seq_lengths):
+            raise ValueError("Prefill sequence lengths must all be positive")
+
+        cu_seqlens = torch.empty(
+            len(seq_lengths) + 1, dtype=torch.int32, device=q.device
+        )
+        cu_seqlens[0] = 0
+        cu_seqlens[1:] = torch.tensor(
+            seq_lengths, dtype=torch.int32, device=q.device
+        ).cumsum(dim=0)
+        max_seqlen = max(seq_lengths)
+
+        # Varlen kernel consumes packed token-major tensors.
+        q_packed = q.squeeze(0).transpose(0, 1).contiguous()
+        k_packed = k.squeeze(0).transpose(0, 1).contiguous()
+        v_packed = v.squeeze(0).transpose(0, 1).contiguous()
+
+        output = flash_attn_varlen_func(
+            q_packed,
+            k_packed,
+            v_packed,
+            cu_seqlens,
+            cu_seqlens,
+            max_seqlen,
+            max_seqlen,
+            causal=True,
+            sm_scale=head_dim**-0.5,
+        )
+        return output.reshape(batch, seq_len, -1)
+
     def _page_attention_forward(
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
@@ -233,41 +318,14 @@ def _patch_single_layer(
                 )
                 token_offset += num_tokens
 
-            # Construct the mask for prefill, where tokens from different sequences
-            # should not attend to each other.
-            # TODO this mask is same across all layers, we can compute it once and reuse across layers
-            mask = torch.full(
-                (seq_len, seq_len),
-                float("-inf"),
-                dtype=q.dtype,
-                device=hidden_states.device,
-            )
-            block_start = 0
-            for seq in inference_context.sequences:
-                num_tokens = seq["num_tokens"]
-                causal_mask = torch.triu(
-                    torch.full(
-                        (num_tokens, num_tokens),
-                        float("-inf"),
-                        dtype=q.dtype,
-                        device=hidden_states.device,
-                    ),
-                    diagonal=1,
+            if q.is_cuda:
+                output = _prefill_varlen_attention(
+                    q, k, v, inference_context.sequences, batch, seq_len
                 )
-
-                b_s, b_e = block_start, block_start + num_tokens
-                mask[b_s:b_e, b_s:b_e] = causal_mask
-                block_start += num_tokens
-
-            output = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=mask,
-                scale=head_dim**-0.5,
-                enable_gqa=True,  # Using enale_gqa to avoid manually repeating k and v for each attention head
-            )
-            output = output.transpose(1, 2).reshape(batch, seq_len, -1)
+            else:
+                output = _prefill_sdpa_with_block_mask(
+                    q, k, v, inference_context.sequences, batch, seq_len
+                )
         else:
             output_tensors = []
 
