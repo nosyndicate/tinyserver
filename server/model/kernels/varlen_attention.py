@@ -183,7 +183,10 @@ def flash_attn_varlen_func(
     if softmax_scale is None:
         softmax_scale = 1.0 / (head_dim**0.5)
 
-    BLOCK_M: int = 64
+    # Keep the query tile modest for fp32 Qwen3 validation runs.  With
+    # BLOCK_M=64 and head_dim rounded to 128, Triton asks for ~104 KiB of
+    # shared memory on some GPUs, just above a 99 KiB per-block limit.
+    BLOCK_M: int = 32
     BLOCK_N: int = 32
     BLOCK_D = triton.next_power_of_2(head_dim)
 

@@ -205,7 +205,7 @@ def _patch_single_layer(
             max_seqlen,
             max_seqlen,
             causal=True,
-            sm_scale=head_dim**-0.5,
+            softmax_scale=head_dim**-0.5,
         )
         return output.reshape(batch, seq_len, -1)
 
