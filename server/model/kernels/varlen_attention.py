@@ -27,8 +27,6 @@ def _flash_attn_varlen_kernel(
     stride_o_headdim,
     num_heads_q: tl.constexpr,
     num_heads_k: tl.constexpr,
-    max_seqlen_q: tl.constexpr,
-    max_seqlen_k: tl.constexpr,
     head_dim: tl.constexpr,
     causal: tl.constexpr,
     softmax_scale: tl.constexpr,
@@ -156,6 +154,7 @@ def flash_attn_varlen_func(
     softmax_scale: float | None = None,
 ):
     """Flash attention for variable-length sequences, using cumulative sequence lengths.
+    Supports GQA where num_heads_q can be different from num_heads_k, as long as num_heads_q is divisible by num_heads_k.
 
     Suppose we have three sequence:
         Sequence 0:  tokens [t0, t1, t2, t3, t4]               length = 5
@@ -175,6 +174,9 @@ def flash_attn_varlen_func(
 
     total_q_tokens, num_heads_q, head_dim = q.shape
     total_k_tokens, num_heads_k, _ = k.shape
+
+    if num_heads_q % num_heads_k != 0:
+        raise ValueError("num_heads_q must be divisible by num_heads_k for GQA")
 
     batch = cu_seqlens_q.shape[0] - 1
 
@@ -202,8 +204,6 @@ def flash_attn_varlen_func(
         *out.stride(),
         num_heads_q,
         num_heads_k,
-        max_seqlen_q,
-        max_seqlen_k,
         head_dim,
         causal,
         softmax_scale,
