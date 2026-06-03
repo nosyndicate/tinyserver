@@ -192,9 +192,9 @@ def _patch_single_layer(
         max_seqlen = max(seq_lengths)
 
         # Varlen kernel consumes packed token-major tensors.
-        q_packed = q.squeeze(0).transpose(0, 1).contiguous()
-        k_packed = k.squeeze(0).transpose(0, 1).contiguous()
-        v_packed = v.squeeze(0).transpose(0, 1).contiguous()
+        q_packed = q.squeeze(0).transpose(0, 1)
+        k_packed = k.squeeze(0).transpose(0, 1)
+        v_packed = v.squeeze(0).transpose(0, 1)
 
         output = flash_attn_varlen_func(
             q_packed,
