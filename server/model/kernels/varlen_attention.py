@@ -13,11 +13,6 @@ def _flash_attn_varlen_kernel(
     out_ptr,
     cu_seqlens_q_ptr,
     cu_seqlens_k_ptr,
-    max_seqlen_q,
-    max_seqlen_k,
-    head_dim,
-    causal,
-    softmax_scale,
     stride_qt,
     stride_q_num_heads,
     stride_q_headdim,
@@ -30,13 +25,22 @@ def _flash_attn_varlen_kernel(
     stride_ot,
     stride_o_num_heads,
     stride_o_headdim,
+    num_heads_q: tl.constexpr,
+    num_heads_k: tl.constexpr,
+    head_dim: tl.constexpr,
+    causal: tl.constexpr,
+    softmax_scale: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     block_q_idx = tl.program_id(0)  # which block of queries
     batch_idx = tl.program_id(1)  # which sequence in the batch
-    head_idx = tl.program_id(2)  # which attention head
+    head_q_idx = tl.program_id(2)  # which attention head
+
+    # GQA: map query heads to key/value heads
+    heads_per_group = num_heads_q // num_heads_k
+    head_k_idx = head_q_idx // heads_per_group
 
     q_start = tl.load(cu_seqlens_q_ptr + batch_idx).to(
         tl.int32
@@ -65,7 +69,7 @@ def _flash_attn_varlen_kernel(
 
     q_offsets = (
         (q_start + offset_seq[:, None]) * stride_qt
-        + head_idx * stride_q_num_heads
+        + head_q_idx * stride_q_num_heads
         + offset_headdim[None, :] * stride_q_headdim
     )
     q_masks = offset_seq < q_len  # (BLOCK_M,)
@@ -89,7 +93,7 @@ def _flash_attn_varlen_kernel(
         offset_seq_k = block_k_idx + tl.arange(0, BLOCK_N)  # (BLOCK_N,)
         k_offsets = (
             (k_start + offset_seq_k[:, None]) * stride_kt
-            + head_idx * stride_k_num_heads
+            + head_k_idx * stride_k_num_heads
             + offset_headdim[None, :] * stride_k_headdim
         )
         k_masks = offset_seq_k < k_len  # (BLOCK_N,)
@@ -128,7 +132,7 @@ def _flash_attn_varlen_kernel(
     o = acc / l_i[:, None]  # (BLOCK_M, BLOCK_D)
     output_offsets = (
         (q_start + offset_seq[:, None]) * stride_ot
-        + head_idx * stride_o_num_heads
+        + head_q_idx * stride_o_num_heads
         + offset_headdim[None, :] * stride_o_headdim
     )
     tl.store(
@@ -150,6 +154,7 @@ def flash_attn_varlen_func(
     softmax_scale: float | None = None,
 ):
     """Flash attention for variable-length sequences, using cumulative sequence lengths.
+    Supports GQA where num_heads_q can be different from num_heads_k, as long as num_heads_q is divisible by num_heads_k.
 
     Suppose we have three sequence:
         Sequence 0:  tokens [t0, t1, t2, t3, t4]               length = 5
@@ -169,6 +174,9 @@ def flash_attn_varlen_func(
 
     total_q_tokens, num_heads_q, head_dim = q.shape
     total_k_tokens, num_heads_k, _ = k.shape
+
+    if num_heads_q % num_heads_k != 0:
+        raise ValueError("num_heads_q must be divisible by num_heads_k for GQA")
 
     batch = cu_seqlens_q.shape[0] - 1
 
@@ -190,15 +198,15 @@ def flash_attn_varlen_func(
         out,
         cu_seqlens_q,
         cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        head_dim,
-        causal,
-        softmax_scale,
         *q.stride(),
         *k.stride(),
         *v.stride(),
         *out.stride(),
+        num_heads_q,
+        num_heads_k,
+        head_dim,
+        causal,
+        softmax_scale,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_D=BLOCK_D,
@@ -249,7 +257,7 @@ def test_flash_attn_varlen():
     dtype = torch.float16
 
     batch = 4
-    nheads_q, nheads_k, headdim = 16, 16, 64  # GQA: 4 groups
+    nheads_q, nheads_k, headdim = 16, 4, 64  # GQA: 4 groups
 
     # Random sequence lengths
     seqlens_q = torch.randint(32, 257, (batch,))
