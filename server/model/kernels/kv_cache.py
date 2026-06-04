@@ -117,3 +117,124 @@ def store_kv_cache(
         *k_cache.stride(),
         *k_src.stride(),
     )
+
+
+def _store_kv_cache_batched_kernel(
+    # --- pointers ---
+    k_src_ptr,
+    v_src_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    block_mapping_ptr,
+    slot_mapping_ptr,
+    # --- scalars ---
+    num_tokens,
+    head_dim: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    # --- strides for k_src, v_src ---
+    k_stride_head,
+    k_stride_tok,
+    k_stride_headdim,
+    v_stride_head,
+    v_stride_tok,
+    v_stride_headdim,
+    # --- strides for k_cache, v_cache ---
+    k_cache_stride_blk,
+    k_cache_stride_head,
+    k_cache_stride_slot,
+    k_cache_stride_dim,
+    v_cache_stride_blk,
+    v_cache_stride_head,
+    v_cache_stride_slot,
+    v_cache_stride_dim,
+):
+    program_id = tl.program_id(0)
+    head_idx = tl.program_id(1)
+
+    offsets_h = tl.arange(0, head_dim)
+    offsets_t = program_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+
+    k_src_offset = (
+        head_idx * k_stride_head
+        + offsets_t[:, None] * k_stride_tok
+        + offsets_h[None, :] * k_stride_headdim
+    )  # (BLOCK_SIZE, head_dim)
+    v_src_offset = (
+        head_idx * v_stride_head
+        + offsets_t[:, None] * v_stride_tok
+        + offsets_h[None, :] * v_stride_headdim
+    )  # (BLOCK_SIZE, head_dim)
+
+    k_mask = offsets_t[:, None] < num_tokens  # (BLOCK_SIZE, 1)
+    v_mask = offsets_t[:, None] < num_tokens  # (BLOCK_SIZE, 1)
+
+    k = tl.load(
+        k_src_ptr + k_src_offset, mask=k_mask, other=0.0
+    )  # (BLOCK_SIZE, head_dim)
+    v = tl.load(
+        v_src_ptr + v_src_offset, mask=v_mask, other=0.0
+    )  # (BLOCK_SIZE, head_dim)
+
+    block_mapping_offset = offsets_t
+    slot_mapping_offset = offsets_t
+    block_indices = tl.load(
+        block_mapping_ptr + block_mapping_offset, mask=offsets_t < num_tokens, other=0
+    )  # (BLOCK_SIZE,)
+    slot_indices = tl.load(
+        slot_mapping_ptr + slot_mapping_offset, mask=offsets_t < num_tokens, other=0
+    )  # (BLOCK_SIZE,)
+
+    cache_offsets = (
+        block_indices[:, None] * k_cache_stride_blk
+        + head_idx * k_cache_stride_head
+        + slot_indices[:, None] * k_cache_stride_slot
+        + offsets_h[None, :] * k_cache_stride_dim
+    )
+
+    tl.store(k_cache_ptr + cache_offsets, value=k, mask=k_mask)
+    tl.store(v_cache_ptr + cache_offsets, value=v, mask=v_mask)
+
+
+def store_kv_cache_batched(
+    k_src: torch.Tensor,
+    v_src: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_mapping: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    """
+    Batched version of store_kv_cache. Unlike store_kv_cache, this function handle a whole batch of sequences at once,
+    saving us from launching one kernel per sequence.  Here, the destination cache address for each token is precomputed
+    and provided in the block_mapping, and slot_mapping tensors.
+
+    Args:
+        k_src: The key tensor for the batch, it has the flatten shape of (num_key_value_heads, num_tokens, head_dim)
+            where num_tokens is the combined length of all sequences in the batch (i.e., sum of individual sequence lengths).
+        v_src: The value tensor for the batch, of shape (num_key_value_heads, num_tokens, head_dim). Similar to k_src,
+            num_tokens is the combined length of all sequences in the batch.
+        k_cache: The key cache tensor for current attention layer with shape (num_blocks, num_key_value_heads, block_size, head_dim).
+        v_cache: The value cache tensor for current attention layer with shape (num_blocks, num_key_value_heads, block_size, head_dim).
+        block_mapping: A tensor of shape (num_tokens,) that maps each token in the batch to a block index in the cache.
+        slot_mapping: A tensor of shape (num_tokens,) that maps each token in the batch to a slot index of the physical block in the cache.
+    """
+
+    BLOCK_SIZE = 16
+    num_key_value_heads, num_tokens, head_dim = k_src.shape
+    grid = (triton.cdiv(num_tokens, BLOCK_SIZE), num_key_value_heads)
+
+    _store_kv_cache_batched_kernel[grid](
+        k_src,
+        v_src,
+        k_cache,
+        v_cache,
+        block_mapping,
+        slot_mapping,
+        num_tokens,
+        head_dim,
+        BLOCK_SIZE,
+        *k_src.stride(),
+        *v_src.stride(),
+        *k_cache.stride(),
+        *v_cache.stride(),
+    )
