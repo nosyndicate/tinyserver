@@ -119,6 +119,7 @@ def store_kv_cache(
     )
 
 
+@triton.jit
 def _store_kv_cache_batched_kernel(
     # --- pointers ---
     k_src_ptr,
@@ -139,14 +140,10 @@ def _store_kv_cache_batched_kernel(
     v_stride_tok,
     v_stride_headdim,
     # --- strides for k_cache, v_cache ---
-    k_cache_stride_blk,
-    k_cache_stride_head,
-    k_cache_stride_slot,
-    k_cache_stride_dim,
-    v_cache_stride_blk,
-    v_cache_stride_head,
-    v_cache_stride_slot,
-    v_cache_stride_dim,
+    cache_stride_blk,
+    cache_stride_head,
+    cache_stride_slot,
+    cache_stride_dim,
 ):
     program_id = tl.program_id(0)
     head_idx = tl.program_id(1)
@@ -185,10 +182,10 @@ def _store_kv_cache_batched_kernel(
     )  # (BLOCK_SIZE,)
 
     cache_offsets = (
-        block_indices[:, None] * k_cache_stride_blk
-        + head_idx * k_cache_stride_head
-        + slot_indices[:, None] * k_cache_stride_slot
-        + offsets_h[None, :] * k_cache_stride_dim
+        block_indices[:, None] * cache_stride_blk
+        + head_idx * cache_stride_head
+        + slot_indices[:, None] * cache_stride_slot
+        + offsets_h[None, :] * cache_stride_dim
     )
 
     tl.store(k_cache_ptr + cache_offsets, value=k, mask=k_mask)
@@ -236,5 +233,4 @@ def store_kv_cache_batched(
         *k_src.stride(),
         *v_src.stride(),
         *k_cache.stride(),
-        *v_cache.stride(),
     )
