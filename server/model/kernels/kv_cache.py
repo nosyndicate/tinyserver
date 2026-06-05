@@ -149,7 +149,9 @@ def _store_kv_cache_batched_kernel(
     head_idx = tl.program_id(1)
 
     offsets_h = tl.arange(0, head_dim)
-    offsets_t = program_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    # Promote to int64 so the offset arithmetic below cannot overflow int32 for
+    # large batches / large paged caches (which would wrap to a wrong address).
+    offsets_t = (program_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)).to(tl.int64)
 
     k_src_offset = (
         head_idx * k_stride_head
@@ -162,24 +164,21 @@ def _store_kv_cache_batched_kernel(
         + offsets_h[None, :] * v_stride_headdim
     )  # (BLOCK_SIZE, head_dim)
 
-    k_mask = offsets_t[:, None] < num_tokens  # (BLOCK_SIZE, 1)
-    v_mask = offsets_t[:, None] < num_tokens  # (BLOCK_SIZE, 1)
+    mask = offsets_t[:, None] < num_tokens  # (BLOCK_SIZE, 1)
 
     k = tl.load(
-        k_src_ptr + k_src_offset, mask=k_mask, other=0.0
+        k_src_ptr + k_src_offset, mask=mask, other=0.0
     )  # (BLOCK_SIZE, head_dim)
     v = tl.load(
-        v_src_ptr + v_src_offset, mask=v_mask, other=0.0
+        v_src_ptr + v_src_offset, mask=mask, other=0.0
     )  # (BLOCK_SIZE, head_dim)
 
-    block_mapping_offset = offsets_t
-    slot_mapping_offset = offsets_t
     block_indices = tl.load(
-        block_mapping_ptr + block_mapping_offset, mask=offsets_t < num_tokens, other=0
-    )  # (BLOCK_SIZE,)
+        block_mapping_ptr + offsets_t, mask=offsets_t < num_tokens, other=0
+    ).to(tl.int64)  # (BLOCK_SIZE,)
     slot_indices = tl.load(
-        slot_mapping_ptr + slot_mapping_offset, mask=offsets_t < num_tokens, other=0
-    )  # (BLOCK_SIZE,)
+        slot_mapping_ptr + offsets_t, mask=offsets_t < num_tokens, other=0
+    ).to(tl.int64)  # (BLOCK_SIZE,)
 
     cache_offsets = (
         block_indices[:, None] * cache_stride_blk
@@ -188,8 +187,8 @@ def _store_kv_cache_batched_kernel(
         + offsets_h[None, :] * cache_stride_dim
     )
 
-    tl.store(k_cache_ptr + cache_offsets, value=k, mask=k_mask)
-    tl.store(v_cache_ptr + cache_offsets, value=v, mask=v_mask)
+    tl.store(k_cache_ptr + cache_offsets, value=k, mask=mask)
+    tl.store(v_cache_ptr + cache_offsets, value=v, mask=mask)
 
 
 def store_kv_cache_batched(
@@ -216,8 +215,24 @@ def store_kv_cache_batched(
         slot_mapping: A tensor of shape (num_tokens,) that maps each token in the batch to a slot index of the physical block in the cache.
     """
 
+    if k_src.dim() != 3 or v_src.dim() != 3:
+        raise ValueError(
+            f"k_src and v_src must be 3D tensors, but got shapes {k_src.shape} and {v_src.shape}"
+        )
+    if k_src.shape != v_src.shape:
+        raise ValueError(
+            f"k_src and v_src must have the same shape, but got {k_src.shape} and {v_src.shape}"
+        )
+
     BLOCK_SIZE = 16
     num_key_value_heads, num_tokens, head_dim = k_src.shape
+
+    if block_mapping.shape[0] != num_tokens or slot_mapping.shape[0] != num_tokens:
+        raise ValueError(
+            f"block_mapping and slot_mapping must have length num_tokens ({num_tokens}), "
+            f"but got {block_mapping.shape[0]} and {slot_mapping.shape[0]}"
+        )
+
     grid = (triton.cdiv(num_tokens, BLOCK_SIZE), num_key_value_heads)
 
     _store_kv_cache_batched_kernel[grid](
