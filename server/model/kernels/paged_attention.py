@@ -18,8 +18,8 @@ def _paged_attention_kernel(
     softmax_scale,
     num_heads,
     num_kv_heads,
-    head_dims,
-    block_size,
+    head_dims: tl.constexpr,
+    block_size: tl.constexpr,
     max_num_blocks_per_seq,
     # --- strides ---
     stride_q_seq,
@@ -36,7 +36,8 @@ def _paged_attention_kernel(
     seq_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
 
-    # GQA: map the query head to the corresponding kv head using modulo
+    # GQA: map the query head to the corresponding kv head using integer
+    # division (heads are grouped contiguously, e.g. q-heads 0..g-1 -> kv-head 0)
     heads_per_group = num_heads // num_kv_heads
     kv_head_idx = head_idx // heads_per_group
 
@@ -53,11 +54,11 @@ def _paged_attention_kernel(
 
     # Load the block table for this sequence, which maps sequence positions to block indices in the cache
     seq_len = tl.load(seq_lens_ptr + seq_idx)
-    num_logical_blocks = triton.cdiv(seq_len, block_size)
+    num_logical_blocks = tl.cdiv(seq_len, block_size)
 
     # each sequence has one running max and one running sum for the online softmax computation
     m_i = tl.full([1], float("-inf"), dtype=tl.float32)  # (1,)
-    l_i = tl.zeros([1], dtype=tl.int32)  # (1,)
+    l_i = tl.zeros([1], dtype=tl.float32)  # (1,)
     acc = tl.zeros([head_dims], dtype=tl.float32)  # (head_dims,)
 
     for logical_blk_idx in range(num_logical_blocks):
@@ -71,7 +72,7 @@ def _paged_attention_kernel(
             + slots_offsets[:, None] * stride_kv_slot
             + headdim_offsets[None, :] * stride_kv_dim
         )
-        kv_mask = slots_offsets[:, None] < seq_len - logical_blk_idx * block_size
+        kv_mask = (logical_blk_idx * block_size + slots_offsets[:, None]) < seq_len
 
         k = tl.load(k_cache_ptr + kv_offset, mask=kv_mask, other=0.0).to(
             tl.float32
@@ -80,18 +81,25 @@ def _paged_attention_kernel(
             tl.float32
         )  # (block_size, head_dims)
 
-        qk = tl.dot(q, k.T)  # (block_size,)
+        # Decode has a single query token, so this is a vector-matrix product
+        # (M=1); use elementwise multiply + reduce rather than tl.dot.
+        qk = tl.sum(q[None, :] * k, axis=1)  # (block_size,)
         qk *= softmax_scale
+
+        token_ids = logical_blk_idx * block_size + slots_offsets  # (block_size,)
+        qk = tl.where(
+            token_ids < seq_len, qk, float("-inf")
+        )  # mask out-of-sequence positions
 
         m_i_new = tl.maximum(m_i, tl.max(qk, axis=0))  # (1,)
         p_ij = tl.exp(qk - m_i_new)  # (block_size,)
         scale = tl.exp(m_i - m_i_new)  # (1,)
-        acc = acc * scale[:, None]
-        acc = acc + tl.sum(p_ij * v, axis=0)  # (head_dims,)
+        acc = acc * scale  # (head_dims,)
+        acc = acc + tl.sum(p_ij[:, None] * v, axis=0)  # (head_dims,)
         l_i = l_i * scale + tl.sum(p_ij, axis=0)  # (1,)
         m_i = m_i_new
 
-    out = acc / l_i[:, None]  # (head_dims,)
+    out = acc / l_i  # (head_dims,)
     out_offset = (
         seq_idx * stride_o_seq
         + head_idx * stride_o_head
@@ -151,10 +159,10 @@ def paged_attention_forward(
     out = torch.empty_like(query)
 
     _paged_attention_kernel[grid](
+        out,
         query,
         k_cache,
         v_cache,
-        out,
         block_tables,
         seq_lens,
         softmax_scale,
@@ -162,7 +170,7 @@ def paged_attention_forward(
         num_kv_heads,
         head_dims,  # tl.constexpr
         block_size,  # tl.constexpr
-        max_num_blocks_per_seq,  # tl.constexpr
+        max_num_blocks_per_seq,
         *query.stride(),  # stride_q_seq, stride_q_head, stride_q_dim
         *k_cache.stride(),  # stride_kv_blk, stride_kv_head, stride_kv_slot, stride_kv_dim
         *out.stride(),  # stride_o_seq, stride_o_head, stride_o_dim
