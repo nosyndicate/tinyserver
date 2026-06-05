@@ -12,7 +12,7 @@ from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
 from transformers.processing_utils import Unpack
 
 from server.model.inference_context import get_inference_context
-from server.model.kernels.kv_cache import store_kv_cache
+from server.model.kernels.kv_cache import store_kv_cache, store_kv_cache_batched
 from server.model.kernels.varlen_attention import flash_attn_varlen_func
 from server.model.utils import bytes_to_gb, get_available_memory
 
@@ -289,34 +289,29 @@ def _patch_single_layer(
             # the order of the sequence in input_ids and position_ids.
             # we here to make sure the q and k will be correctly stored in the kv cache for each sequence.
 
-            token_offset = 0
+            block_size = attn_module.k_cache.shape[2]
+            block_mapping_list = []
+            slot_mapping_list = []
             for seq in inference_context.sequences:
-                # For prefill, num_tokens for a sequence is the total number of tokens in the prompt
-                num_tokens = seq["num_tokens"]
-                block_table = torch.tensor(
-                    seq["block_table"], device=hidden_states.device, dtype=torch.long
-                )
+                block_table = seq["block_table"]
+                for j in range(seq["num_tokens"]):
+                    block_mapping_list.append(block_table[j // block_size])
+                    slot_mapping_list.append(j % block_size)
 
-                t_s, t_e = token_offset, token_offset + num_tokens
-                k_src = (
-                    k[:, :, t_s:t_e, :].squeeze(0).contiguous()
-                )  # shape (num_key_value_heads, num_tokens, head_dim).
-                v_src = (
-                    v[:, :, t_s:t_e, :].squeeze(0).contiguous()
-                )  # shape (num_key_value_heads, num_tokens, head_dim).
-
-                # Since this is prefill, so the start position is hardcode to 0 now
-                # If later we want to implement prefix caching or chunked prefill
-                # we might need to change the start position to the actual position of the token in the sequence.
-                store_kv_cache(
-                    0,
-                    block_table,
-                    k_src,
-                    v_src,
-                    attn_module.k_cache,
-                    attn_module.v_cache,
-                )
-                token_offset += num_tokens
+            block_mapping = torch.tensor(
+                block_mapping_list, device=hidden_states.device, dtype=torch.long
+            )
+            slot_mapping = torch.tensor(
+                slot_mapping_list, device=hidden_states.device, dtype=torch.long
+            )
+            store_kv_cache_batched(
+                k.squeeze(0).contiguous(),
+                v.squeeze(0).contiguous(),
+                attn_module.k_cache,
+                attn_module.v_cache,
+                block_mapping,
+                slot_mapping,
+            )
 
             if q.is_cuda:
                 output = _prefill_varlen_attention(
