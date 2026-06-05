@@ -117,3 +117,135 @@ def store_kv_cache(
         *k_cache.stride(),
         *k_src.stride(),
     )
+
+
+@triton.jit
+def _store_kv_cache_batched_kernel(
+    # --- pointers ---
+    k_src_ptr,
+    v_src_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    block_mapping_ptr,
+    slot_mapping_ptr,
+    # --- scalars ---
+    num_tokens,
+    head_dim: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    # --- strides for k_src, v_src ---
+    k_stride_head,
+    k_stride_tok,
+    k_stride_headdim,
+    v_stride_head,
+    v_stride_tok,
+    v_stride_headdim,
+    # --- strides for k_cache, v_cache ---
+    cache_stride_blk,
+    cache_stride_head,
+    cache_stride_slot,
+    cache_stride_dim,
+):
+    program_id = tl.program_id(0)
+    head_idx = tl.program_id(1)
+
+    offsets_h = tl.arange(0, head_dim)
+    # Promote to int64 so the offset arithmetic below cannot overflow int32 for
+    # large batches / large paged caches (which would wrap to a wrong address).
+    offsets_t = (program_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)).to(tl.int64)
+
+    k_src_offset = (
+        head_idx * k_stride_head
+        + offsets_t[:, None] * k_stride_tok
+        + offsets_h[None, :] * k_stride_headdim
+    )  # (BLOCK_SIZE, head_dim)
+    v_src_offset = (
+        head_idx * v_stride_head
+        + offsets_t[:, None] * v_stride_tok
+        + offsets_h[None, :] * v_stride_headdim
+    )  # (BLOCK_SIZE, head_dim)
+
+    mask = offsets_t[:, None] < num_tokens  # (BLOCK_SIZE, 1)
+
+    k = tl.load(
+        k_src_ptr + k_src_offset, mask=mask, other=0.0
+    )  # (BLOCK_SIZE, head_dim)
+    v = tl.load(
+        v_src_ptr + v_src_offset, mask=mask, other=0.0
+    )  # (BLOCK_SIZE, head_dim)
+
+    block_indices = tl.load(
+        block_mapping_ptr + offsets_t, mask=offsets_t < num_tokens, other=0
+    ).to(tl.int64)  # (BLOCK_SIZE,)
+    slot_indices = tl.load(
+        slot_mapping_ptr + offsets_t, mask=offsets_t < num_tokens, other=0
+    ).to(tl.int64)  # (BLOCK_SIZE,)
+
+    cache_offsets = (
+        block_indices[:, None] * cache_stride_blk
+        + head_idx * cache_stride_head
+        + slot_indices[:, None] * cache_stride_slot
+        + offsets_h[None, :] * cache_stride_dim
+    )
+
+    tl.store(k_cache_ptr + cache_offsets, value=k, mask=mask)
+    tl.store(v_cache_ptr + cache_offsets, value=v, mask=mask)
+
+
+def store_kv_cache_batched(
+    k_src: torch.Tensor,
+    v_src: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_mapping: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    """
+    Batched version of store_kv_cache. Unlike store_kv_cache, this function handle a whole batch of sequences at once,
+    saving us from launching one kernel per sequence.  Here, the destination cache address for each token is precomputed
+    and provided in the block_mapping, and slot_mapping tensors.
+
+    Args:
+        k_src: The key tensor for the batch, it has the flatten shape of (num_key_value_heads, num_tokens, head_dim)
+            where num_tokens is the combined length of all sequences in the batch (i.e., sum of individual sequence lengths).
+        v_src: The value tensor for the batch, of shape (num_key_value_heads, num_tokens, head_dim). Similar to k_src,
+            num_tokens is the combined length of all sequences in the batch.
+        k_cache: The key cache tensor for current attention layer with shape (num_blocks, num_key_value_heads, block_size, head_dim).
+        v_cache: The value cache tensor for current attention layer with shape (num_blocks, num_key_value_heads, block_size, head_dim).
+        block_mapping: A tensor of shape (num_tokens,) that maps each token in the batch to a block index in the cache.
+        slot_mapping: A tensor of shape (num_tokens,) that maps each token in the batch to a slot index of the physical block in the cache.
+    """
+
+    if k_src.dim() != 3 or v_src.dim() != 3:
+        raise ValueError(
+            f"k_src and v_src must be 3D tensors, but got shapes {k_src.shape} and {v_src.shape}"
+        )
+    if k_src.shape != v_src.shape:
+        raise ValueError(
+            f"k_src and v_src must have the same shape, but got {k_src.shape} and {v_src.shape}"
+        )
+
+    BLOCK_SIZE = 16
+    num_key_value_heads, num_tokens, head_dim = k_src.shape
+
+    if block_mapping.shape[0] != num_tokens or slot_mapping.shape[0] != num_tokens:
+        raise ValueError(
+            f"block_mapping and slot_mapping must have length num_tokens ({num_tokens}), "
+            f"but got {block_mapping.shape[0]} and {slot_mapping.shape[0]}"
+        )
+
+    grid = (triton.cdiv(num_tokens, BLOCK_SIZE), num_key_value_heads)
+
+    _store_kv_cache_batched_kernel[grid](
+        k_src,
+        v_src,
+        k_cache,
+        v_cache,
+        block_mapping,
+        slot_mapping,
+        num_tokens,
+        head_dim,
+        BLOCK_SIZE,
+        *k_src.stride(),
+        *v_src.stride(),
+        *k_cache.stride(),
+    )
