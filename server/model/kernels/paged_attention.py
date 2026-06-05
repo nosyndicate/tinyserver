@@ -33,6 +33,19 @@ def _paged_attention_kernel(
     stride_o_head,
     stride_o_dim,
 ):
+    """
+    Each program is a (seq, head) pair. We gather K/V for the sequence from the paged cache,
+
+    Since this forward pass is only for decoding, so for each sequence, we only have one query token.
+    This is different from the prefill case, where each program has multiple query tokens across a batch of queries.
+
+    For each query token, i.e., for each sequence, we walk through the block table to gather K/V blocks from the
+    cache, compute attention weights and output one token of output for each head.
+
+    Right now, we walk through on logical blocks one by one, which ties our implementation to the block size.
+    In the future, we can consider walking through multiple blocks in one iteration, decoupling the implementation
+    from the block size and potentially improving performance by reducing the number of iterations and kernel launches.
+    """
     seq_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
 
@@ -120,7 +133,7 @@ def paged_attention_forward(
     Decode-phase paged attention (one new token per sequence).
 
     For each sequence s and query head h:
-        out[s:, h, :] = softmax(Q[s,h] @ K[s].T * scale) @ V[s]
+        out[s, h, :] = softmax(Q[s,h] @ K[s].T * scale) @ V[s]
 
     where K[s] and V[s] are gathered from the paged cache using block_tables[s]
 
