@@ -6,7 +6,6 @@ from transformers import (
     AutoTokenizer,
 )
 
-from server.executor.types import Sequence
 from server.metrics.logging import log_event
 from server.model.patches.qwen3 import qwen3_model_loader
 from server.model.types import ModelBackend, ModelConfig
@@ -28,11 +27,13 @@ class HFBackend(ModelBackend):
         self.model = model
         self.tokenizer = tokenizer
 
-    def prefill_batch(self, sequences: list[Sequence]) -> None:
-        raise NotImplementedError("HFBackend.prefill_batch is not implemented yet")
-
-    def decode_batch(self, sequences: list[Sequence]) -> None:
-        raise NotImplementedError("HFBackend.decode_batch is not implemented yet")
+    def tokenize(self, prompt: str) -> list[int]:
+        message = [{"role": "user", "content": prompt}]
+        formatted = self.tokenizer.apply_chat_template(
+            message, tokenize=False, add_generation_prompt=True, enable_thinking=False
+        )
+        inputs = self.tokenizer([formatted], return_tensors="pt").to(self.device)
+        return inputs["input_ids"][0].tolist()
 
     def release(self) -> None:
         # Hugging Face models don't require explicit resource release, but if there were any,

@@ -3,8 +3,6 @@ from typing import Protocol
 
 import torch
 
-from server.executor.types import Sequence
-
 
 @dataclass
 class ModelConfig:
@@ -16,8 +14,6 @@ class ModelConfig:
 
 
 class ModelBackend(Protocol):
-    def prefill_batch(self, sequences: list[Sequence]) -> None: ...
-
-    def decode_batch(self, sequences: list[Sequence]) -> None: ...
+    def tokenize(self, prompt: str) -> list[int]: ...
 
     def release(self) -> None: ...
