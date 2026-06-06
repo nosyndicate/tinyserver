@@ -13,6 +13,7 @@ from transformers.processing_utils import Unpack
 
 from server.model.inference_context import get_inference_context
 from server.model.kernels.kv_cache import store_kv_cache, store_kv_cache_batched
+from server.model.kernels.paged_attention import paged_attention_forward
 from server.model.kernels.varlen_attention import flash_attn_varlen_func
 from server.model.utils import bytes_to_gb, get_available_memory
 
@@ -322,15 +323,18 @@ def _patch_single_layer(
                     q, k, v, inference_context.sequences, batch, seq_len
                 )
         else:
-            output_tensors = []
+            if position_ids is None:
+                raise ValueError("Position ids should not be None for decode attention")
 
-            # TODO this implementation calls the SDPA multiple times, need to replaced with a
-            # a more efficient implementation.
+            output_tensors = []
+            block_tables = []
+
             for i, seq in enumerate(inference_context.sequences):
                 start_position = int(position_ids[0, i].item())
                 block_table = torch.tensor(
-                    seq["block_table"], device=hidden_states.device, dtype=torch.long
+                    seq["block_table"], device=hidden_states.device, dtype=torch.int32
                 )
+                block_tables.append(block_table)
 
                 # Since in decoding, we only need to generate 1 token at a time,
                 # the net new k and v for each sequence should only be for one token.
@@ -349,39 +353,64 @@ def _patch_single_layer(
                     attn_module.v_cache,
                 )
 
-                # Now, we need to gather the k and v from cache to make them contiguous for the attention calculation.
-                k_full, v_full = gather_kv_cache(
-                    start_position,
-                    block_table,
+                if not q.is_cuda:
+                    # CPU fallback: gather contiguous K/V and use SDPA. The paged attention
+                    # kernel is Triton/CUDA-only.
+                    k_full, v_full = gather_kv_cache(
+                        start_position,
+                        block_table.tolist(),
+                        attn_module.k_cache,
+                        attn_module.v_cache,
+                    )
+
+                    q_i = q[
+                        :, :, i : i + 1, :
+                    ]  # shape (1, num_attention_heads, 1, head_dim)
+                    k_full = k_full.unsqueeze(0).repeat_interleave(
+                        num_groups, dim=1
+                    )  # shape (1, num_attention_heads, seq_len, head_dim)
+                    v_full = v_full.unsqueeze(0).repeat_interleave(
+                        num_groups, dim=1
+                    )  # shape (1, num_attention_heads, seq_len, head_dim)
+                    output_i = F.scaled_dot_product_attention(
+                        q_i,
+                        k_full,
+                        v_full,
+                        attn_mask=None,
+                        scale=head_dim**-0.5,
+                    )  # shape: (1, num_attention_heads, 1, head_dim)
+                    output_tensors.append(output_i)
+
+            if q.is_cuda:
+                max_num_blocks_per_seq = max(
+                    block_table.shape[0] for block_table in block_tables
+                )
+                padded_block_tables = torch.zeros(
+                    (seq_len, max_num_blocks_per_seq),
+                    device=hidden_states.device,
+                    dtype=torch.int32,
+                )
+                for i, block_table in enumerate(block_tables):
+                    padded_block_tables[i, : block_table.shape[0]] = block_table
+
+                seq_lens = (position_ids.squeeze(0) + 1).to(dtype=torch.int32)
+                query = q.squeeze(0).transpose(0, 1).contiguous()
+                output = paged_attention_forward(
+                    query,
                     attn_module.k_cache,
                     attn_module.v_cache,
+                    padded_block_tables,
+                    attn_module.k_cache.shape[2],
+                    seq_lens,
                 )
-
-                q_i = q[
-                    :, :, i : i + 1, :
-                ]  # shape (1, num_attention_heads, 1, head_dim)
-                k_full = k_full.unsqueeze(0).repeat_interleave(
-                    num_groups, dim=1
+                output = output.reshape(batch, seq_len, -1)
+            else:
+                output = torch.cat(
+                    output_tensors, dim=2
                 )  # shape (1, num_attention_heads, seq_len, head_dim)
-                v_full = v_full.unsqueeze(0).repeat_interleave(
-                    num_groups, dim=1
-                )  # shape (1, num_attention_heads, seq_len, head_dim)
-
-                # Compute the attention output for the current sequence, since the query has length 1 per sequence,
-                # so causality is trivially satisfied
-                # We actually don't need to mask anything
-                output_i = F.scaled_dot_product_attention(
-                    q_i, k_full, v_full, attn_mask=None, scale=head_dim**-0.5
-                )  # shape: (1, num_attention_heads, 1, head_dim)
-
-                output_tensors.append(output_i)
-
-            output = torch.cat(
-                output_tensors, dim=2
-            )  # shape (1, num_attention_heads, seq_len, head_dim)
-            output = output.transpose(1, 2).reshape(
-                batch, seq_len, -1
-            )  # shape (1, seq_len, num_attention_heads * head_dim)
+                output = output.transpose(1, 2).reshape(
+                    batch, seq_len, -1
+                )  # shape (1, seq_len, num_attention_heads * head_dim)
 
         return attn_module.o_proj(output), None
 
