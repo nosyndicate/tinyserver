@@ -45,13 +45,13 @@ def make_scheduler(
 
 def test_can_add_new_sequence_true_when_capacity_available() -> None:
     sched = make_scheduler()
-    assert sched.can_add_new_sequence() is True
+    assert sched.can_add_new_sequence(make_sequence(num_tokens=1)) is True
 
 
 def test_can_add_new_sequence_false_when_waiting_full() -> None:
     sched = make_scheduler(max_waiting=1)
     sched.add(make_sequence())
-    assert sched.can_add_new_sequence() is False
+    assert sched.can_add_new_sequence(make_sequence(num_tokens=1)) is False
 
 
 def test_can_add_new_sequence_false_when_blocks_exhausted() -> None:
@@ -59,7 +59,20 @@ def test_can_add_new_sequence_false_when_blocks_exhausted() -> None:
     # Drain the single free block via a running sequence.
     seq = make_sequence(num_tokens=1)
     sched.block_manager.allocate(seq)
-    assert sched.can_add_new_sequence() is False
+    assert sched.can_add_new_sequence(make_sequence(num_tokens=1)) is False
+
+
+def test_can_add_new_sequence_false_when_prompt_exceeds_free_blocks() -> None:
+    # Regression: previously used has_free_blocks_for(1), which admitted a
+    # sequence as long as ONE token fit, ignoring that the full prompt needed
+    # more blocks than were free. can_allocate must reject it.
+    sched = make_scheduler(total_blocks=4, block_size=4)  # 4 blocks = 16 tokens
+    holder = make_sequence(sequence_id="holder", num_tokens=12)  # 3 blocks
+    sched.block_manager.allocate(holder)
+    assert len(sched.block_manager.free_blocks) == 1  # one 4-token block free
+
+    big = make_sequence(sequence_id="big", num_tokens=8)  # needs 2 blocks
+    assert sched.can_add_new_sequence(big) is False
 
 
 # --- schedule(): prefill ---------------------------------------------------

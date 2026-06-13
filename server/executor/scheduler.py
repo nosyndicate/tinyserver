@@ -27,21 +27,18 @@ class Scheduler:
         # The running list holds sequences that are currently running.
         self.running: list[Sequence] = []
 
-    def can_add_new_sequence(self) -> bool:
+    def can_add_new_sequence(self, sequence: Sequence) -> bool:
         """
-        Check if we can add a new sequence to the scheduler.
-        This is true if we have enough capacity in the waiting list
-        and the block manager can allocate a new sequence.
+        Check if we can add ``sequence`` to the scheduler: room in the waiting
+        queue AND the block manager can allocate the sequence's full prompt
+        right now.
+
+        Checked against the real prompt size rather than a single token so we
+        don't admit requests that can't actually be started.
         """
         if len(self.waiting) >= self.max_waiting:
             return False
-
-        # We check the block manager here to avoid adding too many sequences
-        # to the waiting list and then find out later that we can't even start them.
-        # This is a simple heuristic, in the future we might want to consider
-        # more sophisticated strategies to handle this situation, such as preemption
-        # or dynamic adjustment of max_waiting.
-        return self.block_manager.has_free_blocks_for(1)
+        return self.block_manager.can_allocate(sequence)
 
     def add(self, sequence: Sequence) -> None:
         self.waiting.append(sequence)
