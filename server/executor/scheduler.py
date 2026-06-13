@@ -56,14 +56,38 @@ class Scheduler:
         self.running.clear()
         self.waiting.clear()
 
+    def _reap_finished(self) -> None:
+        """Free blocks of finished sequences and drop them from running.
+
+        Finished sequences are detected by the engine (EOS / max-len), which
+        sets ``seq.finished = True``. Freeing their blocks is the scheduler's
+        job, so it lives here. Called at the top of every ``schedule()`` so
+        blocks are reclaimed promptly regardless of which phase runs next.
+        """
+        remain_running = []
+        for seq in self.running:
+            if seq.finished:
+                self.block_manager.free(seq)
+            else:
+                remain_running.append(seq)
+        self.running = remain_running
+
     def schedule(self) -> ScheduledBatch | None:
         """
         Decide which sequences to run next.
-        Simple policy: prioritize prefill so new requests get TTFT.
 
-        TODO: consider adding more sophisticated policies that take into account other factors,
-        also, consider preemption and do decoding first
+        Reaps finished sequences first, then applies a simple policy:
+        prioritize prefill so new requests get TTFT, falling back to decode.
+
+        Capacity contract: the scheduler reserves block capacity for the token
+        the engine is about to generate (``extra_tokens=1``) but does NOT
+        advance ``num_tokens`` — the engine does that after producing each
+        token, and sets ``finished`` when generation ends.
+
+        TODO: consider more sophisticated policies (preemption, decoding first).
         """
+        self._reap_finished()
+
         scheduled: list[Sequence] = []
         total_tokens = 0
         while self.waiting and len(scheduled) < self.max_num_sequences:
@@ -89,43 +113,28 @@ class Scheduler:
         if scheduled:
             return ScheduledBatch(kind=SequenceBatchTask.PREFILL, sequences=scheduled)
 
-        # Before pick a batch of sequences for decoding, check if any of the sequence is already finished.
-        # If so, free the blocks and remove it from running.
-        # This part of logic might need to be move into a separate method and called at the end of processing
-        # one batch of sequences.
-        remain_running = []
-        for seq in self.running:
-            if seq.finished:
-                self.block_manager.free(seq)
-            else:
-                remain_running.append(seq)
-
-        self.running = remain_running
-
         scheduled = []
         total_tokens = 0
         for seq_to_add in self.running:
             if len(scheduled) >= self.max_num_sequences:
                 break
 
-            # Reserve a slot for the token about to be generated. The executor
-            # fills this slot and must NOT increment num_tokens again for it.
-            seq_to_add.num_tokens += 1
-
-            # If we don't have enough memory to decode, skip for now and
-            # wait for other sequences to finish and free up memory. In the future, we can consider
-            # preemption or other strategies to handle this situation.
-            if not self.block_manager.can_append(seq_to_add):
-                seq_to_add.num_tokens -= 1
+            # Reserve a block for the token the engine is about to generate.
+            # The engine advances num_tokens after producing it; the scheduler
+            # only ensures the capacity exists here, so it never mutates
+            # num_tokens and there is no rollback to undo.
+            if not self.block_manager.can_append(seq_to_add, extra_tokens=1):
+                # Not enough memory to decode this one; skip it for now and
+                # wait for other sequences to finish and free up blocks.
+                # TODO: consider preemption or other strategies here.
                 continue
 
             # See if we can at least decode one more token for this sequence.
             if 1 + total_tokens > self.max_num_tokens:
-                # no budget this round, simply break
-                seq_to_add.num_tokens -= 1
+                # No budget this round, simply break.
                 break
 
-            self.block_manager.append(seq_to_add)
+            self.block_manager.append(seq_to_add, extra_tokens=1)
             scheduled.append(seq_to_add)
             total_tokens += 1
 

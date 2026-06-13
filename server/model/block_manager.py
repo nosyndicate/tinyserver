@@ -34,14 +34,21 @@ class BlockManager:
         """Checks if the requested sequence can be allocated given the current free blocks."""
         return self.has_free_blocks_for(sequence.num_tokens)
 
-    def _additional_blocks_needed(self, sequence: Sequence) -> int:
-        """Number of extra blocks needed to hold sequence.num_tokens tokens."""
-        needed = self._num_blocks_needed(sequence.num_tokens)
+    def _additional_blocks_needed(
+        self, sequence: Sequence, extra_tokens: int = 0
+    ) -> int:
+        """Number of extra blocks needed to hold num_tokens + extra_tokens tokens."""
+        needed = self._num_blocks_needed(sequence.num_tokens + extra_tokens)
         return needed - len(sequence.block_table)
 
-    def can_append(self, sequence: Sequence) -> bool:
-        """Checks if the sequence has (or can obtain) enough blocks for num_tokens."""
-        additional = self._additional_blocks_needed(sequence)
+    def can_append(self, sequence: Sequence, extra_tokens: int = 0) -> bool:
+        """Checks if the sequence has (or can obtain) enough blocks for num_tokens.
+
+        Pass extra_tokens > 0 to check capacity for tokens beyond num_tokens,
+        e.g. reserving a block for a token the engine is about to generate
+        without having advanced num_tokens yet.
+        """
+        additional = self._additional_blocks_needed(sequence, extra_tokens)
         return len(self.free_blocks) >= max(0, additional)
 
     def allocate(self, sequence: Sequence) -> None:
@@ -61,11 +68,13 @@ class BlockManager:
         self.allocated_blocks[sequence.sequence_id] = set(block_ids)
         sequence.block_table = list(block_ids)
 
-    def append(self, sequence: Sequence) -> None:
+    def append(self, sequence: Sequence, extra_tokens: int = 0) -> None:
         """
-        Idempotently ensures the sequence has enough blocks for sequence.num_tokens,
-        allocating any additional blocks needed. Safe to call regardless of whether
-        num_tokens was incremented before or after the call.
+        Idempotently ensures the sequence has enough blocks for num_tokens +
+        extra_tokens, allocating any additional blocks needed. The scheduler
+        passes extra_tokens=1 during decode to reserve the slot for the token
+        the engine is about to generate; num_tokens is advanced by the engine
+        afterwards, not here.
         """
         if sequence.sequence_id not in self.allocated_blocks:
             raise ValueError(
@@ -73,7 +82,7 @@ class BlockManager:
                 "call allocate() first"
             )
 
-        additional = self._additional_blocks_needed(sequence)
+        additional = self._additional_blocks_needed(sequence, extra_tokens)
         if additional <= 0:
             # Already has enough capacity for num_tokens.
             return
