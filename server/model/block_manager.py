@@ -26,10 +26,13 @@ class BlockManager:
     def _num_blocks_needed(self, num_tokens: int) -> int:
         return (num_tokens + self.block_size - 1) // self.block_size  # Ceiling division
 
+    def has_free_blocks_for(self, num_tokens: int) -> bool:
+        """Checks if there are enough free blocks to hold num_tokens tokens."""
+        return len(self.free_blocks) >= self._num_blocks_needed(num_tokens)
+
     def can_allocate(self, sequence: Sequence) -> bool:
         """Checks if the requested sequence can be allocated given the current free blocks."""
-        num_blocks_needed = self._num_blocks_needed(sequence.num_tokens)
-        return len(self.free_blocks) >= num_blocks_needed
+        return self.has_free_blocks_for(sequence.num_tokens)
 
     def _additional_blocks_needed(self, sequence: Sequence) -> int:
         """Number of extra blocks needed to hold sequence.num_tokens tokens."""

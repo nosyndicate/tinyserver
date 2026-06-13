@@ -21,7 +21,10 @@ class Scheduler:
         self.max_waiting = max_waiting
         self.max_num_sequences = max_num_sequences
         self.max_num_tokens = max_num_tokens
+
+        # The waiting queue holds sequences that are waiting to be scheduled.
         self.waiting: deque[Sequence] = deque()
+        # The running list holds sequences that are currently running.
         self.running: list[Sequence] = []
 
     def can_add_new_sequence(self) -> bool:
@@ -38,8 +41,7 @@ class Scheduler:
         # This is a simple heuristic, in the future we might want to consider
         # more sophisticated strategies to handle this situation, such as preemption
         # or dynamic adjustment of max_waiting.
-        dummy_seq = Sequence(request_id="dummy", num_tokens=1)
-        return self.block_manager.can_allocate(dummy_seq)
+        return self.block_manager.has_free_blocks_for(1)
 
     def add(self, sequence: Sequence) -> None:
         self.waiting.append(sequence)
@@ -67,7 +69,12 @@ class Scheduler:
         while self.waiting and len(scheduled) < self.max_num_sequences:
             seq_to_add = self.waiting[0]
             enough_memory = self.block_manager.can_allocate(seq_to_add)
-            enough_budget = seq_to_add.num_tokens + total_tokens <= self.max_num_tokens
+            # Allow a single oversized sequence through when the batch is still
+            # empty; otherwise it would block the whole queue forever.
+            enough_budget = (
+                not scheduled
+                or seq_to_add.num_tokens + total_tokens <= self.max_num_tokens
+            )
 
             if enough_memory and enough_budget:
                 seq = self.waiting.popleft()
@@ -97,20 +104,25 @@ class Scheduler:
 
         scheduled = []
         total_tokens = 0
-        while self.running and len(scheduled) < self.max_num_sequences:
-            seq_to_add = self.running[0]
-            enough_memory = self.block_manager.can_append(seq_to_add)
+        for seq_to_add in self.running:
+            if len(scheduled) >= self.max_num_sequences:
+                break
+
+            # Reserve a slot for the token about to be generated. The executor
+            # fills this slot and must NOT increment num_tokens again for it.
+            seq_to_add.num_tokens += 1
 
             # If we don't have enough memory to decode, skip for now and
             # wait for other sequences to finish and free up memory. In the future, we can consider
             # preemption or other strategies to handle this situation.
-            if not enough_memory:
+            if not self.block_manager.can_append(seq_to_add):
+                seq_to_add.num_tokens -= 1
                 continue
 
             # See if we can at least decode one more token for this sequence.
-            enough_budget = 1 + total_tokens <= self.max_num_tokens
-            # no budget this round, simply break
-            if not enough_budget:
+            if 1 + total_tokens > self.max_num_tokens:
+                # no budget this round, simply break
+                seq_to_add.num_tokens -= 1
                 break
 
             self.block_manager.append(seq_to_add)
