@@ -30,13 +30,15 @@ class HFBackend(ModelBackend):
         self.device = device
 
     def tokenize(self, prompt: str) -> list[int]:
+        # apply_chat_template(tokenize=True) returns the token ids (with the
+        # chat-template special tokens) directly; no tensor round-trip needed.
+        # The single-turn wrapping matches the current str-prompt API.
+        # TODO: truncate to the model's max context length (review #9); left
+        # for now since this engine is not yet wired into main.py.
         message = [{"role": "user", "content": prompt}]
-        formatted = self.tokenizer.apply_chat_template(
-            message, tokenize=False, add_generation_prompt=True, enable_thinking=False
+        return self.tokenizer.apply_chat_template(
+            message, tokenize=True, add_generation_prompt=True, enable_thinking=False
         )
-        # create tensor in cpu before we allocate on target device to avoid fragmentation issues on GPU
-        inputs = self.tokenizer([formatted], return_tensors="pt")
-        return inputs["input_ids"][0].tolist()
 
     def release(self) -> None:
         # Hugging Face models don't require explicit resource release, but if there were any,

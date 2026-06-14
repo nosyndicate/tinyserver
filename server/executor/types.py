@@ -198,8 +198,6 @@ class BaseBatchExecutor(Protocol):
 class SequenceState(Enum):
     WAITING = auto()
     RUNNING = auto()
-    # TODO: consider consolidate this flag with finished field in Sequence
-    FINISHED = auto()
 
 
 @dataclass

@@ -10,6 +10,11 @@ class BlockManager:
     Args:
         total_blocks: Total number of blocks available in the system.
         block_size: Number of tokens each block can hold.
+
+    THREAD SAFETY: ``free_blocks`` and ``allocated_blocks`` are not locked.
+    This is correct only because a single worker thread drives the engine
+    loop; sharing a manager across engine threads would need external
+    synchronization.
     """
 
     def __init__(self, total_blocks: int, block_size: int):
@@ -106,9 +111,24 @@ class BlockManager:
     def free(self, sequence: Sequence) -> None:
         """
         Clears the blocks allocated to the sequence and returns them to the free pool.
+
+        Freeing a sequence that was already freed (or never allocated) is a
+        safe no-op: ``allocated_blocks.pop`` returns an empty set the second
+        time, so nothing is pushed back. A ``RuntimeError`` is raised if any
+        of the sequence's blocks are already in the free pool — that can only
+        happen if a physical block was allocated to two sequences at once,
+        which would alias the KV cache.
         """
         allocated = self.allocated_blocks.pop(sequence.sequence_id, set())
-        for block_id in allocated:
-            heapq.heappush(self.free_blocks, block_id)
+        if allocated:
+            already_free = set(self.free_blocks) & allocated
+            if already_free:
+                raise RuntimeError(
+                    f"Block(s) {sorted(already_free)} freed for sequence "
+                    f"{sequence.sequence_id} are already in the free pool; this "
+                    "indicates a double-allocation that would alias the KV cache"
+                )
+            for block_id in allocated:
+                heapq.heappush(self.free_blocks, block_id)
 
         sequence.block_table = []
