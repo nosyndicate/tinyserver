@@ -23,6 +23,7 @@ class HFBackend(ModelBackend):
         self,
         model: AutoModelForCausalLM,
         tokenizer: AutoTokenizer,
+        device: str,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
@@ -32,7 +33,8 @@ class HFBackend(ModelBackend):
         formatted = self.tokenizer.apply_chat_template(
             message, tokenize=False, add_generation_prompt=True, enable_thinking=False
         )
-        inputs = self.tokenizer([formatted], return_tensors="pt").to(self.device)
+        # create tensor in cpu before we allocate on target device to avoid fragmentation issues on GPU
+        inputs = self.tokenizer([formatted], return_tensors="pt")
         return inputs["input_ids"][0].tolist()
 
     def release(self) -> None:

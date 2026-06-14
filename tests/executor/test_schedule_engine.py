@@ -1,0 +1,308 @@
+"""Tests for ScheduleInferenceEngine's prefill/decode execution path.
+
+These use a fake backend whose model emits logits whose argmax is a fixed
+function of the last input token (``next(t) = t + 1``). That makes the
+generated token chain fully deterministic without a real model, so we can
+assert the engine's position/``num_tokens`` handoff, event stream, and finish
+conditions directly.
+"""
+
+from queue import Queue
+
+import pytest
+import torch
+
+from server.executor.engine import (
+    EngineCallbacks,
+    ScheduleInferenceEngine,
+)
+from server.executor.scheduler import Scheduler
+from server.executor.types import (
+    DoneEvent,
+    GenerationRequestState,
+    RequestStatus,
+    TokenEvent,
+)
+from server.model.block_manager import BlockManager
+from server.model.inference_context import InferenceContext, inference_context
+from server.model.sampling import SamplingParams
+from tests.executor.worker_helpers import drain_events
+
+VOCAB = 32
+EOS = 31
+
+
+class _FakeOutput:
+    def __init__(self, logits: torch.Tensor) -> None:
+        self.logits = logits
+
+
+class _FakeModel:
+    """Returns logits whose per-position argmax is ``input_token + step``.
+
+    Records every call's (input_ids, position_ids) so tests can assert the
+    exact tensors the engine feeds to the model.
+    """
+
+    def __init__(self, vocab: int, step: int = 1) -> None:
+        self.vocab = vocab
+        self.step = step
+        self.calls: list[tuple[list[list[int]], list[list[int]]]] = []
+
+    def __call__(self, input_ids, position_ids=None, use_cache=False):
+        seq_len = input_ids.shape[1]
+        logits = torch.full(
+            (1, seq_len, self.vocab), -1.0, dtype=torch.float32, device=input_ids.device
+        )
+        for j in range(seq_len):
+            tok = int(input_ids[0, j])
+            logits[0, j, (tok + self.step) % self.vocab] = 1.0
+        self.calls.append(
+            (
+                input_ids.cpu().tolist(),
+                position_ids.cpu().tolist() if position_ids is not None else None,
+            )
+        )
+        return _FakeOutput(logits)
+
+
+class _FakeTokenizer:
+    def __init__(self, eos_token_id: int) -> None:
+        self.eos_token_id = eos_token_id
+
+    def decode(self, token_ids, skip_special_tokens=True) -> str:
+        return "".join(f"<{i}>" for i in token_ids)
+
+
+class _FakeBackend:
+    def __init__(self, prompt_tokens: list[int]) -> None:
+        self.tokenizer = _FakeTokenizer(EOS)
+        self.model = _FakeModel(VOCAB)
+        self._prompt_tokens = list(prompt_tokens)
+
+    def tokenize(self, prompt: str) -> list[int]:
+        return list(self._prompt_tokens)
+
+
+def _make_engine(
+    prompt_tokens: list[int],
+) -> tuple[ScheduleInferenceEngine, Scheduler, BlockManager, _FakeBackend]:
+    backend = _FakeBackend(prompt_tokens)
+    block_manager = BlockManager(total_blocks=8, block_size=4)
+    scheduler = Scheduler(
+        block_manager=block_manager,
+        max_waiting=4,
+        max_num_sequences=4,
+        max_num_tokens=64,
+    )
+    engine = ScheduleInferenceEngine(
+        scheduler=scheduler, backend=backend, block_manager=block_manager
+    )
+    return engine, scheduler, block_manager, backend
+
+
+def _make_req(max_new_tokens: int) -> GenerationRequestState:
+    return GenerationRequestState(
+        request_id="req-1",
+        sampling_params=SamplingParams(
+            max_new_tokens=max_new_tokens, temperature=0.0, top_p=1.0
+        ),
+        prompt="hello",
+        enqueued_ns=0,
+    )
+
+
+class _StopWhenDone:
+    """Stops the run loop once every tracked request reaches DONE."""
+
+    def __init__(self, requests: list[GenerationRequestState], max_calls: int = 2000):
+        self._requests = requests
+        self._calls = 0
+        self._max_calls = max_calls
+
+    def should_stop(self) -> bool:
+        self._calls += 1
+        if self._calls > self._max_calls:
+            return True
+        return all(r.status == RequestStatus.DONE for r in self._requests)
+
+    def wait_idle(self, _timeout: float) -> bool:
+        return False
+
+
+def _callbacks(recorder: dict) -> EngineCallbacks:
+    def cancel_request(req: GenerationRequestState, message: str) -> None:
+        recorder.setdefault("cancelled", []).append((req.request_id, message))
+
+    def handle_fatal_error(error: Exception, extra):
+        recorder["fatal"] = error
+
+    return EngineCallbacks(
+        cancel_request=cancel_request, handle_fatal_error=handle_fatal_error
+    )
+
+
+def _run_to_completion(engine, request) -> _FakeBackend:
+    inbound: Queue = Queue()
+    inbound.put(request)
+    control = _StopWhenDone([request])
+    recorder: dict = {}
+    engine.run(
+        inbound=inbound,
+        control=control,
+        callbacks=_callbacks(recorder),
+    )
+    assert "fatal" not in recorder, f"engine hit fatal error: {recorder.get('fatal')}"
+    return engine._backend
+
+
+def test_prefill_then_decode_finishes_at_max_length() -> None:
+    engine, scheduler, block_manager, backend = _make_engine(prompt_tokens=[3, 4, 5])
+    req = _make_req(max_new_tokens=4)
+
+    _run_to_completion(engine, req)
+
+    # Event stream: 4 tokens (last is_last) then a DoneEvent.
+    events = drain_events(req)
+    token_events = [e for e in events if isinstance(e, TokenEvent)]
+    done = [e for e in events if isinstance(e, DoneEvent)]
+    assert len(token_events) == 4
+    assert [t.token for t in token_events] == ["<6>", "<7>", "<8>", "<9>"]
+    assert token_events[-1].is_last is True
+    assert token_events[0].is_first is True
+    assert len(done) == 1
+    assert done[0].num_output_tokens == 4
+    assert done[0].num_prompt_tokens == 3
+    assert req.status == RequestStatus.DONE
+
+
+def test_decode_position_equals_num_tokens_and_increments() -> None:
+    """The load-bearing invariant: decode position_id == num_tokens (pre-store),
+    advancing by exactly one per decode step; input is the last generated token."""
+    engine, *_ = _make_engine(prompt_tokens=[3, 4, 5])
+    req = _make_req(max_new_tokens=4)
+    backend = _run_to_completion(engine, req)
+
+    prefill_calls = [c for c in backend.model.calls if len(c[0][0]) > 1]
+    decode_calls = [c for c in backend.model.calls if len(c[0][0]) == 1]
+
+    # One prefill over the flattened prompt [3,4,5] with positions [0,1,2].
+    assert len(prefill_calls) == 1
+    assert prefill_calls[0][0] == [[3, 4, 5]]
+    assert prefill_calls[0][1] == [[0, 1, 2]]
+
+    # Three decode steps: input is g1,g2,g3 == [6],[7],[8]; positions 3,4,5.
+    assert [c[0] for c in decode_calls] == [[[6]], [[7]], [[8]]]
+    assert [c[1] for c in decode_calls] == [[[3]], [[4]], [[5]]]
+
+
+def test_finished_sequence_is_reaped_and_blocks_freed() -> None:
+    engine, scheduler, block_manager, backend = _make_engine(prompt_tokens=[3, 4, 5])
+    req = _make_req(max_new_tokens=4)
+    _run_to_completion(engine, req)
+
+    # Scheduler dropped the finished sequence; all blocks returned to the pool.
+    assert scheduler.running == []
+    assert len(scheduler.waiting) == 0
+    assert sorted(block_manager.free_blocks) == list(range(block_manager.total_blocks))
+    # Engine-side tracking cleared too.
+    assert engine._all_requests == {}
+    assert engine._seq_to_request == {}
+
+
+def test_stops_on_eos_during_decode() -> None:
+    # Prompt [28, 29]: prefill last token 29 -> g1=30 (not EOS); decode input
+    # 30 -> g2=31 == EOS, so generation stops on the second token, mid-decode.
+    engine, *_ = _make_engine(prompt_tokens=[28, 29])
+    req = _make_req(max_new_tokens=10)
+    backend = _run_to_completion(engine, req)
+
+    events = drain_events(req)
+    token_events = [e for e in events if isinstance(e, TokenEvent)]
+    assert [t.token for t in token_events] == ["<30>", ""]
+    assert token_events[0].is_first is True and token_events[0].is_last is False
+    assert token_events[1].is_last is True  # EOS token
+    assert req.num_output_tokens == 1  # EOS token is not counted as output
+    assert req.status == RequestStatus.DONE
+    assert req.finished_reason is not None
+
+    # Exactly one decode step fed the non-EOS token g1=30 at position P=2.
+    decode_calls = [c for c in backend.model.calls if len(c[0][0]) == 1]
+    assert decode_calls == [([[30]], [[2]])]
+
+
+def test_cancel_inflight_clears_state_and_invokes_callback() -> None:
+    engine, scheduler, block_manager, backend = _make_engine(prompt_tokens=[3, 4, 5])
+    req = _make_req(max_new_tokens=4)
+    inbound: Queue = Queue()
+    inbound.put(req)
+    engine._drain_inbound(inbound)
+
+    # Request is now tracked and the sequence is waiting in the scheduler.
+    assert req.request_id in engine._all_requests
+    assert len(scheduler.waiting) == 1
+
+    cancelled: list = []
+
+    def cancel_request(r: GenerationRequestState, message: str) -> None:
+        cancelled.append((r.request_id, message))
+        r.status = RequestStatus.FAILED
+
+    engine.cancel_inflight("boom", cancel_request)
+
+    assert cancelled == [(req.request_id, "boom")]
+    assert engine._all_requests == {}
+    assert engine._seq_to_request == {}
+    assert len(scheduler.waiting) == 0
+    assert scheduler.running == []
+    assert sorted(block_manager.free_blocks) == list(range(block_manager.total_blocks))
+
+
+def test_prepare_decode_builds_one_token_per_sequence() -> None:
+    """Unit-level check of _prepare_decode's tensor shapes and context."""
+    from server.executor.types import Sequence, SequenceState
+
+    engine, *_ = _make_engine(prompt_tokens=[1, 2, 3])
+    seqs = [
+        Sequence(
+            sequence_id="a",
+            seq_len=2,
+            prompt_token_ids=[10, 11],
+            generated_token_ids=[21],
+            num_prompt_tokens=2,
+            num_tokens=2,
+            block_table=[0],
+            state=SequenceState.RUNNING,
+        ),
+        Sequence(
+            sequence_id="b",
+            seq_len=3,
+            prompt_token_ids=[20, 21, 22],
+            generated_token_ids=[33],
+            num_prompt_tokens=3,
+            num_tokens=3,
+            block_table=[1, 2],
+            state=SequenceState.RUNNING,
+        ),
+    ]
+    input_ids, position_ids, ctx = engine._prepare_decode(seqs)
+    assert input_ids.shape == (1, 2)  # (1, B): one token per sequence
+    assert input_ids.tolist() == [[21, 33]]
+    assert position_ids.shape == (1, 2)
+    assert position_ids.tolist() == [[2, 3]]  # == num_tokens of each seq
+    assert ctx.mode == "decode"
+    assert [s["block_table"] for s in ctx.sequences] == [[0], [1, 2]]
+
+
+def test_inference_context_roundtrip_unused_for_decode_num_tokens() -> None:
+    """Sanity: the decode context only needs block_table (num_tokens unused)."""
+    ctx = InferenceContext(mode="decode", sequences=[{"block_table": [0, 1]}])
+    with inference_context(ctx):
+        from server.model.inference_context import get_inference_context
+
+        assert get_inference_context().mode == "decode"
+        assert get_inference_context().sequences[0]["block_table"] == [0, 1]
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

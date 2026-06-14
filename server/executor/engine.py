@@ -24,7 +24,6 @@ from server.executor.types import (
     SequenceBatchTask,
 )
 from server.metrics.timers import now_ns
-from server.model.block_manager import BlockManager
 from server.model.inference_context import InferenceContext, inference_context
 from server.model.sampling import sample_token
 from server.model.types import ModelBackend
@@ -338,9 +337,7 @@ class ScheduleInferenceEngine:
         self,
         scheduler: Scheduler,
         backend: ModelBackend,
-        block_manager: BlockManager,
     ) -> None:
-        self._block_manager = block_manager
         self._backend = backend
         self._scheduler = scheduler
         self._all_requests: dict[str, RequestContext] = {}
@@ -357,6 +354,9 @@ class ScheduleInferenceEngine:
         """
         need_to_wait = []
 
+        # TODO The current implementation might require us to tokenize the prompt
+        # several times if GPU memory is not enough to schedule the request.
+        # Consider a better solution.
         while True:
             try:
                 req = inbound.get_nowait()
@@ -578,6 +578,8 @@ class ScheduleInferenceEngine:
             request_state.num_prompt_tokens = prompt_len
             self._emitter.on_prefill_started(request_state, start_ns)
 
+            # TODO try capture the failure of calling _sample_one
+            # so the error wouldn't cancel the other requests in the batch.
             result = self._sample_one(last_logit, request_state)
             seq.generated_token_ids.append(result.token_id)
             self._emitter.on_token(
@@ -637,6 +639,7 @@ class ScheduleInferenceEngine:
         self._all_requests.pop(request_id, None)
 
 
+# TODO reduce code duplication with the same function in tests/model/paged_helpers.py
 def build_prefill_inputs(
     seq_token_lists: list[list[int]],
     block_tables: list[list[int]],
