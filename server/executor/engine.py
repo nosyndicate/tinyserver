@@ -340,6 +340,7 @@ class ScheduleInferenceEngine:
     ) -> None:
         self._backend = backend
         self._scheduler = scheduler
+        self._device = backend.device
         self._all_requests: dict[str, RequestContext] = {}
         # Map sequence_id -> request state, since the scheduler hands back
         # ``Sequence`` objects and post-processing needs the request (for
@@ -361,6 +362,16 @@ class ScheduleInferenceEngine:
             try:
                 req = inbound.get_nowait()
                 seq = self._make_sequence(req)
+                if not self._scheduler.block_manager.can_ever_allocate(seq):
+                    # The prompt can never fit in the KV cache, no matter how
+                    # many blocks free up. Fail it once instead of re-queuing
+                    # (and re-tokenizing) it on every loop iteration forever.
+                    self._emitter.on_failed(
+                        req,
+                        f"prompt of {seq.num_tokens} tokens exceeds cache capacity of "
+                        f"{self._scheduler.block_manager.total_blocks * self._scheduler.block_manager.block_size} tokens",
+                    )
+                    continue
                 if self._scheduler.can_add_new_sequence(seq):
                     self._all_requests[req.request_id] = RequestContext(
                         request=req, sequence=seq
@@ -392,7 +403,6 @@ class ScheduleInferenceEngine:
         sequence_id = str(uuid.uuid4())
         return Sequence(
             sequence_id=sequence_id,
-            seq_len=len(token_ids),
             prompt_token_ids=token_ids,
             generated_token_ids=[],
             num_prompt_tokens=len(token_ids),
@@ -434,7 +444,7 @@ class ScheduleInferenceEngine:
             block_tables.append(seq.block_table)
 
         input_ids, position_ids, ctx = build_prefill_inputs(
-            seq_token_lists, block_tables, device="cuda"
+            seq_token_lists, block_tables, device=self._device
         )
         return input_ids, position_ids, ctx
 
@@ -451,14 +461,14 @@ class ScheduleInferenceEngine:
         input_ids = torch.tensor(
             [[seq.generated_token_ids[-1] for seq in sequences]],
             dtype=torch.long,
-            device="cuda",
+            device=self._device,
         )
         # position_id is the absolute position of the token being stored, which
         # equals the number of tokens already committed to the cache.
         position_ids = torch.tensor(
             [[seq.num_tokens for seq in sequences]],
             dtype=torch.long,
-            device="cuda",
+            device=self._device,
         )
         # The decode attention branch only reads ``block_table`` from each
         # sequence entry (positions come from ``position_ids``), so num_tokens
@@ -571,28 +581,38 @@ class ScheduleInferenceEngine:
             last_logit = out.logits[0, offset + prompt_len - 1, :].unsqueeze(0)
             offset += prompt_len
 
-            # num_prompt_tokens is required by the emitter's _finish path, and
-            # start_ns/DECODING transition are driven via on_prefill_started +
-            # on_token. We skip on_prefill_succeeded: it expects a per-request
-            # PrefillResult with tensors this engine does not carry.
-            request_state.num_prompt_tokens = prompt_len
-            self._emitter.on_prefill_started(request_state, start_ns)
+            try:
+                # num_prompt_tokens is required by the emitter's _finish path,
+                # and start_ns/DECODING transition are driven via
+                # on_prefill_started + on_token. We skip on_prefill_succeeded:
+                # it expects a per-request PrefillResult with tensors this
+                # engine does not carry.
+                request_state.num_prompt_tokens = prompt_len
+                self._emitter.on_prefill_started(request_state, start_ns)
+                result = self._sample_one(last_logit, request_state)
+                seq.generated_token_ids.append(result.token_id)
+                self._emitter.on_token(
+                    request_state,
+                    DecodeResult(
+                        token_id=result.token_id,
+                        token=result.token,
+                        finish_reason=result.finish_reason,
+                    ),
+                )
 
-            # TODO try capture the failure of calling _sample_one
-            # so the error wouldn't cancel the other requests in the batch.
-            result = self._sample_one(last_logit, request_state)
-            seq.generated_token_ids.append(result.token_id)
-            self._emitter.on_token(
-                request_state,
-                DecodeResult(
-                    token_id=result.token_id,
-                    token=result.token,
-                    finish_reason=result.finish_reason,
-                ),
-            )
-
-            if result.is_finished:
+                if result.is_finished:
+                    seq.finished = True
+                    self._cleanup_request(seq.sequence_id, request_state.request_id)
+            except Exception:
+                # Fail just this request instead of letting the exception
+                # propagate to run()'s fatal handler and tear down the worker
+                # along with every other in-flight request.
+                logger.exception(
+                    "Failed to sample first token for request %s",
+                    request_state.request_id,
+                )
                 seq.finished = True
+                self._emitter.on_failed(request_state, "sampling failed during prefill")
                 self._cleanup_request(seq.sequence_id, request_state.request_id)
 
     def _post_decode(
@@ -613,19 +633,29 @@ class ScheduleInferenceEngine:
             seq.num_tokens += 1
 
             logit = out.logits[0, i, :].unsqueeze(0)
-            result = self._sample_one(logit, request_state)
-            seq.generated_token_ids.append(result.token_id)
-            self._emitter.on_token(
-                request_state,
-                DecodeResult(
-                    token_id=result.token_id,
-                    token=result.token,
-                    finish_reason=result.finish_reason,
-                ),
-            )
+            try:
+                result = self._sample_one(logit, request_state)
+                seq.generated_token_ids.append(result.token_id)
+                self._emitter.on_token(
+                    request_state,
+                    DecodeResult(
+                        token_id=result.token_id,
+                        token=result.token,
+                        finish_reason=result.finish_reason,
+                    ),
+                )
 
-            if result.is_finished:
+                if result.is_finished:
+                    seq.finished = True
+                    self._cleanup_request(seq.sequence_id, request_state.request_id)
+            except Exception:
+                # Fail just this request instead of tearing down the worker.
+                logger.exception(
+                    "Failed to sample next token for request %s",
+                    request_state.request_id,
+                )
                 seq.finished = True
+                self._emitter.on_failed(request_state, "sampling failed during decode")
                 self._cleanup_request(seq.sequence_id, request_state.request_id)
 
     def _cleanup_request(self, sequence_id: str, request_id: str) -> None:

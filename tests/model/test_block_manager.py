@@ -18,7 +18,6 @@ def make_sequence(
     """
     return Sequence(
         sequence_id=sequence_id,
-        seq_len=num_tokens,
         prompt_token_ids=[],
         generated_token_ids=[],
         num_prompt_tokens=num_tokens,

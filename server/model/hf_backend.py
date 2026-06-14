@@ -27,6 +27,7 @@ class HFBackend(ModelBackend):
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
+        self.device = device
 
     def tokenize(self, prompt: str) -> list[int]:
         message = [{"role": "user", "content": prompt}]
@@ -81,4 +82,4 @@ class HFBackend(ModelBackend):
             model_config.device,
         )
 
-        return HFBackend(model, tokenizer)
+        return HFBackend(model, tokenizer, model_config.device)

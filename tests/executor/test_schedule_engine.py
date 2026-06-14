@@ -19,6 +19,7 @@ from server.executor.engine import (
 from server.executor.scheduler import Scheduler
 from server.executor.types import (
     DoneEvent,
+    ErrorEvent,
     GenerationRequestState,
     RequestStatus,
     TokenEvent,
@@ -79,6 +80,7 @@ class _FakeBackend:
         self.tokenizer = _FakeTokenizer(EOS)
         self.model = _FakeModel(VOCAB)
         self._prompt_tokens = list(prompt_tokens)
+        self.device = "cpu"
 
     def tokenize(self, prompt: str) -> list[int]:
         return list(self._prompt_tokens)
@@ -264,7 +266,6 @@ def test_prepare_decode_builds_one_token_per_sequence() -> None:
     seqs = [
         Sequence(
             sequence_id="a",
-            seq_len=2,
             prompt_token_ids=[10, 11],
             generated_token_ids=[21],
             num_prompt_tokens=2,
@@ -274,7 +275,6 @@ def test_prepare_decode_builds_one_token_per_sequence() -> None:
         ),
         Sequence(
             sequence_id="b",
-            seq_len=3,
             prompt_token_ids=[20, 21, 22],
             generated_token_ids=[33],
             num_prompt_tokens=3,
@@ -300,6 +300,85 @@ def test_inference_context_roundtrip_unused_for_decode_num_tokens() -> None:
 
         assert get_inference_context().mode == "decode"
         assert get_inference_context().sequences[0]["block_table"] == [0, 1]
+
+
+def test_oversized_prompt_is_failed_not_requeued() -> None:
+    # Cache capacity = 8 blocks * 4 tokens = 32. A 40-token prompt needs
+    # ceil(40/4) = 10 blocks and can never fit, so it must be failed once
+    # rather than re-queued (and re-tokenized) on every loop forever.
+    engine, scheduler, block_manager, backend = _make_engine(
+        prompt_tokens=list(range(40))
+    )
+    req = _make_req(max_new_tokens=4)
+    inbound: Queue = Queue()
+    inbound.put(req)
+
+    engine._drain_inbound(inbound)
+
+    assert req.status == RequestStatus.FAILED
+    assert len(scheduler.waiting) == 0
+    assert engine._all_requests == {}
+    assert inbound.empty()  # not re-queued back for retry
+    events = drain_events(req)
+    assert any(isinstance(e, ErrorEvent) for e in events)
+
+
+def test_post_decode_isolates_sampling_failure() -> None:
+    """A sampling failure for one sequence fails only it; the batch continues."""
+    from server.executor.types import Sequence, SequenceState
+
+    engine, *_ = _make_engine(prompt_tokens=[1, 2, 3])
+
+    req_a = _make_req(max_new_tokens=5)
+    req_a.request_id = "a"
+    req_b = _make_req(max_new_tokens=5)
+    req_b.request_id = "b"
+
+    seq_a = Sequence(
+        sequence_id="sa",
+        prompt_token_ids=[1, 2, 3],
+        generated_token_ids=[4],
+        num_prompt_tokens=3,
+        num_tokens=3,
+        block_table=[0],
+        state=SequenceState.RUNNING,
+    )
+    seq_b = Sequence(
+        sequence_id="sb",
+        prompt_token_ids=[1, 2, 3],
+        generated_token_ids=[4],
+        num_prompt_tokens=3,
+        num_tokens=3,
+        block_table=[1],
+        state=SequenceState.RUNNING,
+    )
+    engine._seq_to_request[seq_a.sequence_id] = req_a
+    engine._seq_to_request[seq_b.sequence_id] = req_b
+
+    # Tokenizer that blows up when decoding token 0 (the "bad" token).
+    class _BadTokenizer(_FakeTokenizer):
+        def decode(self, token_ids, skip_special_tokens=True) -> str:
+            if 0 in token_ids:
+                raise RuntimeError("boom")
+            return super().decode(token_ids, skip_special_tokens=True)
+
+    engine._backend.tokenizer = _BadTokenizer(EOS)
+
+    # out.logits [1, 2, vocab]: seq a argmax -> 0 (decode raises), seq b -> 7 (ok).
+    logits = torch.full((1, 2, VOCAB), -1.0, dtype=torch.float32)
+    logits[0, 0, 0] = 1.0
+    logits[0, 1, 7] = 1.0
+    out = _FakeOutput(logits)
+
+    engine._post_decode(out, [seq_a, seq_b])
+
+    assert req_a.status == RequestStatus.FAILED
+    assert seq_a.finished is True
+    # seq b continued: a token was emitted and it is still decoding.
+    assert req_b.status != RequestStatus.FAILED
+    assert req_b.num_output_tokens == 1
+    assert seq_b.finished is False
+    assert any(isinstance(e, ErrorEvent) for e in drain_events(req_a))
 
 
 if __name__ == "__main__":

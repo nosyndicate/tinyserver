@@ -14,6 +14,8 @@ class ModelConfig:
 
 
 class ModelBackend(Protocol):
+    device: str
+
     def tokenize(self, prompt: str) -> list[int]: ...
 
     def release(self) -> None: ...

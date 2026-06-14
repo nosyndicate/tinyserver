@@ -205,13 +205,11 @@ class SequenceState(Enum):
 @dataclass
 class Sequence:
     sequence_id: str
-    seq_len: int
     prompt_token_ids: list[int]
     generated_token_ids: list[int]
     num_prompt_tokens: int
     num_tokens: int
     block_table: list[int]
-    last_block_used: int | None = None
     state: SequenceState = SequenceState.WAITING
     finished: bool = False
 
