@@ -95,9 +95,7 @@ def _make_engine(
         max_num_sequences=4,
         max_num_tokens=64,
     )
-    engine = ScheduleInferenceEngine(
-        scheduler=scheduler, backend=backend, block_manager=block_manager
-    )
+    engine = ScheduleInferenceEngine(scheduler=scheduler, backend=backend)
     return engine, scheduler, block_manager, backend
 
 
