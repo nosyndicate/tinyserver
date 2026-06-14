@@ -6,7 +6,6 @@ from transformers import (
     AutoTokenizer,
 )
 
-from server.executor.types import Sequence
 from server.metrics.logging import log_event
 from server.model.patches.qwen3 import qwen3_model_loader
 from server.model.types import ModelBackend, ModelConfig
@@ -24,15 +23,20 @@ class HFBackend(ModelBackend):
         self,
         model: AutoModelForCausalLM,
         tokenizer: AutoTokenizer,
+        device: str,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
+        self.device = device
 
-    def prefill_batch(self, sequences: list[Sequence]) -> None:
-        raise NotImplementedError("HFBackend.prefill_batch is not implemented yet")
-
-    def decode_batch(self, sequences: list[Sequence]) -> None:
-        raise NotImplementedError("HFBackend.decode_batch is not implemented yet")
+    def tokenize(self, prompt: str) -> list[int]:
+        message = [{"role": "user", "content": prompt}]
+        formatted = self.tokenizer.apply_chat_template(
+            message, tokenize=False, add_generation_prompt=True, enable_thinking=False
+        )
+        # create tensor in cpu before we allocate on target device to avoid fragmentation issues on GPU
+        inputs = self.tokenizer([formatted], return_tensors="pt")
+        return inputs["input_ids"][0].tolist()
 
     def release(self) -> None:
         # Hugging Face models don't require explicit resource release, but if there were any,
@@ -78,4 +82,4 @@ class HFBackend(ModelBackend):
             model_config.device,
         )
 
-        return HFBackend(model, tokenizer)
+        return HFBackend(model, tokenizer, model_config.device)

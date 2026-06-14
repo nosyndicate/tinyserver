@@ -34,6 +34,15 @@ class BlockManager:
         """Checks if the requested sequence can be allocated given the current free blocks."""
         return self.has_free_blocks_for(sequence.num_tokens)
 
+    def can_ever_allocate(self, sequence: Sequence) -> bool:
+        """Whether the prompt could ever fit in the cache, ignoring current usage.
+
+        Unlike ``can_allocate``, this is checked against the cache's total
+        capacity, so a prompt that can never be scheduled (no matter how many
+        blocks free up) is detected up front.
+        """
+        return self._num_blocks_needed(sequence.num_tokens) <= self.total_blocks
+
     def _additional_blocks_needed(
         self, sequence: Sequence, extra_tokens: int = 0
     ) -> int:
