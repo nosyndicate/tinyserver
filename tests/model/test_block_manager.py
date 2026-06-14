@@ -231,3 +231,21 @@ def test_allocate_append_free_reallocate_round_trip() -> None:
     bm.allocate(seq2)
     assert len(seq2.block_table) == 4
     assert len(bm.free_blocks) == 0
+
+
+def test_free_raises_on_already_free_block() -> None:
+    # A physical block handed to two sequences at once (a double-allocation
+    # bug) must be caught when the second one is freed, rather than silently
+    # aliasing the KV cache. The first free returns block 0 to the pool; the
+    # second then sees it already free and raises.
+    bm = BlockManager(total_blocks=8, block_size=4)
+    seq = make_sequence(num_tokens=4)
+    bm.allocate(seq)  # consumes block 0
+
+    # Simulate the bug: block 0 is also recorded for another sequence.
+    ghost = make_sequence(sequence_id="seq-ghost", num_tokens=4)
+    bm.allocated_blocks["seq-ghost"] = {0}
+
+    bm.free(seq)  # block 0 returns to the free pool
+    with pytest.raises(RuntimeError):
+        bm.free(ghost)

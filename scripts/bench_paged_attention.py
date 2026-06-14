@@ -25,7 +25,8 @@ from transformers import AutoModelForCausalLM, PreTrainedModel
 
 from server.model.inference_context import InferenceContext, inference_context
 from server.model.patches.qwen3 import qwen3_model_loader
-from tests.model.paged_helpers import allocate_block_tables, build_prefill_inputs
+from server.model.prefill_helpers import build_prefill_inputs
+from tests.model.paged_helpers import allocate_block_tables
 
 DEFAULT_MODEL_NAME = "Qwen/Qwen3-0.6B"
 DEFAULT_DEVICE = "cuda"

@@ -14,6 +14,7 @@ import torch
 from transformers import PreTrainedModel
 
 from server.model.inference_context import InferenceContext, inference_context
+from server.model.prefill_helpers import build_prefill_inputs
 
 
 def allocate_block_tables(
@@ -31,26 +32,6 @@ def allocate_block_tables(
         block_tables.append(list(range(next_block, next_block + num_blocks)))
         next_block += num_blocks
     return block_tables
-
-
-def build_prefill_inputs(
-    seq_token_lists: list[list[int]],
-    block_tables: list[list[int]],
-    device: str,
-) -> tuple[torch.Tensor, torch.Tensor, InferenceContext]:
-    """Flatten a batch of prompts into the patched model's prefill input format."""
-    flat_input_ids: list[int] = []
-    flat_position_ids: list[int] = []
-    sequences = []
-    for toks, block_table in zip(seq_token_lists, block_tables):
-        flat_input_ids.extend(toks)
-        flat_position_ids.extend(range(len(toks)))
-        sequences.append({"num_tokens": len(toks), "block_table": block_table})
-
-    input_ids = torch.tensor([flat_input_ids], dtype=torch.long, device=device)
-    position_ids = torch.tensor([flat_position_ids], dtype=torch.long, device=device)
-    ctx = InferenceContext(mode="prefill", sequences=sequences)
-    return input_ids, position_ids, ctx
 
 
 def patched_prefill_logits(
