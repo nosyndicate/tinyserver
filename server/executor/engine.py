@@ -338,10 +338,14 @@ class ScheduleInferenceEngine:
         self,
         scheduler: Scheduler,
         backend: ModelBackend,
+        max_pending: int,
     ) -> None:
+        if max_pending <= 0:
+            raise ValueError("max_pending must be positive")
         self._backend = backend
         self._scheduler = scheduler
         self._device = backend.device
+        self._max_pending = max_pending
         self._all_requests: dict[str, RequestContext] = {}
         # Map sequence_id -> request state, since the scheduler hands back
         # ``Sequence`` objects and post-processing needs the request (for
@@ -350,7 +354,10 @@ class ScheduleInferenceEngine:
         # Requests pulled from `inbound` and tokenized once, but not yet
         # admitted to the scheduler (no block capacity / waiting queue full).
         # Kept in arrival order so we never re-tokenize or recycle them through
-        # `inbound`.
+        # `inbound`. Bounded by ``max_pending``: once full we stop draining
+        # `inbound` so the bounded inbound queue backs up and producers see
+        # backpressure (``queue.Full``) instead of `_pending` growing without
+        # limit.
         self._pending: list[RequestContext] = []
         self._emitter = RequestEventEmitter()
 
@@ -359,9 +366,14 @@ class ScheduleInferenceEngine:
 
         Two phases:
 
-        1. Drain every available request from ``inbound``, tokenize it exactly
+        1. Drain requests from ``inbound`` until ``self._pending`` is full
+           (``max_pending``) or ``inbound`` is empty, tokenizing each exactly
            once via ``_make_sequence``, fail-fast any prompt that can never fit
            the cache, and append the rest to ``self._pending`` in arrival order.
+           Stopping once ``_pending`` is full leaves remaining requests on the
+           bounded ``inbound`` queue so it backs up and producers see
+           backpressure (``queue.Full``) instead of ``_pending`` growing without
+           bound.
         2. Walk ``self._pending`` (oldest first) and admit each sequence the
            scheduler can accept right now; keep the rest in ``self._pending``
            for a later spin.
@@ -380,8 +392,10 @@ class ScheduleInferenceEngine:
         stop early once the waiting queue is full, since nothing else can be
         admitted then.
         """
-        # Phase 1: drain and tokenize each new request exactly once.
-        while True:
+        # Phase 1: drain and tokenize each new request exactly once, but stop
+        # once `_pending` is full so the bounded inbound queue can back up and
+        # signal backpressure to producers via ``queue.Full``.
+        while len(self._pending) < self._max_pending:
             try:
                 req = inbound.get_nowait()
             except Empty:

@@ -99,7 +99,9 @@ def _make_engine(
         max_num_sequences=4,
         max_num_tokens=64,
     )
-    engine = ScheduleInferenceEngine(scheduler=scheduler, backend=backend)
+    engine = ScheduleInferenceEngine(
+        scheduler=scheduler, backend=backend, max_pending=8
+    )
     return engine, scheduler, block_manager, backend
 
 
@@ -384,7 +386,7 @@ def test_post_decode_isolates_sampling_failure() -> None:
 
 
 def _make_engine_with_max_waiting(
-    prompt_tokens: list[int], max_waiting: int
+    prompt_tokens: list[int], max_waiting: int, max_pending: int = 8
 ) -> tuple[ScheduleInferenceEngine, Scheduler, BlockManager, _FakeBackend]:
     backend = _FakeBackend(prompt_tokens)
     block_manager = BlockManager(total_blocks=8, block_size=4)
@@ -394,7 +396,9 @@ def _make_engine_with_max_waiting(
         max_num_sequences=4,
         max_num_tokens=64,
     )
-    engine = ScheduleInferenceEngine(scheduler=scheduler, backend=backend)
+    engine = ScheduleInferenceEngine(
+        scheduler=scheduler, backend=backend, max_pending=max_pending
+    )
     return engine, scheduler, block_manager, backend
 
 
@@ -488,6 +492,44 @@ def test_cancel_inflight_cancels_pending_requests() -> None:
     assert engine._pending == []
     assert engine._all_requests == {}
     assert engine._seq_to_request == {}
+
+
+def test_pending_is_bounded_for_backpressure() -> None:
+    # max_waiting=0 means nothing can ever be admitted, so every drained request
+    # piles onto `_pending`. With max_pending=2 the drain must stop after pulling
+    # two requests, leaving the rest on the bounded inbound queue (backpressure)
+    # and tokenizing only what it actually pulled.
+    engine, _, _, backend = _make_engine_with_max_waiting(
+        prompt_tokens=[3, 4, 5], max_waiting=0, max_pending=2
+    )
+    reqs = [_make_req_id(f"req-{i}") for i in range(5)]
+    inbound: Queue = Queue()
+    for req in reqs:
+        inbound.put(req)
+
+    engine._drain_inbound(inbound)
+
+    assert len(engine._pending) == 2  # capped at max_pending
+    assert inbound.qsize() == 3  # remainder left on inbound -> producers back up
+    assert backend.tokenize_calls == 2  # we don't tokenize what we don't pull
+
+    # A second drain stays at the cap and does not tokenize anything new.
+    engine._drain_inbound(inbound)
+    assert len(engine._pending) == 2
+    assert inbound.qsize() == 3
+    assert backend.tokenize_calls == 2
+
+
+def test_max_pending_must_be_positive() -> None:
+    backend = _FakeBackend([3, 4, 5])
+    scheduler = Scheduler(
+        block_manager=BlockManager(total_blocks=8, block_size=4),
+        max_waiting=4,
+        max_num_sequences=4,
+        max_num_tokens=64,
+    )
+    with pytest.raises(ValueError):
+        ScheduleInferenceEngine(scheduler=scheduler, backend=backend, max_pending=0)
 
 
 if __name__ == "__main__":
