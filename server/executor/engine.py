@@ -347,57 +347,76 @@ class ScheduleInferenceEngine:
         # ``Sequence`` objects and post-processing needs the request (for
         # sampling params, generator, and event emission).
         self._seq_to_request: dict[str, GenerationRequestState] = {}
+        # Requests pulled from `inbound` and tokenized once, but not yet
+        # admitted to the scheduler (no block capacity / waiting queue full).
+        # Kept in arrival order so we never re-tokenize or recycle them through
+        # `inbound`.
+        self._pending: list[RequestContext] = []
         self._emitter = RequestEventEmitter()
 
     def _drain_inbound(self, inbound: Queue[GenerationRequestState]) -> None:
-        """
-        Move requests from the inbound queue to the scheduler's waiting list.
-        Convert the GenerationRequestState to Sequence and add to the scheduler.
-        """
-        need_to_wait = []
+        """Tokenize new requests once and admit pending ones to the scheduler.
 
-        # TODO The current implementation might require us to tokenize the prompt
-        # several times if GPU memory is not enough to schedule the request.
-        # Consider a better solution.
+        Two phases:
+
+        1. Drain every available request from ``inbound``, tokenize it exactly
+           once via ``_make_sequence``, fail-fast any prompt that can never fit
+           the cache, and append the rest to ``self._pending`` in arrival order.
+        2. Walk ``self._pending`` (oldest first) and admit each sequence the
+           scheduler can accept right now; keep the rest in ``self._pending``
+           for a later spin.
+
+        Sequences are therefore tokenized only once, and un-admittable requests
+        live on ``self._pending`` rather than being re-queued onto ``inbound``
+        (which previously forced re-tokenization on every loop and pushed older
+        requests behind newer arrivals).
+
+        Admission is intentionally **best-effort**, not strict FIFO: if the
+        oldest pending request can't be allocated but the scheduler's waiting
+        queue still has room, we keep trying later (possibly smaller) pending
+        requests, so a newer request may be admitted ahead of an older one.
+        This avoids head-of-line blocking where one prompt that is too big for
+        the currently-free blocks would stall everything behind it. We only
+        stop early once the waiting queue is full, since nothing else can be
+        admitted then.
+        """
+        # Phase 1: drain and tokenize each new request exactly once.
         while True:
             try:
                 req = inbound.get_nowait()
-                seq = self._make_sequence(req)
-                if not self._scheduler.block_manager.can_ever_allocate(seq):
-                    # The prompt can never fit in the KV cache, no matter how
-                    # many blocks free up. Fail it once instead of re-queuing
-                    # (and re-tokenizing) it on every loop iteration forever.
-                    self._emitter.on_failed(
-                        req,
-                        f"prompt of {seq.num_tokens} tokens exceeds cache capacity of "
-                        f"{self._scheduler.block_manager.total_blocks * self._scheduler.block_manager.block_size} tokens",
-                    )
-                    continue
-                if self._scheduler.can_add_new_sequence(seq):
-                    self._all_requests[req.request_id] = RequestContext(
-                        request=req, sequence=seq
-                    )
-                    self._seq_to_request[seq.sequence_id] = req
-                    self._scheduler.add(seq)
-                else:
-                    # Collect requests that can't be scheduled right now to put them back to the inbound queue later,
-                    # so they can be retried in the next loop iteration.
-                    need_to_wait.append(req)
-                    # if the scheduler's waiting queue is full, it's unlikely that the next requests can be
-                    # scheduled, so break early to avoid unnecessary retries.
-                    # otherwise, if the scheduler can accept new sequences but the current one just can't be
-                    # scheduled due to block manager capacity, we can continue to try the next requests
-                    # which might be schedulable.
-                    if self._scheduler.waiting_queue_is_full():
-                        break
-                    else:
-                        continue
             except Empty:
                 break
+            seq = self._make_sequence(req)
+            if not self._scheduler.block_manager.can_ever_allocate(seq):
+                # The prompt can never fit in the KV cache, no matter how many
+                # blocks free up. Fail it once instead of holding it forever.
+                self._emitter.on_failed(
+                    req,
+                    f"prompt of {seq.num_tokens} tokens exceeds cache capacity of "
+                    f"{self._scheduler.block_manager.total_blocks * self._scheduler.block_manager.block_size} tokens",
+                )
+                continue
+            self._pending.append(RequestContext(request=req, sequence=seq))
 
-        # Put back the requests that can't be scheduled right now to the inbound queue for later processing
-        for req in need_to_wait:
-            inbound.put(req)
+        # Phase 2: admit pending requests (oldest first), best-effort.
+        still_pending: list[RequestContext] = []
+        for i, ctx in enumerate(self._pending):
+            seq = ctx.sequence
+            if self._scheduler.can_add_new_sequence(seq):
+                self._all_requests[ctx.request.request_id] = ctx
+                self._seq_to_request[seq.sequence_id] = ctx.request
+                self._scheduler.add(seq)
+            else:
+                still_pending.append(ctx)
+                # Waiting queue full: nothing further can be admitted this spin,
+                # so keep the remaining pending requests untouched and in order.
+                if self._scheduler.waiting_queue_is_full():
+                    still_pending.extend(self._pending[i + 1 :])
+                    break
+                # Otherwise the waiting queue has room and only this sequence's
+                # blocks couldn't be allocated; try the next pending request.
+
+        self._pending = still_pending
 
     def _make_sequence(self, req: GenerationRequestState) -> Sequence:
         token_ids = self._backend.tokenize(req.prompt)
@@ -420,7 +439,8 @@ class ScheduleInferenceEngine:
 
         Asks the scheduler to clear its waiting/running sequences (freeing
         their blocks) and emits an error event for each tracked request via
-        the supplied ``cancel_request`` callback.
+        the supplied ``cancel_request`` callback, including requests still on
+        the pending list that were tokenized but never admitted.
         """
         self._scheduler.clear()
         for context in self._all_requests.values():
@@ -431,8 +451,19 @@ class ScheduleInferenceEngine:
                     "Failed to emit error event for request %s",
                     context.request.request_id,
                 )
+        # Pending requests were tokenized but never admitted to the scheduler,
+        # so they are not in ``_all_requests`` and must be cancelled separately.
+        for context in self._pending:
+            try:
+                cancel_request(context.request, message)
+            except Exception:
+                logger.exception(
+                    "Failed to emit error event for pending request %s",
+                    context.request.request_id,
+                )
         self._all_requests.clear()
         self._seq_to_request.clear()
+        self._pending.clear()
 
     def _prepare_prefill(
         self, sequences: list[Sequence]

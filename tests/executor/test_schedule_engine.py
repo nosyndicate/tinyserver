@@ -81,8 +81,10 @@ class _FakeBackend:
         self.model = _FakeModel(VOCAB)
         self._prompt_tokens = list(prompt_tokens)
         self.device = "cpu"
+        self.tokenize_calls = 0
 
     def tokenize(self, prompt: str) -> list[int]:
+        self.tokenize_calls += 1
         return list(self._prompt_tokens)
 
 
@@ -379,6 +381,113 @@ def test_post_decode_isolates_sampling_failure() -> None:
     assert req_b.num_output_tokens == 1
     assert seq_b.finished is False
     assert any(isinstance(e, ErrorEvent) for e in drain_events(req_a))
+
+
+def _make_engine_with_max_waiting(
+    prompt_tokens: list[int], max_waiting: int
+) -> tuple[ScheduleInferenceEngine, Scheduler, BlockManager, _FakeBackend]:
+    backend = _FakeBackend(prompt_tokens)
+    block_manager = BlockManager(total_blocks=8, block_size=4)
+    scheduler = Scheduler(
+        block_manager=block_manager,
+        max_waiting=max_waiting,
+        max_num_sequences=4,
+        max_num_tokens=64,
+    )
+    engine = ScheduleInferenceEngine(scheduler=scheduler, backend=backend)
+    return engine, scheduler, block_manager, backend
+
+
+def _make_req_id(request_id: str, max_new_tokens: int = 4) -> GenerationRequestState:
+    return GenerationRequestState(
+        request_id=request_id,
+        sampling_params=SamplingParams(
+            max_new_tokens=max_new_tokens, temperature=0.0, top_p=1.0
+        ),
+        prompt="hello",
+        enqueued_ns=0,
+    )
+
+
+def test_pending_requests_are_not_retokenized() -> None:
+    # max_waiting=2 means only two of four requests can be admitted per drain;
+    # the rest wait on the engine's pending list. They must keep their
+    # already-built sequence and never be re-tokenized or re-queued to inbound.
+    engine, scheduler, _, backend = _make_engine_with_max_waiting(
+        prompt_tokens=[3, 4, 5], max_waiting=2
+    )
+    reqs = [_make_req_id(f"req-{i}") for i in range(4)]
+    inbound: Queue = Queue()
+    for req in reqs:
+        inbound.put(req)
+
+    engine._drain_inbound(inbound)
+
+    # Each request tokenized exactly once during the first drain.
+    assert backend.tokenize_calls == 4
+    assert len(scheduler.waiting) == 2  # admitted up to max_waiting
+    assert len(engine._pending) == 2  # the rest parked on the pending list
+    assert inbound.empty()  # nothing recycled back onto the inbound queue
+
+    # A second drain with nothing new must not re-tokenize the pending requests.
+    engine._drain_inbound(inbound)
+    assert backend.tokenize_calls == 4
+    assert len(engine._pending) == 2
+
+
+def test_pending_requests_admitted_once_capacity_frees() -> None:
+    engine, scheduler, _, backend = _make_engine_with_max_waiting(
+        prompt_tokens=[3, 4, 5], max_waiting=2
+    )
+    reqs = [_make_req_id(f"req-{i}") for i in range(4)]
+    inbound: Queue = Queue()
+    for req in reqs:
+        inbound.put(req)
+
+    engine._drain_inbound(inbound)
+    assert len(engine._pending) == 2
+
+    # schedule() moves the two waiting sequences into running, freeing the
+    # waiting queue so the pending requests can be admitted next drain.
+    scheduler.schedule()
+    assert len(scheduler.waiting) == 0
+
+    engine._drain_inbound(inbound)
+
+    # Pending requests admitted, still without any re-tokenization.
+    assert engine._pending == []
+    assert backend.tokenize_calls == 4
+    assert len(scheduler.waiting) == 2
+    for req in reqs:
+        assert req.request_id in engine._all_requests
+
+
+def test_cancel_inflight_cancels_pending_requests() -> None:
+    engine, scheduler, _, _ = _make_engine_with_max_waiting(
+        prompt_tokens=[3, 4, 5], max_waiting=2
+    )
+    reqs = [_make_req_id(f"req-{i}") for i in range(4)]
+    inbound: Queue = Queue()
+    for req in reqs:
+        inbound.put(req)
+
+    engine._drain_inbound(inbound)
+    assert len(engine._pending) == 2
+
+    cancelled: list = []
+
+    def cancel_request(r: GenerationRequestState, message: str) -> None:
+        cancelled.append((r.request_id, message))
+        r.status = RequestStatus.FAILED
+
+    engine.cancel_inflight("boom", cancel_request)
+
+    # Both admitted and pending requests are cancelled; pending list cleared.
+    cancelled_ids = {rid for rid, _ in cancelled}
+    assert cancelled_ids == {req.request_id for req in reqs}
+    assert engine._pending == []
+    assert engine._all_requests == {}
+    assert engine._seq_to_request == {}
 
 
 if __name__ == "__main__":
