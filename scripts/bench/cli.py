@@ -38,12 +38,15 @@ def _build_parser() -> argparse.ArgumentParser:
             "generate",
             "generate_v2",
             "generate_v3",
+            "generate_v4",
             "stream",
             "stream_v2",
             "stream_v3",
+            "stream_v4",
             "generate/stream",
             "generate/stream_v2",
             "generate/stream_v3",
+            "generate/stream_v4",
         ],
     )
     parser.add_argument("--scenario", default="short_short")
