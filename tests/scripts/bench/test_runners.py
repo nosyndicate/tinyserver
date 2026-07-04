@@ -79,10 +79,16 @@ class TestEndpointPath:
         [
             ("generate", "/generate"),
             ("generate_v2", "/generate_v2"),
+            ("generate_v3", "/generate_v3"),
+            ("generate_v4", "/generate_v4"),
             ("stream", "/generate/stream"),
             ("stream_v2", "/generate/stream_v2"),
+            ("stream_v3", "/generate/stream_v3"),
+            ("stream_v4", "/generate/stream_v4"),
             ("generate/stream", "/generate/stream"),
             ("generate/stream_v2", "/generate/stream_v2"),
+            ("generate/stream_v3", "/generate/stream_v3"),
+            ("generate/stream_v4", "/generate/stream_v4"),
         ],
     )
     def test_all_endpoints(self, endpoint: str, expected: str) -> None:

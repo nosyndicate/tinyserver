@@ -25,7 +25,8 @@ def qwen3_cache_allocator(
     block_size: int,
     dtype: torch.dtype,
     device: str,
-) -> None:
+) -> int:
+    """Allocate the paged KV cache and return the number of blocks it holds."""
     available_mem = get_available_memory(memory_utilization)
 
     num_layers = config.num_hidden_layers
@@ -59,6 +60,8 @@ def qwen3_cache_allocator(
     for i in range(num_layers):
         model.model.layers[i].self_attn.k_cache = kv_cache[0, i]
         model.model.layers[i].self_attn.v_cache = kv_cache[1, i]
+
+    return num_available_kv_blocks
 
 
 def _patch_single_layer(
@@ -483,10 +486,16 @@ def qwen3_model_loader(
     block_size: int,
     dtype: torch.dtype,
     device: str,
-) -> None:
+) -> int:
     """
     Allocate the kv cache for the Qwen3 model and patch the model so the attention module
     will use the pre-allocated cache for computing attention scores.
+
+    Returns the number of KV cache blocks allocated, so callers can size the
+    BlockManager to match the physical pool.
     """
-    qwen3_cache_allocator(model, config, memory_utilization, block_size, dtype, device)
+    num_blocks = qwen3_cache_allocator(
+        model, config, memory_utilization, block_size, dtype, device
+    )
     qwen3_model_patcher(model)
+    return num_blocks

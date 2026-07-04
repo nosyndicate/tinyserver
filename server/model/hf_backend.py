@@ -24,10 +24,16 @@ class HFBackend(ModelBackend):
         model: AutoModelForCausalLM,
         tokenizer: AutoTokenizer,
         device: str,
+        num_blocks: int,
+        block_size: int,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
+        # Size of the paged KV cache pool allocated by the model loader; used
+        # to construct a BlockManager that matches the physical pool.
+        self.num_blocks = num_blocks
+        self.block_size = block_size
 
     def tokenize(self, prompt: str) -> list[int]:
         # apply_chat_template(tokenize=True) returns the token ids (with the
@@ -36,8 +42,14 @@ class HFBackend(ModelBackend):
         # TODO: truncate to the model's max context length (review #9); left
         # for now since this engine is not yet wired into main.py.
         message = [{"role": "user", "content": prompt}]
+        # return_dict=False forces a plain list[int]; recent transformers
+        # versions otherwise return a BatchEncoding dict here.
         return self.tokenizer.apply_chat_template(
-            message, tokenize=True, add_generation_prompt=True, enable_thinking=False
+            message,
+            tokenize=True,
+            add_generation_prompt=True,
+            enable_thinking=False,
+            return_dict=False,
         )
 
     def release(self) -> None:
@@ -75,7 +87,7 @@ class HFBackend(ModelBackend):
         log_event("model_init_done", model=model_config.model_name_or_path)
 
         loader = loader_by_name[model_config.model_name_or_path]
-        loader(
+        num_blocks = loader(
             model,
             config,
             model_config.memory_utilization,
@@ -84,4 +96,10 @@ class HFBackend(ModelBackend):
             model_config.device,
         )
 
-        return HFBackend(model, tokenizer, model_config.device)
+        return HFBackend(
+            model,
+            tokenizer,
+            model_config.device,
+            num_blocks=num_blocks,
+            block_size=model_config.block_size,
+        )
