@@ -17,6 +17,10 @@ from server.metrics.timers import now_ns
 logger = logging.getLogger(__name__)
 
 
+class WorkerShuttingDown(RuntimeError):
+    """Raised when a request is submitted while the worker is shutting down."""
+
+
 class Worker:
     """Orchestrates generation requests by bridging a queue and an inference engine.
 
@@ -150,11 +154,13 @@ class Worker:
         """Enqueue a request for the engine to process.
 
         Raises:
-            RuntimeError: If the worker is shutting down.
+            WorkerShuttingDown: If the worker is shutting down.
             queue.Full: If the inbound queue is at capacity.
         """
         if self._shutdown_event.is_set():
-            raise RuntimeError("Cannot submit new request, worker is shutting down")
+            raise WorkerShuttingDown(
+                "Cannot submit new request, worker is shutting down"
+            )
 
         request_state.enqueued_ns = now_ns()
         self._inbound.put_nowait(request_state)
