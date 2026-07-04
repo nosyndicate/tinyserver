@@ -324,12 +324,13 @@ def test_oversized_prompt_is_failed_not_requeued() -> None:
 
 
 class _RejectAllScheduler:
-    """Scheduler stub that never admits a sequence and never fills up.
+    """Scheduler stub that never admits a sequence.
 
     Lets us exercise `_drain_inbound`'s deferral path without a real block
     manager. `can_add_new_sequence` always False (nothing is admittable) and
-    `waiting_queue_is_full` always False (so the engine keeps pulling from
-    inbound). The block manager stub accepts every prompt as feasible.
+    `admission_headroom` is a settable budget (default 8, so small tests can
+    pull everything from inbound). The block manager stub accepts every
+    prompt as feasible.
     """
 
     class _BlockManager:
@@ -339,12 +340,16 @@ class _RejectAllScheduler:
     def __init__(self) -> None:
         self.block_manager = self._BlockManager()
         self.added: list = []
+        self.headroom = 8
 
     def can_add_new_sequence(self, seq) -> bool:
         return False
 
     def waiting_queue_is_full(self) -> bool:
         return False
+
+    def admission_headroom(self) -> int:
+        return self.headroom
 
     def add(self, seq) -> None:
         self.added.append(seq)
@@ -436,6 +441,100 @@ def test_pending_preserves_fifo_across_drains() -> None:
     assert [seq for seq in scheduler.added]  # something admitted
     assert engine._seq_to_request[scheduler.added[0].sequence_id].request_id == "A"
     assert scheduler.added[1] is engine._all_requests["B"].sequence
+
+
+def test_new_small_request_cannot_overtake_deferred_large() -> None:
+    # FIFO must hold ACROSS drain calls, not just within one: a large deferred
+    # request at the head of pending must not be overtaken by a smaller new
+    # arrival that would fit on its own. (Regression: the old two-phase drain
+    # ran _try_admit separately on pending and on new arrivals, so the
+    # "once deferred, defer all later" latch reset between the two calls and
+    # a small newcomer could be admitted ahead of a starved large request.)
+    class _SizeGatedScheduler(_RejectAllScheduler):
+        def can_add_new_sequence(self, seq) -> bool:
+            return seq.num_tokens <= 3
+
+    backend = _FakeBackend(prompt_tokens=[])
+    # Tokenize by prompt length so the two requests get different sizes.
+    backend.tokenize = lambda prompt: list(range(len(prompt)))
+    scheduler = _SizeGatedScheduler()
+    engine = ScheduleInferenceEngine(scheduler=scheduler, backend=backend)
+
+    req_large = _make_req(max_new_tokens=4)
+    req_large.request_id = "large"
+    req_large.prompt = "0123456789"  # 10 tokens -> never admittable here
+    req_small = _make_req(max_new_tokens=4)
+    req_small.request_id = "small"
+    req_small.prompt = "01"  # 2 tokens -> admittable in isolation
+
+    inbound: Queue = Queue()
+    inbound.put(req_large)
+    engine._drain_inbound(inbound)  # large is deferred
+    inbound.put(req_small)
+    engine._drain_inbound(inbound)  # small must queue BEHIND large
+
+    assert scheduler.added == []  # nothing admitted: large blocks the line
+    assert [r.request_id for r, _ in engine._pending] == ["large", "small"]
+
+
+def test_pending_is_bounded_by_admission_headroom() -> None:
+    # Backpressure regression: when the block manager (not the waiting queue)
+    # is the bottleneck, the engine must stop pulling from inbound once the
+    # pending buffer fills the admission budget. The surplus stays in the
+    # bounded inbound queue, so submit() eventually raises Full -> 503 instead
+    # of _pending growing without bound.
+    backend = _FakeBackend(prompt_tokens=[3, 4, 5])
+    scheduler = _RejectAllScheduler()
+    scheduler.headroom = 2
+    engine = ScheduleInferenceEngine(scheduler=scheduler, backend=backend)
+
+    inbound: Queue = Queue(maxsize=8)
+    for _ in range(5):
+        inbound.put_nowait(_make_req(max_new_tokens=4))
+
+    engine._drain_inbound(inbound)
+    assert len(engine._pending) == 2  # capped at the admission budget
+    assert inbound.qsize() == 3  # the rest stays put as backpressure
+
+    engine._drain_inbound(inbound)  # nothing was admitted -> no new headroom
+    assert len(engine._pending) == 2
+    assert inbound.qsize() == 3
+
+
+def test_oversized_prompt_does_not_consume_budget() -> None:
+    # A never-fits prompt is failed immediately; it must not eat an admission
+    # slot that a feasible request behind it could use in the same drain.
+    class _TinyBlockManager:
+        total_blocks = 2
+        block_size = 4
+
+        def can_ever_allocate(self, seq) -> bool:
+            return seq.num_tokens <= 8
+
+    backend = _FakeBackend(prompt_tokens=[])
+    backend.tokenize = lambda prompt: list(range(len(prompt)))
+    scheduler = _RejectAllScheduler()
+    scheduler.block_manager = _TinyBlockManager()
+    scheduler.headroom = 1
+    engine = ScheduleInferenceEngine(scheduler=scheduler, backend=backend)
+
+    oversized = _make_req(max_new_tokens=4)
+    oversized.request_id = "oversized"
+    oversized.prompt = "0123456789"  # 10 tokens > 8-token capacity
+    normal = _make_req(max_new_tokens=4)
+    normal.request_id = "normal"
+    normal.prompt = "012"
+
+    inbound: Queue = Queue()
+    inbound.put(oversized)
+    inbound.put(normal)
+    engine._drain_inbound(inbound)
+
+    assert oversized.status == RequestStatus.FAILED
+    assert any(isinstance(e, ErrorEvent) for e in drain_events(oversized))
+    # The single admission slot went to the feasible request behind it.
+    assert [r.request_id for r, _ in engine._pending] == ["normal"]
+    assert inbound.empty()
 
 
 def test_cancel_inflight_fails_pending_requests() -> None:

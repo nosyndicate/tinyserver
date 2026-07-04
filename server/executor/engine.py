@@ -350,11 +350,14 @@ class ScheduleInferenceEngine:
         self._seq_to_request: dict[str, GenerationRequestState] = {}
         # Requests that were built (tokenized) but couldn't be admitted yet.
         # Engine-thread-private, so no locking is needed. Retried oldest-first
-        # on every iteration *before* new arrivals, which both avoids
-        # re-tokenizing (we keep the already-built Sequence) and preserves FIFO
-        # fairness. Never re-enter the shared inbound queue: the engine is its
-        # only consumer, so a blocking put-back would deadlock against the HTTP
-        # handlers that produce into it.
+        # on every iteration, with new arrivals appended behind them, which
+        # both avoids re-tokenizing (we keep the already-built Sequence) and
+        # preserves FIFO fairness. Never re-enter the shared inbound queue:
+        # the engine is its only consumer, so a blocking put-back would
+        # deadlock against the HTTP handlers that produce into it. Bounded:
+        # _drain_inbound only pulls new arrivals while pending + the
+        # scheduler's waiting queue have headroom, so len(_pending) never
+        # exceeds the scheduler's max_waiting.
         self._pending: deque[tuple[GenerationRequestState, Sequence]] = deque()
         self._emitter = RequestEventEmitter()
 
@@ -386,16 +389,17 @@ class ScheduleInferenceEngine:
         Move requests from the inbound queue to the scheduler's waiting list.
         Convert the GenerationRequestState to Sequence and add to the scheduler.
         """
-        # Phase 1: retry previously-deferred requests first (FIFO fairness),
-        # reusing their already-built Sequence so we never re-tokenize.
-        self._pending = self._try_admit(self._pending)
-
-        # Phase 2: pull newly-arrived requests only while there is admission
-        # headroom. Anything left in `inbound` stays there as natural
-        # backpressure (a full bounded queue makes submit() raise Full -> 503),
-        # which also bounds how large `self._pending` can grow.
-        newly: deque[tuple[GenerationRequestState, Sequence]] = deque()
-        while not self._scheduler.waiting_queue_is_full():
+        # Pull new arrivals only while the TOTAL deferred population
+        # (engine-private pending + scheduler waiting) has headroom. This is
+        # what makes backpressure real: once pending fills the waiting-queue
+        # budget we stop pulling, the bounded inbound queue fills up, and
+        # submit() raises Full -> 503. It also caps len(_pending) at the
+        # scheduler's max_waiting. (Checking waiting_queue_is_full() here
+        # would NOT bound pending: when the block manager -- not the waiting
+        # queue -- is the bottleneck, the waiting queue stays short and such
+        # a loop would drain all of inbound into pending forever.)
+        budget = self._scheduler.admission_headroom() - len(self._pending)
+        while budget > 0:
             try:
                 req = inbound.get_nowait()
             except Empty:
@@ -404,18 +408,24 @@ class ScheduleInferenceEngine:
             if not self._scheduler.block_manager.can_ever_allocate(seq):
                 # The prompt can never fit in the KV cache, no matter how many
                 # blocks free up. Fail it once instead of deferring (and later
-                # re-checking) it forever.
+                # re-checking) it forever. Consumes no admission budget.
                 self._emitter.on_failed(
                     req,
                     f"prompt of {seq.num_tokens} tokens exceeds cache capacity of "
                     f"{self._scheduler.block_manager.total_blocks * self._scheduler.block_manager.block_size} tokens",
                 )
                 continue
-            newly.append((req, seq))
+            self._pending.append((req, seq))
+            budget -= 1
 
-        # Admit what fits now; defer the rest to the right of the pending buffer
-        # so overall arrival order is preserved (pending is always older).
-        self._pending.extend(self._try_admit(newly))
+        # Single admission pass over old + new together. One call means one
+        # shared "deferred" latch inside _try_admit, so a newly-arrived small
+        # request can never overtake an older deferred large one (running
+        # _try_admit separately on pending and on new arrivals would reset
+        # that latch between calls and reintroduce starvation). Pending items
+        # are always to the left of newer ones, so arrival order holds.
+        if self._pending:
+            self._pending = self._try_admit(self._pending)
 
     def _make_sequence(self, req: GenerationRequestState) -> Sequence:
         token_ids = self._backend.tokenize(req.prompt)
@@ -441,23 +451,17 @@ class ScheduleInferenceEngine:
         the supplied ``cancel_request`` callback.
         """
         self._scheduler.clear()
-        for context in self._all_requests.values():
-            try:
-                cancel_request(context.request, message)
-            except Exception:
-                logger.exception(
-                    "Failed to emit error event for request %s",
-                    context.request.request_id,
-                )
         # Deferred (not-yet-admitted) requests live only in `self._pending`,
         # never in the scheduler or `_all_requests`, so they must be cancelled
-        # here too or they would be silently dropped on shutdown/fatal error.
-        for req, _seq in self._pending:
+        # too or they would be silently dropped on shutdown/fatal error.
+        tracked = [context.request for context in self._all_requests.values()]
+        deferred = [req for req, _seq in self._pending]
+        for req in tracked + deferred:
             try:
                 cancel_request(req, message)
             except Exception:
                 logger.exception(
-                    "Failed to emit error event for pending request %s",
+                    "Failed to emit error event for request %s",
                     req.request_id,
                 )
         self._pending.clear()

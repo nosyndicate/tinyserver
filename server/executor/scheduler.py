@@ -44,6 +44,16 @@ class Scheduler:
         """Check if the waiting queue is full."""
         return len(self.waiting) >= self.max_waiting
 
+    def admission_headroom(self) -> int:
+        """Number of free slots in the waiting queue.
+
+        Used by the engine to bound how many not-yet-admitted requests it
+        holds in total (its private pending buffer plus this waiting queue),
+        so that overload backs up into the bounded inbound queue and surfaces
+        as 503s instead of growing an unbounded buffer.
+        """
+        return max(0, self.max_waiting - len(self.waiting))
+
     def add(self, sequence: Sequence) -> None:
         self.waiting.append(sequence)
 
