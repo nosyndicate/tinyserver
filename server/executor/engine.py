@@ -390,14 +390,8 @@ class ScheduleInferenceEngine:
         Convert the GenerationRequestState to Sequence and add to the scheduler.
         """
         # Pull new arrivals only while the TOTAL deferred population
-        # (engine-private pending + scheduler waiting) has headroom. This is
-        # what makes backpressure real: once pending fills the waiting-queue
-        # budget we stop pulling, the bounded inbound queue fills up, and
-        # submit() raises Full -> 503. It also caps len(_pending) at the
-        # scheduler's max_waiting. (Checking waiting_queue_is_full() here
-        # would NOT bound pending: when the block manager -- not the waiting
-        # queue -- is the bottleneck, the waiting queue stays short and such
-        # a loop would drain all of inbound into pending forever.)
+        # (engine-private pending + scheduler waiting) has headroom. This helps
+        # us to keep the backpressue.
         budget = self._scheduler.admission_headroom() - len(self._pending)
         while budget > 0:
             try:
@@ -420,10 +414,7 @@ class ScheduleInferenceEngine:
 
         # Single admission pass over old + new together. One call means one
         # shared "deferred" latch inside _try_admit, so a newly-arrived small
-        # request can never overtake an older deferred large one (running
-        # _try_admit separately on pending and on new arrivals would reset
-        # that latch between calls and reintroduce starvation). Pending items
-        # are always to the left of newer ones, so arrival order holds.
+        # request can never overtake an older deferred large one.
         if self._pending:
             self._pending = self._try_admit(self._pending)
 
