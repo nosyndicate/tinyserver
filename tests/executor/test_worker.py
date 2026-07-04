@@ -18,7 +18,7 @@ from server.executor.types import (
     RequestStatus,
     TokenEvent,
 )
-from server.executor.worker import Worker
+from server.executor.worker import Worker, WorkerShuttingDown
 from server.metrics.timers import NS_PER_S, now_ns
 
 from .worker_helpers import (
@@ -166,7 +166,7 @@ def test_submit_after_stop_is_rejected() -> None:
     worker.start()
     worker.stop()
 
-    with pytest.raises(RuntimeError, match="shutting down"):
+    with pytest.raises(WorkerShuttingDown, match="shutting down"):
         worker.submit(make_req("r0"))
 
 
