@@ -210,6 +210,23 @@ def _stream_generation(state: GenerationRequestState) -> Generator[str, None, No
             return
 
 
+def _submit_or_fail(request: Request, req: GenerateRequest) -> GenerationRequestState:
+    """
+    Submit the request state to the worker, raising an HTTPException if the
+    worker is at capacity.
+    """
+    worker = _get_worker(request)
+    state = _build_request_state(req, device=request.app.state.device)
+    try:
+        worker.submit(state)
+    except Full:
+        raise HTTPException(
+            status_code=503,
+            detail="Server at capacity. Please try again later.",
+        )
+    return state
+
+
 @health_router.get("/health")
 def health() -> dict[str, bool]:
     return {"ok": True}
@@ -267,32 +284,14 @@ def generate(req: GenerateRequest, request: Request) -> GenerateResponse:
 
 @v2_router.post("/generate_v2", response_model=GenerateResponse)
 def generate_v2(req: GenerateRequest, request: Request) -> GenerateResponse:
-    worker = _get_worker(request)
-    state = _build_request_state(req, device=request.app.state.device)
-
-    try:
-        worker.submit(state)
-    except Full:
-        raise HTTPException(
-            status_code=503,
-            detail="Server at capacity. Please try again later.",
-        )
+    state = _submit_or_fail(request, req)
 
     return _await_generation(state)
 
 
 @v3_router.post("/generate_v3", response_model=GenerateResponse)
 def generate_v3(req: GenerateRequest, request: Request) -> GenerateResponse:
-    worker = _get_worker(request)
-    state = _build_request_state(req, device=request.app.state.device)
-
-    try:
-        worker.submit(state)
-    except Full:
-        raise HTTPException(
-            status_code=503,
-            detail="Server at capacity. Please try again later.",
-        )
+    state = _submit_or_fail(request, req)
 
     return _await_generation(state)
 
@@ -300,16 +299,7 @@ def generate_v3(req: GenerateRequest, request: Request) -> GenerateResponse:
 @v4_router.post("/generate_v4", response_model=GenerateResponse)
 def generate_v4(req: GenerateRequest, request: Request) -> GenerateResponse:
     """Generate text via the paged-attention scheduled engine."""
-    worker = _get_worker(request)
-    state = _build_request_state(req, device=request.app.state.device)
-
-    try:
-        worker.submit(state)
-    except Full:
-        raise HTTPException(
-            status_code=503,
-            detail="Server at capacity. Please try again later.",
-        )
+    state = _submit_or_fail(request, req)
 
     return _await_generation(state)
 
@@ -355,32 +345,14 @@ def generate_stream(req: GenerateRequest, request: Request) -> StreamingResponse
 
 @v2_router.post("/generate/stream_v2", response_model=None)
 def generate_stream_v2(req: GenerateRequest, request: Request) -> StreamingResponse:
-    worker = _get_worker(request)
-    state = _build_request_state(req, device=request.app.state.device)
-
-    try:
-        worker.submit(state)
-    except Full:
-        raise HTTPException(
-            status_code=503,
-            detail="Server at capacity. Please try again later.",
-        )
+    state = _submit_or_fail(request, req)
 
     return StreamingResponse(_stream_generation(state), media_type="text/event-stream")
 
 
 @v3_router.post("/generate/stream_v3", response_model=None)
 def generate_stream_v3(req: GenerateRequest, request: Request) -> StreamingResponse:
-    worker = _get_worker(request)
-    state = _build_request_state(req, device=request.app.state.device)
-
-    try:
-        worker.submit(state)
-    except Full:
-        raise HTTPException(
-            status_code=503,
-            detail="Server at capacity. Please try again later.",
-        )
+    state = _submit_or_fail(request, req)
 
     return StreamingResponse(_stream_generation(state), media_type="text/event-stream")
 
@@ -388,15 +360,6 @@ def generate_stream_v3(req: GenerateRequest, request: Request) -> StreamingRespo
 @v4_router.post("/generate/stream_v4", response_model=None)
 def generate_stream_v4(req: GenerateRequest, request: Request) -> StreamingResponse:
     """Stream generated tokens via the paged-attention scheduled engine."""
-    worker = _get_worker(request)
-    state = _build_request_state(req, device=request.app.state.device)
-
-    try:
-        worker.submit(state)
-    except Full:
-        raise HTTPException(
-            status_code=503,
-            detail="Server at capacity. Please try again later.",
-        )
+    state = _submit_or_fail(request, req)
 
     return StreamingResponse(_stream_generation(state), media_type="text/event-stream")
