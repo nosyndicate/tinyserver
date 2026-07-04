@@ -1,5 +1,6 @@
 import logging
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import Callable, Protocol, runtime_checkable
@@ -347,57 +348,74 @@ class ScheduleInferenceEngine:
         # ``Sequence`` objects and post-processing needs the request (for
         # sampling params, generator, and event emission).
         self._seq_to_request: dict[str, GenerationRequestState] = {}
+        # Requests that were built (tokenized) but couldn't be admitted yet.
+        # Engine-thread-private, so no locking is needed. Retried oldest-first
+        # on every iteration *before* new arrivals, which both avoids
+        # re-tokenizing (we keep the already-built Sequence) and preserves FIFO
+        # fairness. Never re-enter the shared inbound queue: the engine is its
+        # only consumer, so a blocking put-back would deadlock against the HTTP
+        # handlers that produce into it.
+        self._pending: deque[tuple[GenerationRequestState, Sequence]] = deque()
         self._emitter = RequestEventEmitter()
+
+    def _admit(self, req: GenerationRequestState, seq: Sequence) -> None:
+        """Track a request and hand its sequence to the scheduler's waiting list."""
+        self._all_requests[req.request_id] = RequestContext(request=req, sequence=seq)
+        self._seq_to_request[seq.sequence_id] = req
+        self._scheduler.add(seq)
+
+    def _try_admit(
+        self, candidates: deque[tuple[GenerationRequestState, Sequence]]
+    ) -> deque[tuple[GenerationRequestState, Sequence]]:
+        """Admit what fits (in arrival order); return the rest, order preserved.
+
+        Once a candidate is deferred, every later candidate is deferred too, so
+        arrival order is never violated (a big-but-feasible request is admitted
+        before a smaller newer one rather than being overtaken and starved).
+        """
+        deferred: deque[tuple[GenerationRequestState, Sequence]] = deque()
+        for req, seq in candidates:
+            if not deferred and self._scheduler.can_add_new_sequence(seq):
+                self._admit(req, seq)
+            else:
+                deferred.append((req, seq))
+        return deferred
 
     def _drain_inbound(self, inbound: Queue[GenerationRequestState]) -> None:
         """
         Move requests from the inbound queue to the scheduler's waiting list.
         Convert the GenerationRequestState to Sequence and add to the scheduler.
         """
-        need_to_wait = []
+        # Phase 1: retry previously-deferred requests first (FIFO fairness),
+        # reusing their already-built Sequence so we never re-tokenize.
+        self._pending = self._try_admit(self._pending)
 
-        # TODO The current implementation might require us to tokenize the prompt
-        # several times if GPU memory is not enough to schedule the request.
-        # Consider a better solution.
-        while True:
+        # Phase 2: pull newly-arrived requests only while there is admission
+        # headroom. Anything left in `inbound` stays there as natural
+        # backpressure (a full bounded queue makes submit() raise Full -> 503),
+        # which also bounds how large `self._pending` can grow.
+        newly: deque[tuple[GenerationRequestState, Sequence]] = deque()
+        while not self._scheduler.waiting_queue_is_full():
             try:
                 req = inbound.get_nowait()
-                seq = self._make_sequence(req)
-                if not self._scheduler.block_manager.can_ever_allocate(seq):
-                    # The prompt can never fit in the KV cache, no matter how
-                    # many blocks free up. Fail it once instead of re-queuing
-                    # (and re-tokenizing) it on every loop iteration forever.
-                    self._emitter.on_failed(
-                        req,
-                        f"prompt of {seq.num_tokens} tokens exceeds cache capacity of "
-                        f"{self._scheduler.block_manager.total_blocks * self._scheduler.block_manager.block_size} tokens",
-                    )
-                    continue
-                if self._scheduler.can_add_new_sequence(seq):
-                    self._all_requests[req.request_id] = RequestContext(
-                        request=req, sequence=seq
-                    )
-                    self._seq_to_request[seq.sequence_id] = req
-                    self._scheduler.add(seq)
-                else:
-                    # Collect requests that can't be scheduled right now to put them back to the inbound queue later,
-                    # so they can be retried in the next loop iteration.
-                    need_to_wait.append(req)
-                    # if the scheduler's waiting queue is full, it's unlikely that the next requests can be
-                    # scheduled, so break early to avoid unnecessary retries.
-                    # otherwise, if the scheduler can accept new sequences but the current one just can't be
-                    # scheduled due to block manager capacity, we can continue to try the next requests
-                    # which might be schedulable.
-                    if self._scheduler.waiting_queue_is_full():
-                        break
-                    else:
-                        continue
             except Empty:
                 break
+            seq = self._make_sequence(req)
+            if not self._scheduler.block_manager.can_ever_allocate(seq):
+                # The prompt can never fit in the KV cache, no matter how many
+                # blocks free up. Fail it once instead of deferring (and later
+                # re-checking) it forever.
+                self._emitter.on_failed(
+                    req,
+                    f"prompt of {seq.num_tokens} tokens exceeds cache capacity of "
+                    f"{self._scheduler.block_manager.total_blocks * self._scheduler.block_manager.block_size} tokens",
+                )
+                continue
+            newly.append((req, seq))
 
-        # Put back the requests that can't be scheduled right now to the inbound queue for later processing
-        for req in need_to_wait:
-            inbound.put(req)
+        # Admit what fits now; defer the rest to the right of the pending buffer
+        # so overall arrival order is preserved (pending is always older).
+        self._pending.extend(self._try_admit(newly))
 
     def _make_sequence(self, req: GenerationRequestState) -> Sequence:
         token_ids = self._backend.tokenize(req.prompt)
@@ -431,6 +449,18 @@ class ScheduleInferenceEngine:
                     "Failed to emit error event for request %s",
                     context.request.request_id,
                 )
+        # Deferred (not-yet-admitted) requests live only in `self._pending`,
+        # never in the scheduler or `_all_requests`, so they must be cancelled
+        # here too or they would be silently dropped on shutdown/fatal error.
+        for req, _seq in self._pending:
+            try:
+                cancel_request(req, message)
+            except Exception:
+                logger.exception(
+                    "Failed to emit error event for pending request %s",
+                    req.request_id,
+                )
+        self._pending.clear()
         self._all_requests.clear()
         self._seq_to_request.clear()
 
