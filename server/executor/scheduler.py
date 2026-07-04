@@ -40,10 +40,6 @@ class Scheduler:
             return False
         return self.block_manager.can_allocate(sequence)
 
-    def waiting_queue_is_full(self) -> bool:
-        """Check if the waiting queue is full."""
-        return len(self.waiting) >= self.max_waiting
-
     def admission_headroom(self) -> int:
         """Number of free slots in the waiting queue.
 

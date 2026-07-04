@@ -391,7 +391,7 @@ class ScheduleInferenceEngine:
         """
         # Pull new arrivals only while the TOTAL deferred population
         # (engine-private pending + scheduler waiting) has headroom. This helps
-        # us to keep the backpressue.
+        # us to keep the backpressure.
         budget = self._scheduler.admission_headroom() - len(self._pending)
         while budget > 0:
             try:
