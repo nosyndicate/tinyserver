@@ -13,7 +13,7 @@ from server.executor.types import (
     GenerationRequestState,
     TokenEvent,
 )
-from server.executor.worker import Worker
+from server.executor.worker import Worker, WorkerShuttingDown
 from server.metrics.logging import log_event
 from server.metrics.timers import now_ns, ns_to_ms, timed
 from server.model.determinism import make_generator
@@ -223,6 +223,11 @@ def _submit_or_fail(request: Request, req: GenerateRequest) -> GenerationRequest
         raise HTTPException(
             status_code=503,
             detail="Server at capacity. Please try again later.",
+        )
+    except WorkerShuttingDown:
+        raise HTTPException(
+            status_code=503,
+            detail="Worker is shutting down. Please try again later.",
         )
     return state
 
