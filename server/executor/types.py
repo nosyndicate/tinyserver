@@ -207,6 +207,10 @@ class Sequence:
     generated_token_ids: list[int]
     num_prompt_tokens: int
     num_tokens: int
+    # Worst-case generation budget, used by admission to reserve enough KV
+    # capacity for the whole request (prompt + max_new_tokens) up front rather
+    # than admitting on prompt size alone and wedging on a later decode step.
+    max_new_tokens: int
     block_table: list[int]
     state: SequenceState = SequenceState.WAITING
     finished: bool = False

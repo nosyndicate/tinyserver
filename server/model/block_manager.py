@@ -36,17 +36,35 @@ class BlockManager:
         return len(self.free_blocks) >= self._num_blocks_needed(num_tokens)
 
     def can_allocate(self, sequence: Sequence) -> bool:
-        """Checks if the requested sequence can be allocated given the current free blocks."""
+        """Checks if the sequence's prompt can be physically allocated now.
+
+        Prompt-only on purpose: ``allocate`` only pops blocks for the prompt, so
+        this guard must match what is actually allocated. Admission decisions use
+        ``can_admit`` instead, which also reserves the generation budget.
+        """
         return self.has_free_blocks_for(sequence.num_tokens)
 
-    def can_ever_allocate(self, sequence: Sequence) -> bool:
-        """Whether the prompt could ever fit in the cache, ignoring current usage.
+    def can_admit(self, sequence: Sequence) -> bool:
+        """Whether the sequence's worst-case footprint fits in the free pool now.
 
-        Unlike ``can_allocate``, this is checked against the cache's total
-        capacity, so a prompt that can never be scheduled (no matter how many
-        blocks free up) is detected up front.
+        Reserves for prompt + ``max_new_tokens`` so a request is not admitted on
+        prompt size alone and then wedged when a later decode step needs a block
+        that no longer exists. Conservative: most generations stop early at EOS,
+        so this trades throughput for a liveness guarantee.
         """
-        return self._num_blocks_needed(sequence.num_tokens) <= self.total_blocks
+        return self.has_free_blocks_for(sequence.num_tokens + sequence.max_new_tokens)
+
+    def can_ever_allocate(self, sequence: Sequence) -> bool:
+        """Whether the request could ever fit in the cache, ignoring current usage.
+
+        Unlike ``can_admit``, this is checked against the cache's total capacity,
+        so a request whose prompt + ``max_new_tokens`` can never be scheduled (no
+        matter how many blocks free up) is detected up front.
+        """
+        return (
+            self._num_blocks_needed(sequence.num_tokens + sequence.max_new_tokens)
+            <= self.total_blocks
+        )
 
     def _additional_blocks_needed(
         self, sequence: Sequence, extra_tokens: int = 0

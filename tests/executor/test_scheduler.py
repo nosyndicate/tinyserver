@@ -11,6 +11,7 @@ def make_sequence(
     sequence_id: str = "seq-0",
     num_tokens: int = 1,
     block_table: list[int] | None = None,
+    max_new_tokens: int = 1,
 ) -> Sequence:
     """Minimal Sequence factory mirroring tests/model/test_block_manager.py."""
     return Sequence(
@@ -19,6 +20,7 @@ def make_sequence(
         generated_token_ids=[],
         num_prompt_tokens=num_tokens,
         num_tokens=num_tokens,
+        max_new_tokens=max_new_tokens,
         block_table=list(block_table) if block_table is not None else [],
     )
 
@@ -72,6 +74,38 @@ def test_can_add_new_sequence_false_when_prompt_exceeds_free_blocks() -> None:
 
     big = make_sequence(sequence_id="big", num_tokens=8)  # needs 2 blocks
     assert sched.can_add_new_sequence(big) is False
+
+
+def test_can_add_new_sequence_reserves_generation_budget() -> None:
+    # Admission reserves prompt + max_new_tokens, not just the prompt: a prompt
+    # that physically fits is still rejected when its worst-case footprint would
+    # not, so it can't be admitted and then wedge on a later decode step.
+    sched = make_scheduler(total_blocks=4, block_size=4)  # 16-token pool
+    seq = make_sequence(num_tokens=14, max_new_tokens=8)  # 22 tokens worst case
+    assert sched.block_manager.can_allocate(seq) is True  # prompt alone fits
+    assert sched.can_add_new_sequence(seq) is False
+
+
+# --- abort_youngest_running (deadlock backstop) ----------------------------
+
+
+def test_abort_youngest_running_frees_blocks_and_returns_victim() -> None:
+    sched = make_scheduler(total_blocks=4, block_size=4)
+    _prefill_running(sched, ["a", "b"], num_tokens=8)  # 2 blocks each, pool full
+    assert not sched.block_manager.free_blocks
+
+    victim = sched.abort_youngest_running()
+
+    assert victim is not None
+    assert victim.sequence_id == "b"  # youngest = last started
+    assert [s.sequence_id for s in sched.running] == ["a"]
+    assert victim.sequence_id not in sched.block_manager.allocated_blocks
+    assert len(sched.block_manager.free_blocks) == 2  # b's blocks reclaimed
+
+
+def test_abort_youngest_running_returns_none_when_idle() -> None:
+    sched = make_scheduler()
+    assert sched.abort_youngest_running() is None
 
 
 # --- schedule(): prefill ---------------------------------------------------
@@ -135,8 +169,13 @@ def test_schedule_prefill_allows_single_oversized_sequence() -> None:
 
 
 def _prefill_running(sched: Scheduler, ids: list[str], num_tokens: int) -> None:
+    # max_new_tokens=0 so admission reserves exactly the prompt: these decode
+    # tests size prompts against the pool and grow sequences by hand, so the
+    # worst-case budget reservation would otherwise change the block math.
     for sid in ids:
-        sched.add(make_sequence(sequence_id=sid, num_tokens=num_tokens))
+        sched.add(
+            make_sequence(sequence_id=sid, num_tokens=num_tokens, max_new_tokens=0)
+        )
     sched.schedule()  # consume the prefill batch, populating running
 
 
@@ -206,15 +245,17 @@ def test_schedule_reaps_finished_before_prefill_so_blocks_are_reused() -> None:
     # skipped cleanup, so a finished sequence's blocks stayed allocated and
     # blocked new prefills (schedule() returned None instead).
     sched = make_scheduler(block_size=4, total_blocks=4)
-    # One running sequence holding all 4 blocks, now finished.
-    done = make_sequence(sequence_id="done", num_tokens=16)
+    # One running sequence holding all 4 blocks, now finished. max_new_tokens=0
+    # so admission reserves exactly the prompt (this test is about reaping, not
+    # the generation-budget reservation).
+    done = make_sequence(sequence_id="done", num_tokens=16, max_new_tokens=0)
     sched.add(done)
     sched.schedule()  # prefill -> running, allocates all 4 blocks
     done.finished = True
     assert not sched.block_manager.free_blocks
 
     # A waiting sequence that can only prefill once `done`'s blocks free up.
-    sched.add(make_sequence(sequence_id="next", num_tokens=4))
+    sched.add(make_sequence(sequence_id="next", num_tokens=4, max_new_tokens=0))
 
     batch = sched.schedule()
 

@@ -258,6 +258,78 @@ def test_cancel_inflight_clears_state_and_invokes_callback() -> None:
     assert sorted(block_manager.free_blocks) == list(range(block_manager.total_blocks))
 
 
+class _StopWhenTerminal:
+    """Stops once every tracked request reaches a terminal state (DONE/FAILED)."""
+
+    def __init__(self, requests: list[GenerationRequestState], max_calls: int = 5000):
+        self._requests = requests
+        self._calls = 0
+        self._max_calls = max_calls
+        self._terminal = {RequestStatus.DONE, RequestStatus.FAILED}
+
+    def should_stop(self) -> bool:
+        self._calls += 1
+        if self._calls > self._max_calls:
+            return True
+        return all(r.status in self._terminal for r in self._requests)
+
+    def wait_idle(self, _timeout: float) -> bool:
+        return False
+
+
+def test_kv_deadlock_breaker_aborts_one_request_and_frees_all_blocks() -> None:
+    # Two requests whose worst-case footprints jointly outgrow the pool. Each
+    # passes admission (Layer 1 checks the free pool without reserving the
+    # other's budget), both prefill, both grow, and collide with no free block.
+    # Layer 2 must abort exactly one and let the other complete, leaking nothing.
+    backend = _FakeBackend([0, 1, 2, 3])  # 4-token prompt = one full block
+    block_manager = BlockManager(total_blocks=4, block_size=4)  # 16-token pool
+    scheduler = Scheduler(
+        block_manager=block_manager,
+        max_waiting=4,
+        max_num_sequences=4,
+        max_num_tokens=64,
+    )
+    engine = ScheduleInferenceEngine(scheduler=scheduler, backend=backend)
+
+    reqs = []
+    for i in range(2):
+        r = _make_req(max_new_tokens=8)  # worst case 4 + 8 = 12 tokens = 3 blocks
+        r.request_id = f"req-{i}"
+        reqs.append(r)
+
+    inbound: Queue = Queue()
+    for r in reqs:
+        inbound.put(r)
+    recorder: dict = {}
+    engine.run(
+        inbound=inbound,
+        control=_StopWhenTerminal(reqs),
+        callbacks=_callbacks(recorder),
+    )
+
+    assert "fatal" not in recorder, f"engine hit fatal error: {recorder.get('fatal')}"
+
+    # Exactly one completes, exactly one is aborted.
+    statuses = [r.status for r in reqs]
+    assert statuses.count(RequestStatus.DONE) == 1
+    assert statuses.count(RequestStatus.FAILED) == 1
+
+    aborted = next(r for r in reqs if r.status == RequestStatus.FAILED)
+    errors = [e for e in drain_events(aborted) if isinstance(e, ErrorEvent)]
+    assert len(errors) == 1
+    assert "KV cache exhausted" in errors[0].error
+
+    done = next(r for r in reqs if r.status == RequestStatus.DONE)
+    assert [e for e in drain_events(done) if isinstance(e, DoneEvent)]
+
+    # No leaked blocks: both the completed and the aborted sequence released.
+    assert scheduler.running == []
+    assert sorted(block_manager.free_blocks) == list(range(block_manager.total_blocks))
+    assert engine._all_requests == {}
+    assert engine._seq_to_request == {}
+
+
 def test_prepare_decode_builds_one_token_per_sequence() -> None:
     """Unit-level check of _prepare_decode's tensor shapes and context."""
     from server.executor.types import Sequence, SequenceState
@@ -270,6 +342,7 @@ def test_prepare_decode_builds_one_token_per_sequence() -> None:
             generated_token_ids=[21],
             num_prompt_tokens=2,
             num_tokens=2,
+            max_new_tokens=4,
             block_table=[0],
             state=SequenceState.RUNNING,
         ),
@@ -279,6 +352,7 @@ def test_prepare_decode_builds_one_token_per_sequence() -> None:
             generated_token_ids=[33],
             num_prompt_tokens=3,
             num_tokens=3,
+            max_new_tokens=4,
             block_table=[1, 2],
             state=SequenceState.RUNNING,
         ),
@@ -578,6 +652,7 @@ def test_post_decode_isolates_sampling_failure() -> None:
         generated_token_ids=[4],
         num_prompt_tokens=3,
         num_tokens=3,
+        max_new_tokens=5,
         block_table=[0],
         state=SequenceState.RUNNING,
     )
@@ -587,6 +662,7 @@ def test_post_decode_isolates_sampling_failure() -> None:
         generated_token_ids=[4],
         num_prompt_tokens=3,
         num_tokens=3,
+        max_new_tokens=5,
         block_table=[1],
         state=SequenceState.RUNNING,
     )
