@@ -258,30 +258,13 @@ def test_cancel_inflight_clears_state_and_invokes_callback() -> None:
     assert sorted(block_manager.free_blocks) == list(range(block_manager.total_blocks))
 
 
-class _StopWhenTerminal:
-    """Stops once every tracked request reaches a terminal state (DONE/FAILED)."""
-
-    def __init__(self, requests: list[GenerationRequestState], max_calls: int = 5000):
-        self._requests = requests
-        self._calls = 0
-        self._max_calls = max_calls
-        self._terminal = {RequestStatus.DONE, RequestStatus.FAILED}
-
-    def should_stop(self) -> bool:
-        self._calls += 1
-        if self._calls > self._max_calls:
-            return True
-        return all(r.status in self._terminal for r in self._requests)
-
-    def wait_idle(self, _timeout: float) -> bool:
-        return False
-
-
-def test_kv_deadlock_breaker_aborts_one_request_and_frees_all_blocks() -> None:
-    # Two requests whose worst-case footprints jointly outgrow the pool. Each
-    # passes admission (Layer 1 checks the free pool without reserving the
-    # other's budget), both prefill, both grow, and collide with no free block.
-    # Layer 2 must abort exactly one and let the other complete, leaking nothing.
+def test_admission_reserves_budget_so_competing_requests_serialize() -> None:
+    # Two requests whose worst-case footprints jointly outgrow the pool. The
+    # reservation ledger admits the first (claiming its full budget) and defers
+    # the second until the first finishes and releases its blocks — so BOTH
+    # complete, in sequence, with no aborts and nothing leaked. Before the
+    # ledger, both were admitted against the same free blocks, collided, and
+    # the deadlock breaker hard-failed one of them.
     backend = _FakeBackend([0, 1, 2, 3])  # 4-token prompt = one full block
     block_manager = BlockManager(total_blocks=4, block_size=4)  # 16-token pool
     scheduler = Scheduler(
@@ -294,7 +277,7 @@ def test_kv_deadlock_breaker_aborts_one_request_and_frees_all_blocks() -> None:
 
     reqs = []
     for i in range(2):
-        r = _make_req(max_new_tokens=8)  # worst case 4 + 8 = 12 tokens = 3 blocks
+        r = _make_req(max_new_tokens=8)  # worst case 4 + 7 = 11 tokens = 3 blocks
         r.request_id = f"req-{i}"
         reqs.append(r)
 
@@ -304,30 +287,26 @@ def test_kv_deadlock_breaker_aborts_one_request_and_frees_all_blocks() -> None:
     recorder: dict = {}
     engine.run(
         inbound=inbound,
-        control=_StopWhenTerminal(reqs),
+        control=_StopWhenDone(reqs),
         callbacks=_callbacks(recorder),
     )
 
     assert "fatal" not in recorder, f"engine hit fatal error: {recorder.get('fatal')}"
 
-    # Exactly one completes, exactly one is aborted.
-    statuses = [r.status for r in reqs]
-    assert statuses.count(RequestStatus.DONE) == 1
-    assert statuses.count(RequestStatus.FAILED) == 1
+    # Both complete; neither is aborted.
+    assert [r.status for r in reqs] == [RequestStatus.DONE, RequestStatus.DONE]
+    for r in reqs:
+        events = drain_events(r)
+        assert not [e for e in events if isinstance(e, ErrorEvent)]
+        assert [e for e in events if isinstance(e, DoneEvent)]
 
-    aborted = next(r for r in reqs if r.status == RequestStatus.FAILED)
-    errors = [e for e in drain_events(aborted) if isinstance(e, ErrorEvent)]
-    assert len(errors) == 1
-    assert "KV cache exhausted" in errors[0].error
-
-    done = next(r for r in reqs if r.status == RequestStatus.DONE)
-    assert [e for e in drain_events(done) if isinstance(e, DoneEvent)]
-
-    # No leaked blocks: both the completed and the aborted sequence released.
+    # Nothing leaked: blocks, reservations, and engine tracking all drained.
     assert scheduler.running == []
     assert sorted(block_manager.free_blocks) == list(range(block_manager.total_blocks))
+    assert block_manager._total_reserved == 0
     assert engine._all_requests == {}
     assert engine._seq_to_request == {}
+    assert len(engine._pending) == 0
 
 
 def test_prepare_decode_builds_one_token_per_sequence() -> None:

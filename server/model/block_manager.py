@@ -11,10 +11,19 @@ class BlockManager:
         total_blocks: Total number of blocks available in the system.
         block_size: Number of tokens each block can hold.
 
-    THREAD SAFETY: ``free_blocks`` and ``allocated_blocks`` are not locked.
-    This is correct only because a single worker thread drives the engine
-    loop; sharing a manager across engine threads would need external
-    synchronization.
+    RESERVATION INVARIANT: admission uses a check-then-reserve protocol —
+    ``can_admit`` checks the *effective* free pool (physical free blocks minus
+    every outstanding reservation) and ``reserve`` records the sequence's
+    worst-case block count. As long as every tracked sequence went through
+    that pair, ``sum(reserved.values()) <= len(free_blocks)`` always holds, so
+    ``allocate``/``append`` for a reserved sequence can never run out of
+    physical blocks. This is what prevents two concurrently admitted requests
+    from jointly over-committing the pool and deadlocking mid-decode.
+
+    THREAD SAFETY: ``free_blocks``, ``allocated_blocks`` and the reservation
+    ledger are not locked. This is correct only because a single worker thread
+    drives the engine loop; sharing a manager across engine threads would need
+    external synchronization.
     """
 
     def __init__(self, total_blocks: int, block_size: int):
@@ -27,6 +36,13 @@ class BlockManager:
         self.allocated_blocks: dict[
             str, set[int]
         ] = {}  # sequence_id -> set of block_ids
+        # Reservation ledger: sequence_id -> worst-case blocks the sequence may
+        # still need beyond what is already in its block_table. Recorded at
+        # admission (reserve), drawn down as blocks materialize (allocate /
+        # append), released on free. _total_reserved caches the sum so the
+        # admission check stays O(1).
+        self.reserved: dict[str, int] = {}
+        self._total_reserved = 0
 
     def _num_blocks_needed(self, num_tokens: int) -> int:
         return (num_tokens + self.block_size - 1) // self.block_size  # Ceiling division
@@ -40,31 +56,78 @@ class BlockManager:
 
         Prompt-only on purpose: ``allocate`` only pops blocks for the prompt, so
         this guard must match what is actually allocated. Admission decisions use
-        ``can_admit`` instead, which also reserves the generation budget.
+        ``can_admit`` + ``reserve`` instead, which account for the generation
+        budget.
         """
         return self.has_free_blocks_for(sequence.num_tokens)
 
-    def can_admit(self, sequence: Sequence) -> bool:
-        """Whether the sequence's worst-case footprint fits in the free pool now.
+    def worst_case_blocks(self, sequence: Sequence) -> int:
+        """Blocks needed if the sequence generates its full ``max_new_tokens``.
 
-        Reserves for prompt + ``max_new_tokens`` so a request is not admitted on
-        prompt size alone and then wedged when a later decode step needs a block
-        that no longer exists. Conservative: most generations stop early at EOS,
-        so this trades throughput for a liveness guarantee.
+        The budget is prompt + max_new_tokens - 1, not + max_new_tokens: prefill
+        stores KV for positions 0..P-1, and each decode step stores KV for its
+        *input* token before sampling the next one. The final sampled token ends
+        generation immediately, so its KV is never written to the cache. The
+        max(0, ...) keeps max_new_tokens=0 sequences prompt-only.
         """
-        return self.has_free_blocks_for(sequence.num_tokens + sequence.max_new_tokens)
+        return self._num_blocks_needed(
+            sequence.num_tokens + max(0, sequence.max_new_tokens - 1)
+        )
+
+    def can_admit(self, sequence: Sequence) -> bool:
+        """Whether the sequence's worst-case footprint fits the effective pool.
+
+        The effective pool is the physical free blocks minus every outstanding
+        reservation, so already-admitted sequences' unmaterialized budgets are
+        counted even though their blocks haven't been popped yet. This is a
+        check only — the caller must follow up with ``reserve`` to claim the
+        capacity. Only call this for sequences that are not yet reserved: a
+        reserved sequence's own budget sits in ``_total_reserved`` and would be
+        double-counted against it.
+
+        Conservative: most generations stop early at EOS, so reserving the full
+        budget trades throughput for a liveness guarantee.
+        """
+        effective_free = len(self.free_blocks) - self._total_reserved
+        return effective_free >= self.worst_case_blocks(sequence)
+
+    def reserve(self, sequence: Sequence) -> None:
+        """Record the sequence's worst-case block budget in the ledger.
+
+        Called at admission, after ``can_admit`` passed. The reservation is
+        drawn down as blocks materialize (``allocate``/``append``) and any
+        remainder is released by ``free``.
+        """
+        if sequence.sequence_id in self.reserved:
+            raise ValueError(
+                f"Sequence {sequence.sequence_id} already holds a reservation; "
+                "free it before re-reserving"
+            )
+        blocks = self.worst_case_blocks(sequence)
+        self.reserved[sequence.sequence_id] = blocks
+        self._total_reserved += blocks
+
+    def _consume_reservation(self, sequence_id: str, num_blocks: int) -> None:
+        """Draw down a reservation as physical blocks materialize.
+
+        A reserved block that has been popped into the block_table is no longer
+        "promised future use" — it is held — so it leaves the ledger. The min()
+        floor makes this a no-op for unreserved sequences (e.g. tests that call
+        allocate directly without going through admission).
+        """
+        used = min(self.reserved.get(sequence_id, 0), num_blocks)
+        if used:
+            self.reserved[sequence_id] -= used
+            self._total_reserved -= used
 
     def can_ever_allocate(self, sequence: Sequence) -> bool:
         """Whether the request could ever fit in the cache, ignoring current usage.
 
         Unlike ``can_admit``, this is checked against the cache's total capacity,
-        so a request whose prompt + ``max_new_tokens`` can never be scheduled (no
+        so a request whose worst-case footprint can never be scheduled (no
         matter how many blocks free up) is detected up front.
         """
-        return (
-            self._num_blocks_needed(sequence.num_tokens + sequence.max_new_tokens)
-            <= self.total_blocks
-        )
+        return self.worst_case_blocks(sequence) <= self.total_blocks
 
     def _additional_blocks_needed(
         self, sequence: Sequence, extra_tokens: int = 0
@@ -99,6 +162,7 @@ class BlockManager:
 
         self.allocated_blocks[sequence.sequence_id] = set(block_ids)
         sequence.block_table = list(block_ids)
+        self._consume_reservation(sequence.sequence_id, num_blocks_needed)
 
     def append(self, sequence: Sequence, extra_tokens: int = 0) -> None:
         """
@@ -125,6 +189,7 @@ class BlockManager:
             block_id = heapq.heappop(self.free_blocks)
             self.allocated_blocks[sequence.sequence_id].add(block_id)
             sequence.block_table.append(block_id)
+        self._consume_reservation(sequence.sequence_id, additional)
 
     def free(self, sequence: Sequence) -> None:
         """
@@ -148,5 +213,10 @@ class BlockManager:
                 )
             for block_id in allocated:
                 heapq.heappush(self.free_blocks, block_id)
+
+        # Release whatever budget the sequence never materialized (e.g. it hit
+        # EOS early, or was evicted while still waiting). Popping keeps free()
+        # idempotent for the ledger too.
+        self._total_reserved -= self.reserved.pop(sequence.sequence_id, 0)
 
         sequence.block_table = []

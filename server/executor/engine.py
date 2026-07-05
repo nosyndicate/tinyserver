@@ -335,10 +335,6 @@ class ScheduleInferenceEngine:
     calls the executor to process them.
     """
 
-    # Number of consecutive wedged schedule() calls tolerated before aborting a
-    # running sequence.
-    _STALL_LIMIT = 3
-
     def __init__(
         self,
         scheduler: Scheduler,
@@ -364,10 +360,6 @@ class ScheduleInferenceEngine:
         # exceeds the scheduler's max_waiting.
         self._pending: deque[tuple[GenerationRequestState, Sequence]] = deque()
         self._emitter = RequestEventEmitter()
-        # Consecutive schedule() calls that produced no batch while the pool is
-        # exhausted and sequences are still running (see run()). Bounded backstop
-        # against a KV-cache deadlock; reset whenever a batch is scheduled.
-        self._stall_count = 0
 
     def _admit(self, req: GenerationRequestState, seq: Sequence) -> None:
         """Track a request and hand its sequence to the scheduler's waiting list."""
@@ -411,10 +403,13 @@ class ScheduleInferenceEngine:
                 # The prompt can never fit in the KV cache, no matter how many
                 # blocks free up. Fail it once instead of deferring (and later
                 # re-checking) it forever. Consumes no admission budget.
+                # Worst case stores prompt + max_new_tokens - 1 tokens of KV
+                # (the final sampled token's KV is never written).
                 self._emitter.on_failed(
                     req,
-                    f"prompt of {seq.num_tokens} tokens plus {seq.max_new_tokens} "
-                    f"max_new_tokens exceeds cache capacity of "
+                    f"prompt of {seq.num_tokens} tokens plus "
+                    f"{max(0, seq.max_new_tokens - 1)} generated-KV tokens "
+                    f"exceeds cache capacity of "
                     f"{self._scheduler.block_manager.total_blocks * self._scheduler.block_manager.block_size} tokens",
                 )
                 continue
@@ -542,7 +537,6 @@ class ScheduleInferenceEngine:
                         control.wait_idle(0.01)
                         continue
 
-                    self._stall_count = 0
                     start_ns = now_ns()
                     if batch.kind == SequenceBatchTask.PREFILL:
                         input_ids, position_ids, ctx = self._prepare_prefill(
@@ -704,27 +698,22 @@ class ScheduleInferenceEngine:
     def _maybe_break_deadlock(self) -> None:
         """Abort a running sequence when the KV pool is deadlocked.
 
-        Called when ``schedule()`` returned no batch. The wedge is: sequences are
-        still running but there are no free blocks, so no decode step can reserve
-        the block it needs and nothing will ever free one on its own.
+        Called when ``schedule()`` returned no batch. That alone implies the
+        wedge whenever sequences are still running: finished sequences were
+        reaped at the top of schedule(), each decode step needs at most one new
+        block, and every one was skipped — so the pool is out of blocks. The
+        wedge is also permanent: this engine is single-threaded and nothing
+        frees a block outside schedule(), so there is no point debouncing —
+        abort on first detection.
 
-        In this case, the youngest running sequence is evicted, its blocks reclaimed,
-        and its request failed with a clear error. Progress on any later iteration
-        resets the counter.
+        With the reservation ledger, admitted sequences can always obtain their
+        blocks, so this path should be unreachable; it survives as a backstop
+        against accounting bugs (a wedged pool becomes one failed request
+        instead of a bricked server).
         """
-        wedged = (
-            bool(self._scheduler.running)
-            and not self._scheduler.block_manager.free_blocks
-        )
-        if not wedged:
-            self._stall_count = 0
+        if not self._scheduler.running:
             return
 
-        self._stall_count += 1
-        if self._stall_count < self._STALL_LIMIT:
-            return
-
-        self._stall_count = 0
         victim = self._scheduler.abort_youngest_running()
         if victim is None:
             return

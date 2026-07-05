@@ -208,8 +208,10 @@ class Sequence:
     num_prompt_tokens: int
     num_tokens: int
     # Worst-case generation budget, used by admission to reserve enough KV
-    # capacity for the whole request (prompt + max_new_tokens) up front rather
-    # than admitting on prompt size alone and wedging on a later decode step.
+    # capacity for the whole request up front rather than admitting on prompt
+    # size alone and wedging on a later decode step. The reservation is
+    # prompt + max_new_tokens - 1 tokens: the final sampled token ends the
+    # request immediately, so its KV is never written to the cache.
     max_new_tokens: int
     block_table: list[int]
     state: SequenceState = SequenceState.WAITING
