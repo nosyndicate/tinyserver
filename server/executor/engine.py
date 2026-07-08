@@ -526,12 +526,6 @@ class ScheduleInferenceEngine:
                     batch = self._scheduler.schedule()
 
                     if batch is None:
-                        # Nothing scheduled. Detect a KV-cache deadlock: sequences
-                        # are still running but the pool is exhausted, so no decode
-                        # can make progress nothing else will free a block. Break it
-                        # by aborting the youngest running sequence and reporting a
-                        # clean error.
-                        self._maybe_break_deadlock()
                         # No sequences are scheduled, sleep for a short while to avoid busy loop. Use the sleep on _shutdown_event so when shutdown
                         # signal is set, it can break the sleep immediately and exit the loop.
                         control.wait_idle(0.01)
@@ -694,33 +688,6 @@ class ScheduleInferenceEngine:
                 seq.finished = True
                 self._emitter.on_failed(request_state, "sampling failed during decode")
                 self._cleanup_request(seq.sequence_id, request_state.request_id)
-
-    def _maybe_break_deadlock(self) -> None:
-        """Abort a running sequence when the KV pool is deadlocked.
-
-        Called when ``schedule()`` returned no batch. That alone implies the
-        wedge whenever sequences are still running: finished sequences were
-        reaped at the top of schedule(), each decode step needs at most one new
-        block, and every one was skipped — so the pool is out of blocks. The
-        wedge is also permanent: this engine is single-threaded and nothing
-        frees a block outside schedule(), so there is no point debouncing —
-        abort on first detection.
-
-        With the reservation ledger, admitted sequences can always obtain their
-        blocks, so this path should be unreachable; it survives as a backstop
-        against accounting bugs (a wedged pool becomes one failed request
-        instead of a bricked server).
-        """
-        if not self._scheduler.running:
-            return
-
-        victim = self._scheduler.abort_youngest_running()
-        if victim is None:
-            return
-        req = self._seq_to_request.get(victim.sequence_id)
-        if req is not None:
-            self._emitter.on_failed(req, "KV cache exhausted, request aborted")
-            self._cleanup_request(victim.sequence_id, req.request_id)
 
     def _cleanup_request(self, sequence_id: str, request_id: str) -> None:
         """Drop a finished request from the engine's tracking.

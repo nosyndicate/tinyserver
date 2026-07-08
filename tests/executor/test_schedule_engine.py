@@ -258,57 +258,6 @@ def test_cancel_inflight_clears_state_and_invokes_callback() -> None:
     assert sorted(block_manager.free_blocks) == list(range(block_manager.total_blocks))
 
 
-def test_admission_reserves_budget_so_competing_requests_serialize() -> None:
-    # Two requests whose worst-case footprints jointly outgrow the pool. The
-    # reservation ledger admits the first (claiming its full budget) and defers
-    # the second until the first finishes and releases its blocks — so BOTH
-    # complete, in sequence, with no aborts and nothing leaked. Before the
-    # ledger, both were admitted against the same free blocks, collided, and
-    # the deadlock breaker hard-failed one of them.
-    backend = _FakeBackend([0, 1, 2, 3])  # 4-token prompt = one full block
-    block_manager = BlockManager(total_blocks=4, block_size=4)  # 16-token pool
-    scheduler = Scheduler(
-        block_manager=block_manager,
-        max_waiting=4,
-        max_num_sequences=4,
-        max_num_tokens=64,
-    )
-    engine = ScheduleInferenceEngine(scheduler=scheduler, backend=backend)
-
-    reqs = []
-    for i in range(2):
-        r = _make_req(max_new_tokens=8)  # worst case 4 + 7 = 11 tokens = 3 blocks
-        r.request_id = f"req-{i}"
-        reqs.append(r)
-
-    inbound: Queue = Queue()
-    for r in reqs:
-        inbound.put(r)
-    recorder: dict = {}
-    engine.run(
-        inbound=inbound,
-        control=_StopWhenDone(reqs),
-        callbacks=_callbacks(recorder),
-    )
-
-    assert "fatal" not in recorder, f"engine hit fatal error: {recorder.get('fatal')}"
-
-    # Both complete; neither is aborted.
-    assert [r.status for r in reqs] == [RequestStatus.DONE, RequestStatus.DONE]
-    for r in reqs:
-        events = drain_events(r)
-        assert not [e for e in events if isinstance(e, ErrorEvent)]
-        assert [e for e in events if isinstance(e, DoneEvent)]
-
-    # Nothing leaked: blocks, reservations, and engine tracking all drained.
-    assert scheduler.running == []
-    assert sorted(block_manager.free_blocks) == list(range(block_manager.total_blocks))
-    assert block_manager._total_reserved == 0
-    assert engine._all_requests == {}
-    assert engine._seq_to_request == {}
-    assert len(engine._pending) == 0
-
-
 def test_prepare_decode_builds_one_token_per_sequence() -> None:
     """Unit-level check of _prepare_decode's tensor shapes and context."""
     from server.executor.types import Sequence, SequenceState

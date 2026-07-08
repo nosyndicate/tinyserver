@@ -76,71 +76,6 @@ def test_can_add_new_sequence_false_when_prompt_exceeds_free_blocks() -> None:
     assert sched.can_add_new_sequence(big) is False
 
 
-def test_can_add_new_sequence_reserves_generation_budget() -> None:
-    # Admission accounts for the worst-case footprint, not just the prompt: a
-    # prompt that physically fits is still rejected when its worst case would
-    # not, so it can't be admitted and then wedge on a later decode step.
-    sched = make_scheduler(total_blocks=4, block_size=4)  # 16-token pool
-    seq = make_sequence(num_tokens=14, max_new_tokens=8)  # 21 tokens worst case
-    assert sched.block_manager.can_allocate(seq) is True  # prompt alone fits
-    assert sched.can_add_new_sequence(seq) is False
-
-
-def test_add_reserves_worst_case_blocks() -> None:
-    # add() records a reservation, so a second identical sequence is rejected
-    # even though the pool is still physically untouched. Before the ledger,
-    # both would pass can_add_new_sequence against the same free blocks, both
-    # would start, and they'd collide mid-decode with no free block left.
-    sched = make_scheduler(total_blocks=4, block_size=4)  # 16-token pool
-    a = make_sequence(sequence_id="a", num_tokens=4, max_new_tokens=8)  # 3 blocks
-    b = make_sequence(sequence_id="b", num_tokens=4, max_new_tokens=8)  # 3 blocks
-
-    assert sched.can_add_new_sequence(a) is True
-    sched.add(a)
-
-    assert len(sched.block_manager.free_blocks) == 4  # nothing popped yet
-    assert sched.can_add_new_sequence(b) is False  # only 1 effective block left
-
-
-def test_schedule_prefill_runs_sequence_when_pool_exactly_reserved() -> None:
-    # Regression for a double-count bug: the prefill loop must not re-check
-    # can_admit for a waiting sequence — its own reservation is already in the
-    # ledger, so effective free capacity looks like zero and the head would
-    # stall forever despite being guaranteed its blocks.
-    sched = make_scheduler(total_blocks=4, block_size=4)  # 16-token pool
-    seq = make_sequence(num_tokens=13, max_new_tokens=4)  # 16 tokens = 4 blocks
-    assert sched.can_add_new_sequence(seq) is True
-    sched.add(seq)
-
-    batch = sched.schedule()
-
-    assert batch is not None
-    assert batch.sequences == [seq]
-
-
-# --- abort_youngest_running (deadlock backstop) ----------------------------
-
-
-def test_abort_youngest_running_frees_blocks_and_returns_victim() -> None:
-    sched = make_scheduler(total_blocks=4, block_size=4)
-    _prefill_running(sched, ["a", "b"], num_tokens=8)  # 2 blocks each, pool full
-    assert not sched.block_manager.free_blocks
-
-    victim = sched.abort_youngest_running()
-
-    assert victim is not None
-    assert victim.sequence_id == "b"  # youngest = last started
-    assert victim.finished is True  # terminal by every observable field
-    assert [s.sequence_id for s in sched.running] == ["a"]
-    assert victim.sequence_id not in sched.block_manager.allocated_blocks
-    assert len(sched.block_manager.free_blocks) == 2  # b's blocks reclaimed
-
-
-def test_abort_youngest_running_returns_none_when_idle() -> None:
-    sched = make_scheduler()
-    assert sched.abort_youngest_running() is None
-
-
 # --- schedule(): prefill ---------------------------------------------------
 
 
@@ -202,13 +137,8 @@ def test_schedule_prefill_allows_single_oversized_sequence() -> None:
 
 
 def _prefill_running(sched: Scheduler, ids: list[str], num_tokens: int) -> None:
-    # max_new_tokens=0 so admission reserves exactly the prompt: these decode
-    # tests size prompts against the pool and grow sequences by hand, so the
-    # worst-case budget reservation would otherwise change the block math.
     for sid in ids:
-        sched.add(
-            make_sequence(sequence_id=sid, num_tokens=num_tokens, max_new_tokens=0)
-        )
+        sched.add(make_sequence(sequence_id=sid, num_tokens=num_tokens))
     sched.schedule()  # consume the prefill batch, populating running
 
 
@@ -278,17 +208,15 @@ def test_schedule_reaps_finished_before_prefill_so_blocks_are_reused() -> None:
     # skipped cleanup, so a finished sequence's blocks stayed allocated and
     # blocked new prefills (schedule() returned None instead).
     sched = make_scheduler(block_size=4, total_blocks=4)
-    # One running sequence holding all 4 blocks, now finished. max_new_tokens=0
-    # so admission reserves exactly the prompt (this test is about reaping, not
-    # the generation-budget reservation).
-    done = make_sequence(sequence_id="done", num_tokens=16, max_new_tokens=0)
+    # One running sequence holding all 4 blocks, now finished.
+    done = make_sequence(sequence_id="done", num_tokens=16)
     sched.add(done)
     sched.schedule()  # prefill -> running, allocates all 4 blocks
     done.finished = True
     assert not sched.block_manager.free_blocks
 
     # A waiting sequence that can only prefill once `done`'s blocks free up.
-    sched.add(make_sequence(sequence_id="next", num_tokens=4, max_new_tokens=0))
+    sched.add(make_sequence(sequence_id="next", num_tokens=4))
 
     batch = sched.schedule()
 

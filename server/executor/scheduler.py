@@ -30,19 +30,16 @@ class Scheduler:
     def can_add_new_sequence(self, sequence: Sequence) -> bool:
         """
         Check if we can add ``sequence`` to the scheduler: room in the waiting
-        queue AND the effective free pool has capacity for the sequence's
-        worst-case footprint (prompt + max_new_tokens - 1). ``add()`` then
-        records the reservation.
+        queue AND the block manager can allocate the sequence's prompt right now.
 
-        Checked against the full generation budget rather than the prompt alone
-        so we don't admit a request that prefills fine but wedges on a later
-        decode step when no free block remains — and because ``can_admit``
-        subtracts every earlier admission's reservation, two requests can't
-        both be admitted against the same free blocks.
+        Checked against the real prompt size rather than a single token so we
+        don't admit requests that can't actually be started. Feasibility
+        (worst-case prompt + max_new_tokens fitting the cache at all) is rejected
+        earlier, in the engine's fail-fast on ``can_ever_allocate``.
         """
         if len(self.waiting) >= self.max_waiting:
             return False
-        return self.block_manager.can_admit(sequence)
+        return self.block_manager.can_allocate(sequence)
 
     def admission_headroom(self) -> int:
         """Number of free slots in the waiting queue.
@@ -55,10 +52,6 @@ class Scheduler:
         return max(0, self.max_waiting - len(self.waiting))
 
     def add(self, sequence: Sequence) -> None:
-        # Claim the worst-case block budget the moment the sequence is admitted.
-        # Every sequence in waiting/running holds a reservation, which is what
-        # makes the allocate/append calls in schedule() infallible for them.
-        self.block_manager.reserve(sequence)
         self.waiting.append(sequence)
 
     def clear(self) -> None:
@@ -67,33 +60,9 @@ class Scheduler:
         """
         for seq in self.running:
             self.block_manager.free(seq)
-        # Waiting sequences hold no physical blocks, but free() also releases
-        # the reservation add() recorded for them.
-        for seq in self.waiting:
-            self.block_manager.free(seq)
 
         self.running.clear()
         self.waiting.clear()
-
-    def abort_youngest_running(self) -> Sequence | None:
-        """Evict the most recently started running sequence, freeing its blocks.
-
-        A liveness backstop against block-accounting bugs: the reservation
-        ledger guarantees admitted sequences can always obtain their blocks, so
-        a wedged pool should be unreachable — but if the guarantee is ever
-        broken, this reclaims capacity instead of bricking the server. The
-        youngest sequence is picked because it is furthest from finishing (the
-        older ones are closer to freeing their own blocks). Returns the evicted
-        sequence, or ``None`` if nothing is running. Surfacing an error for the
-        victim is the caller's job — this reclaims the blocks and marks the
-        sequence finished so it is terminal by every observable field.
-        """
-        if not self.running:
-            return None
-        victim = self.running.pop()
-        victim.finished = True
-        self.block_manager.free(victim)
-        return victim
 
     def _reap_finished(self) -> None:
         """Free blocks of finished sequences and drop them from running.
@@ -131,12 +100,6 @@ class Scheduler:
         total_tokens = 0
         while self.waiting and len(scheduled) < self.max_num_sequences:
             seq_to_add = self.waiting[0]
-            # Waiting sequences already hold a worst-case reservation (add()
-            # recorded it), so their prompt blocks are guaranteed available —
-            # re-checking can_admit here would double-count the head's own
-            # reservation and could stall it forever. The physical check below
-            # only guards sequences that bypassed the reservation (e.g. tests
-            # driving the block manager directly).
             enough_memory = self.block_manager.can_allocate(seq_to_add)
             # Allow a single oversized sequence through when the batch is still
             # empty; otherwise it would block the whole queue forever.

@@ -107,23 +107,7 @@ def test_allocate_preserves_block_order() -> None:
     assert seq.block_table == [7, 8]
 
 
-# --- can_admit / can_ever_allocate (worst-case budget) ---------------------
-
-
-def test_can_admit_reserves_generation_budget() -> None:
-    # 4 blocks * 4 tokens = 16-token pool. A 14-token prompt fits (needs 4
-    # blocks) but with 8 max_new_tokens its worst case is 21 tokens (6 blocks),
-    # so it must NOT be admitted even though its prompt physically allocates.
-    bm = BlockManager(total_blocks=4, block_size=4)
-    seq = make_sequence(num_tokens=14, max_new_tokens=8)
-    assert bm.can_allocate(seq) is True  # prompt alone fits
-    assert bm.can_admit(seq) is False  # prompt + budget does not
-
-
-def test_can_admit_true_when_worst_case_fits() -> None:
-    bm = BlockManager(total_blocks=4, block_size=4)  # 16 tokens
-    seq = make_sequence(num_tokens=8, max_new_tokens=8)  # 15 tokens worst case
-    assert bm.can_admit(seq) is True
+# --- can_ever_allocate (worst-case budget) ----------------------------------
 
 
 def test_can_ever_allocate_uses_prompt_plus_budget_vs_total() -> None:
@@ -143,43 +127,7 @@ def test_worst_case_excludes_final_sampled_token_kv() -> None:
     bm = BlockManager(total_blocks=4, block_size=4)  # 16-token capacity
     seq = make_sequence(num_tokens=13, max_new_tokens=4)
     assert bm.worst_case_blocks(seq) == 4
-    assert bm.can_admit(seq) is True
     assert bm.can_ever_allocate(seq) is True
-
-
-# --- reservation ledger -----------------------------------------------------
-
-
-def test_reservation_lifecycle_reserve_drawdown_release() -> None:
-    bm = BlockManager(total_blocks=4, block_size=4)  # 16-token pool
-    a = make_sequence(sequence_id="a", num_tokens=4, max_new_tokens=5)  # 2 blocks
-
-    # reserve: claims worst-case capacity without touching physical blocks,
-    # shrinking the effective pool other admissions see.
-    bm.reserve(a)
-    assert bm._total_reserved == 2
-    assert len(bm.free_blocks) == 4
-    b = make_sequence(sequence_id="b", num_tokens=4, max_new_tokens=9)  # 3 blocks
-    assert bm.can_admit(b) is False  # 4 free - 2 reserved = 2 < 3
-
-    # allocate draws the prompt block out of a's reservation.
-    bm.allocate(a)
-    assert bm.reserved["a"] == 1
-    assert bm._total_reserved == 1
-
-    # append draws the remaining budgeted block.
-    a.num_tokens = 5  # spills into a second block
-    bm.append(a)
-    assert bm.reserved["a"] == 0
-    assert bm._total_reserved == 0
-
-    # free returns the blocks and drops the ledger entry; double-free is a no-op.
-    bm.free(a)
-    assert "a" not in bm.reserved
-    assert bm._total_reserved == 0
-    assert len(bm.free_blocks) == 4
-    bm.free(a)
-    assert bm._total_reserved == 0
 
 
 # --- can_append / append (idempotent ensure-capacity) ----------------------
