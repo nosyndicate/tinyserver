@@ -11,6 +11,7 @@ def make_sequence(
     sequence_id: str = "seq-0",
     num_tokens: int = 1,
     block_table: list[int] | None = None,
+    max_new_tokens: int = 1,
 ) -> Sequence:
     """Minimal Sequence factory mirroring tests/model/test_block_manager.py."""
     return Sequence(
@@ -19,6 +20,7 @@ def make_sequence(
         generated_token_ids=[],
         num_prompt_tokens=num_tokens,
         num_tokens=num_tokens,
+        max_new_tokens=max_new_tokens,
         block_table=list(block_table) if block_table is not None else [],
     )
 

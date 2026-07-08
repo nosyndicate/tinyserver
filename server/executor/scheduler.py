@@ -30,11 +30,12 @@ class Scheduler:
     def can_add_new_sequence(self, sequence: Sequence) -> bool:
         """
         Check if we can add ``sequence`` to the scheduler: room in the waiting
-        queue AND the block manager can allocate the sequence's full prompt
-        right now.
+        queue AND the block manager can allocate the sequence's prompt right now.
 
         Checked against the real prompt size rather than a single token so we
-        don't admit requests that can't actually be started.
+        don't admit requests that can't actually be started. Feasibility
+        (worst-case prompt + max_new_tokens fitting the cache at all) is rejected
+        earlier, in the engine's fail-fast on ``can_ever_allocate``.
         """
         if len(self.waiting) >= self.max_waiting:
             return False

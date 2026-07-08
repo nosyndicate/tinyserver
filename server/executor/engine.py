@@ -403,9 +403,13 @@ class ScheduleInferenceEngine:
                 # The prompt can never fit in the KV cache, no matter how many
                 # blocks free up. Fail it once instead of deferring (and later
                 # re-checking) it forever. Consumes no admission budget.
+                # Worst case stores prompt + max_new_tokens - 1 tokens of KV
+                # (the final sampled token's KV is never written).
                 self._emitter.on_failed(
                     req,
-                    f"prompt of {seq.num_tokens} tokens exceeds cache capacity of "
+                    f"prompt of {seq.num_tokens} tokens plus "
+                    f"{max(0, seq.max_new_tokens - 1)} generated-KV tokens "
+                    f"exceeds cache capacity of "
                     f"{self._scheduler.block_manager.total_blocks * self._scheduler.block_manager.block_size} tokens",
                 )
                 continue
@@ -427,6 +431,7 @@ class ScheduleInferenceEngine:
             generated_token_ids=[],
             num_prompt_tokens=len(token_ids),
             num_tokens=len(token_ids),
+            max_new_tokens=req.sampling_params.max_new_tokens,
             block_table=[],
         )
 

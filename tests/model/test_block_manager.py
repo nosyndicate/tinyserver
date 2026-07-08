@@ -10,11 +10,13 @@ def make_sequence(
     sequence_id: str = "seq-0",
     num_tokens: int = 0,
     block_table: list[int] | None = None,
+    max_new_tokens: int = 0,
 ) -> Sequence:
     """Minimal Sequence factory for BlockManager tests.
 
-    BlockManager only reads sequence_id, num_tokens and block_table; the other
-    fields are set to harmless defaults.
+    BlockManager reads sequence_id, num_tokens, max_new_tokens and block_table;
+    the other fields are set to harmless defaults. max_new_tokens defaults to 0
+    so callers that don't care keep prompt-only semantics.
     """
     return Sequence(
         sequence_id=sequence_id,
@@ -22,6 +24,7 @@ def make_sequence(
         generated_token_ids=[],
         num_prompt_tokens=num_tokens,
         num_tokens=num_tokens,
+        max_new_tokens=max_new_tokens,
         block_table=list(block_table) if block_table is not None else [],
     )
 
@@ -102,6 +105,29 @@ def test_allocate_preserves_block_order() -> None:
     bm.allocate(seq)
 
     assert seq.block_table == [7, 8]
+
+
+# --- can_ever_allocate (worst-case budget) ----------------------------------
+
+
+def test_can_ever_allocate_uses_prompt_plus_budget_vs_total() -> None:
+    bm = BlockManager(total_blocks=4, block_size=4)  # 16-token capacity
+    # 14 + 7 = 21 tokens > 16: can never complete, reject up front.
+    assert bm.can_ever_allocate(make_sequence(num_tokens=14, max_new_tokens=8)) is False
+    # 8 + 7 = 15 tokens < capacity: could complete when the pool is empty.
+    assert bm.can_ever_allocate(make_sequence(num_tokens=8, max_new_tokens=8)) is True
+
+
+def test_worst_case_excludes_final_sampled_token_kv() -> None:
+    # The final sampled token ends generation immediately, so its KV is never
+    # written: the worst case is prompt + max_new_tokens - 1 tokens. A 13-token
+    # prompt with 4 max_new_tokens caches at most 16 tokens = exactly 4 blocks
+    # — admissible. The old +max_new_tokens formula computed 17 tokens = 5
+    # blocks and wrongly hard-failed the request.
+    bm = BlockManager(total_blocks=4, block_size=4)  # 16-token capacity
+    seq = make_sequence(num_tokens=13, max_new_tokens=4)
+    assert bm.worst_case_blocks(seq) == 4
+    assert bm.can_ever_allocate(seq) is True
 
 
 # --- can_append / append (idempotent ensure-capacity) ----------------------

@@ -270,6 +270,7 @@ def test_prepare_decode_builds_one_token_per_sequence() -> None:
             generated_token_ids=[21],
             num_prompt_tokens=2,
             num_tokens=2,
+            max_new_tokens=4,
             block_table=[0],
             state=SequenceState.RUNNING,
         ),
@@ -279,6 +280,7 @@ def test_prepare_decode_builds_one_token_per_sequence() -> None:
             generated_token_ids=[33],
             num_prompt_tokens=3,
             num_tokens=3,
+            max_new_tokens=4,
             block_table=[1, 2],
             state=SequenceState.RUNNING,
         ),
@@ -578,6 +580,7 @@ def test_post_decode_isolates_sampling_failure() -> None:
         generated_token_ids=[4],
         num_prompt_tokens=3,
         num_tokens=3,
+        max_new_tokens=5,
         block_table=[0],
         state=SequenceState.RUNNING,
     )
@@ -587,6 +590,7 @@ def test_post_decode_isolates_sampling_failure() -> None:
         generated_token_ids=[4],
         num_prompt_tokens=3,
         num_tokens=3,
+        max_new_tokens=5,
         block_table=[1],
         state=SequenceState.RUNNING,
     )

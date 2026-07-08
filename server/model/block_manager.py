@@ -39,14 +39,28 @@ class BlockManager:
         """Checks if the requested sequence can be allocated given the current free blocks."""
         return self.has_free_blocks_for(sequence.num_tokens)
 
+    def worst_case_blocks(self, sequence: Sequence) -> int:
+        """Blocks needed if the sequence generates its full ``max_new_tokens``.
+
+        The budget is prompt + max_new_tokens - 1, not + max_new_tokens: prefill
+        stores KV for positions 0..P-1, and each decode step stores KV for its
+        *input* token before sampling the next one. The final sampled token ends
+        generation immediately, so its KV is never written to the cache. The
+        max(0, ...) keeps max_new_tokens=0 sequences prompt-only.
+        """
+        return self._num_blocks_needed(
+            sequence.num_tokens + max(0, sequence.max_new_tokens - 1)
+        )
+
     def can_ever_allocate(self, sequence: Sequence) -> bool:
-        """Whether the prompt could ever fit in the cache, ignoring current usage.
+        """Whether the request could ever fit in the cache, ignoring current usage.
 
         Unlike ``can_allocate``, this is checked against the cache's total
-        capacity, so a prompt that can never be scheduled (no matter how many
-        blocks free up) is detected up front.
+        capacity, so a request whose worst-case footprint can never be scheduled
+        (no matter how many blocks free up) is detected up front and failed fast
+        rather than admitted and wedged mid-decode.
         """
-        return self._num_blocks_needed(sequence.num_tokens) <= self.total_blocks
+        return self.worst_case_blocks(sequence) <= self.total_blocks
 
     def _additional_blocks_needed(
         self, sequence: Sequence, extra_tokens: int = 0
