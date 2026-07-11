@@ -27,19 +27,25 @@ class Scheduler:
         # The running list holds sequences that are currently running.
         self.running: list[Sequence] = []
 
+        # Number of preemptions performed over the scheduler's lifetime. A high
+        # rate signals the watermark is too small or the pool too tight; full
+        # observability (logging/metrics) is a separate piece of work.
+        self.preemption_count = 0
+
     def can_add_new_sequence(self, sequence: Sequence) -> bool:
         """
         Check if we can add ``sequence`` to the scheduler: room in the waiting
-        queue AND the block manager can allocate the sequence's prompt right now.
+        queue AND the block manager can allocate the sequence's prompt while
+        leaving a small free-block headroom. The headroom is a thrash guard.
 
-        Checked against the real prompt size rather than a single token so we
-        don't admit requests that can't actually be started. Feasibility
-        (worst-case prompt + max_new_tokens fitting the cache at all) is rejected
-        earlier, in the engine's fail-fast on ``can_ever_allocate``.
+        Feasibility (worst-case prompt + max_new_tokens fitting the cache at all)
+        is rejected earlier, in the engine's fail-fast on ``can_ever_allocate``.
         """
         if len(self.waiting) >= self.max_waiting:
             return False
-        return self.block_manager.can_allocate(sequence)
+
+        headroom = max(1, int(0.01 * self.block_manager.total_blocks))
+        return self.block_manager.can_allocate_with_headroom(sequence, headroom)
 
     def admission_headroom(self) -> int:
         """Number of free slots in the waiting queue.
@@ -80,19 +86,41 @@ class Scheduler:
                 remain_running.append(seq)
         self.running = remain_running
 
+    def _preempt(self) -> Sequence:
+        """Evict the youngest running sequence to free blocks for a
+        higher-priority one, returning the evicted sequence.
+
+        Blocks are freed immediately (recompute-based preemption: there is no
+        KV swap to CPU). The victim keeps its ``generated_token_ids`` and
+        re-enters at the FRONT of ``waiting``, so it resumes before any newer
+        waiting request. Preempt-youngest + requeue-at-front keeps priority
+        order stable, so the oldest sequence always makes progress and the
+        eviction loop terminates.
+
+        Only the tail of ``running`` is ever evicted (``pop()``), so callers
+        must ensure the youngest sequence is a valid victim (not one already
+        scheduled this round).
+        """
+        victim = self.running.pop()  # youngest == last appended
+        self.block_manager.free(victim)
+        victim.state = SequenceState.PREEMPTED
+        self.waiting.appendleft(victim)
+        self.preemption_count += 1
+        return victim
+
     def schedule(self) -> ScheduledBatch | None:
         """
         Decide which sequences to run next.
 
         Reaps finished sequences first, then applies a simple policy:
         prioritize prefill so new requests get TTFT, falling back to decode.
+        Under memory pressure the decode phase preempts the youngest running
+        sequence (see ``_preempt``) so the oldest always makes progress.
 
         Capacity contract: the scheduler reserves block capacity for the token
         the engine is about to generate (``extra_tokens=1``) but does NOT
         advance ``num_tokens`` — the engine does that after producing each
         token, and sets ``finished`` when generation ends.
-
-        TODO: consider more sophisticated policies (preemption, decoding first).
         """
         self._reap_finished()
 
@@ -123,28 +151,50 @@ class Scheduler:
 
         scheduled = []
         total_tokens = 0
-        for seq_to_add in self.running:
+        # Index-based walk because we mutate ``running`` while iterating: making
+        # room for a sequence may preempt (pop) younger sequences off the tail.
+        # We only ever pop the tail, and ``seq_to_add = running[i]`` is never
+        # the tail while a younger sequence remains, so the current sequence is
+        # never popped and ``i`` stays valid as the tail shrinks.
+        idx = 0
+        while idx < len(self.running):
             if len(scheduled) >= self.max_num_sequences:
+                break
+
+            seq_to_add = self.running[idx]
+
+            # See if we can at least decode one more token for this sequence.
+            # If no, don't bother try to do preemption of other sequences.
+            if 1 + total_tokens > self.max_num_tokens:
+                # No budget this round, simply break.
                 break
 
             # Reserve a block for the token the engine is about to generate.
             # The engine advances num_tokens after producing it; the scheduler
             # only ensures the capacity exists here, so it never mutates
             # num_tokens and there is no rollback to undo.
-            if not self.block_manager.can_append(seq_to_add, extra_tokens=1):
-                # Not enough memory to decode this one; skip it for now and
-                # wait for other sequences to finish and free up blocks.
-                # TODO: consider preemption or other strategies here.
-                continue
+            #
+            # If there aren't enough blocks, preempt the youngest not-yet-
+            # scheduled sequence (the tail) and retry, until seq_to_add fits or
+            # it IS the youngest (nothing younger left to evict). The
+            # already-scheduled sequences occupy running[0:i] and have had
+            # append() called, so they must never be evicted — we only pop the
+            # tail, which is always in the not-yet-scheduled range running[i:].
+            while not self.block_manager.can_append(seq_to_add, extra_tokens=1):
+                if self.running[-1] is seq_to_add:
+                    break
+                self._preempt()
 
-            # See if we can at least decode one more token for this sequence.
-            if 1 + total_tokens > self.max_num_tokens:
-                # No budget this round, simply break.
+            if not self.block_manager.can_append(seq_to_add, extra_tokens=1):
+                # seq_to_add is the youngest remaining and still doesn't fit; it
+                # keeps its KV and waits for other sequences to free blocks.
+                # Every later sequence is younger, so none of them fit either.
                 break
 
             self.block_manager.append(seq_to_add, extra_tokens=1)
             scheduled.append(seq_to_add)
             total_tokens += 1
+            idx += 1
 
         if scheduled:
             return ScheduledBatch(kind=SequenceBatchTask.DECODE, sequences=scheduled)

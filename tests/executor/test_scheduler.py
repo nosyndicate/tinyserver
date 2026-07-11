@@ -76,6 +76,21 @@ def test_can_add_new_sequence_false_when_prompt_exceeds_free_blocks() -> None:
     assert sched.can_add_new_sequence(big) is False
 
 
+def test_can_add_new_sequence_rejects_when_no_headroom() -> None:
+    # Watermark thrash guard: even when the prompt fits, admission requires a
+    # small free-block headroom left over so a fresh sequence doesn't force a
+    # preemption on its first decode step. total_blocks=2 -> headroom
+    # max(1, int(0.02)) = 1.
+    sched = make_scheduler(total_blocks=2, block_size=4)
+
+    full = make_sequence(sequence_id="full", num_tokens=8)  # needs both blocks
+    assert sched.block_manager.can_allocate(full) is True  # would fit...
+    assert sched.can_add_new_sequence(full) is False  # ...but leaves 0 headroom
+
+    fits = make_sequence(sequence_id="fits", num_tokens=4)  # needs 1, leaves 1
+    assert sched.can_add_new_sequence(fits) is True
+
+
 # --- schedule(): prefill ---------------------------------------------------
 
 
@@ -173,18 +188,111 @@ def test_schedule_decode_reserves_block_on_boundary() -> None:
     assert len(seq.block_table) == 2  # new block reserved for the next token
 
 
-def test_schedule_decode_skips_sequence_without_free_blocks() -> None:
+def test_schedule_decode_preempts_youngest_to_make_room() -> None:
     # block_size=1 so every decoded token needs a new block. With only enough
-    # blocks for prefill, no sequence can append and decode yields nothing.
+    # blocks for prefill, the oldest sequence can't append until the youngest
+    # is preempted, freeing its block.
     sched = make_scheduler(block_size=1, total_blocks=2)
     _prefill_running(sched, ["a", "b"], num_tokens=1)
     assert not sched.block_manager.free_blocks
 
     batch = sched.schedule()
 
-    assert batch is None
-    # num_tokens left untouched (the scheduler never mutates it).
-    assert all(seq.num_tokens == 1 for seq in sched.running)
+    # Oldest ("a") makes progress; youngest ("b") is evicted.
+    assert batch is not None
+    assert batch.kind is SequenceBatchTask.DECODE
+    assert [s.sequence_id for s in batch.sequences] == ["a"]
+
+    assert [s.sequence_id for s in sched.running] == ["a"]
+    assert sched.running[0].num_tokens == 1  # scheduler never mutates num_tokens
+    assert len(sched.running[0].block_table) == 2  # block reserved for next token
+
+    # "b" is preempted: back at the front of waiting, blocks freed, state set.
+    assert [s.sequence_id for s in sched.waiting] == ["b"]
+    victim = sched.waiting[0]
+    assert victim.state is SequenceState.PREEMPTED
+    assert victim.block_table == []
+    assert sched.preemption_count == 1
+
+
+def test_preempt_evicts_youngest_and_requeues_at_front() -> None:
+    sched = make_scheduler(block_size=4, total_blocks=16)
+    _prefill_running(sched, ["a", "b"], num_tokens=4)
+    free_before = len(sched.block_manager.free_blocks)
+
+    victim = sched._preempt()
+
+    # Youngest (tail) is evicted and moved to the FRONT of waiting.
+    assert victim.sequence_id == "b"
+    assert victim.state is SequenceState.PREEMPTED
+    assert victim.block_table == []
+    assert victim.sequence_id not in sched.block_manager.allocated_blocks
+    assert [s.sequence_id for s in sched.running] == ["a"]
+    assert sched.waiting[0] is victim
+    assert len(sched.block_manager.free_blocks) > free_before  # blocks returned
+    assert sched.preemption_count == 1
+
+
+def test_schedule_decode_preempts_multiple_youngest_for_older_sequences() -> None:
+    # block_size=1, all 4 blocks used by 4 running sequences. Decoding the two
+    # oldest requires evicting the two youngest, one preemption each.
+    sched = make_scheduler(block_size=1, total_blocks=4)
+    _prefill_running(sched, ["a", "b", "c", "d"], num_tokens=1)
+    assert not sched.block_manager.free_blocks
+
+    batch = sched.schedule()
+
+    assert batch is not None
+    assert batch.kind is SequenceBatchTask.DECODE
+    assert [s.sequence_id for s in batch.sequences] == ["a", "b"]
+    assert [s.sequence_id for s in sched.running] == ["a", "b"]
+    assert sched.preemption_count == 2
+    # "d" was preempted first, then "c" via appendleft, so the older victim
+    # ("c") sits in front and resumes before "d".
+    assert [s.sequence_id for s in sched.waiting] == ["c", "d"]
+    assert all(s.state is SequenceState.PREEMPTED for s in sched.waiting)
+
+
+def test_schedule_decode_leaves_youngest_running_when_it_cannot_fit() -> None:
+    # block_size=1, 3 blocks: 2 held by running "a"/"b", 1 free. "a" takes the
+    # last free block; "b" is then the youngest not-yet-scheduled sequence and
+    # cannot append. It must NOT be self-preempted — it keeps its KV and waits.
+    sched = make_scheduler(block_size=1, total_blocks=3)
+    _prefill_running(sched, ["a", "b"], num_tokens=1)
+    assert len(sched.block_manager.free_blocks) == 1
+
+    batch = sched.schedule()
+
+    assert batch is not None
+    assert batch.kind is SequenceBatchTask.DECODE
+    assert [s.sequence_id for s in batch.sequences] == ["a"]
+    # "b" is untouched: still running, never evicted.
+    assert [s.sequence_id for s in sched.running] == ["a", "b"]
+    assert sched.running[1].state is SequenceState.RUNNING
+    assert not sched.waiting
+    assert sched.preemption_count == 0
+
+
+def test_preempted_sequence_resumes_before_newer_waiting() -> None:
+    # After a preemption, the evicted sequence must resume (re-prefill) ahead of
+    # any newer waiting request once blocks free up.
+    sched = make_scheduler(block_size=1, total_blocks=2)
+    _prefill_running(sched, ["a", "b"], num_tokens=1)
+    sched.schedule()  # "a" decodes, "b" is preempted to the front of waiting
+    assert [s.sequence_id for s in sched.waiting] == ["b"]
+
+    # "a" completes and frees its blocks; a newer request "c" arrives.
+    sched.running[0].finished = True
+    sched.add(make_sequence(sequence_id="c", num_tokens=1))
+
+    batch = sched.schedule()
+
+    assert batch is not None
+    assert batch.kind is SequenceBatchTask.PREFILL
+    # Resumed "b" is prefilled before the newer "c".
+    assert [s.sequence_id for s in batch.sequences][0] == "b"
+    resumed = next(s for s in sched.running if s.sequence_id == "b")
+    assert resumed.state is SequenceState.RUNNING
 
 
 def test_schedule_decode_drops_finished_sequences() -> None:

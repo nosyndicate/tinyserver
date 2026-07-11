@@ -198,6 +198,7 @@ class BaseBatchExecutor(Protocol):
 class SequenceState(Enum):
     WAITING = auto()
     RUNNING = auto()
+    PREEMPTED = auto()
 
 
 @dataclass

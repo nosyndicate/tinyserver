@@ -39,6 +39,17 @@ class BlockManager:
         """Checks if the requested sequence can be allocated given the current free blocks."""
         return self.has_free_blocks_for(sequence.num_tokens)
 
+    def can_allocate_with_headroom(self, sequence: Sequence, headroom: int) -> bool:
+        """Like ``can_allocate``, but require ``headroom`` blocks still free
+        AFTER the prompt is allocated.
+
+        The scheduler uses this as an admission watermark so a fresh admission
+        doesn't immediately consume the last free block and force a preemption
+        on the very next decode step (thrash guard).
+        """
+        needed = self._num_blocks_needed(sequence.num_tokens)
+        return len(self.free_blocks) >= needed + max(0, headroom)
+
     def worst_case_blocks(self, sequence: Sequence) -> int:
         """Blocks needed if the sequence generates its full ``max_new_tokens``.
 
