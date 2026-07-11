@@ -43,6 +43,7 @@ class Scheduler:
         """
         if len(self.waiting) >= self.max_waiting:
             return False
+
         headroom = max(1, int(0.01 * self.block_manager.total_blocks))
         return self.block_manager.can_allocate_with_headroom(sequence, headroom)
 
@@ -162,6 +163,12 @@ class Scheduler:
 
             seq_to_add = self.running[idx]
 
+            # See if we can at least decode one more token for this sequence.
+            # If no, don't bother try to do preemption of other sequences.
+            if 1 + total_tokens > self.max_num_tokens:
+                # No budget this round, simply break.
+                break
+
             # Reserve a block for the token the engine is about to generate.
             # The engine advances num_tokens after producing it; the scheduler
             # only ensures the capacity exists here, so it never mutates
@@ -182,11 +189,6 @@ class Scheduler:
                 # seq_to_add is the youngest remaining and still doesn't fit; it
                 # keeps its KV and waits for other sequences to free blocks.
                 # Every later sequence is younger, so none of them fit either.
-                break
-
-            # See if we can at least decode one more token for this sequence.
-            if 1 + total_tokens > self.max_num_tokens:
-                # No budget this round, simply break.
                 break
 
             self.block_manager.append(seq_to_add, extra_tokens=1)
