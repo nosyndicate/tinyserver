@@ -234,13 +234,9 @@ def test_preempt_evicts_youngest_and_requeues_at_front() -> None:
 
 
 def test_preempt_recomputes_num_tokens_from_prompt_and_generated_lengths() -> None:
-    # Regression for 5ab64a1: after preemption, num_tokens must reflect ALL
+    # After preemption, num_tokens must reflect ALL
     # fed tokens (prompt + generated) that resume-prefill will recompute KV
-    # for -- including the most recently generated token, whose KV was NOT
-    # yet committed at preemption time (it's fed as input to the *next*
-    # decode step, not written by the previous one). Before the fix,
-    # num_tokens kept its stale pre-preemption value (P + G - 1), which would
-    # silently misalign decode positions after resume.
+    # for
     sched = make_scheduler(block_size=4, total_blocks=16)
     seq = Sequence(
         sequence_id="a",

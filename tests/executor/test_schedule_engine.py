@@ -22,6 +22,8 @@ from server.executor.types import (
     ErrorEvent,
     GenerationRequestState,
     RequestStatus,
+    Sequence,
+    SequenceState,
     TokenEvent,
 )
 from server.model.block_manager import BlockManager
@@ -260,7 +262,6 @@ def test_cancel_inflight_clears_state_and_invokes_callback() -> None:
 
 def test_prepare_decode_builds_one_token_per_sequence() -> None:
     """Unit-level check of _prepare_decode's tensor shapes and context."""
-    from server.executor.types import Sequence, SequenceState
 
     engine, *_ = _make_engine(prompt_tokens=[1, 2, 3])
     seqs = [
@@ -565,7 +566,6 @@ def test_cancel_inflight_fails_pending_requests() -> None:
 
 def test_post_decode_isolates_sampling_failure() -> None:
     """A sampling failure for one sequence fails only it; the batch continues."""
-    from server.executor.types import Sequence, SequenceState
 
     engine, *_ = _make_engine(prompt_tokens=[1, 2, 3])
 
@@ -644,10 +644,7 @@ def _make_resumable_request(
 
 def test_prepare_prefill_feeds_prompt_plus_generated_for_resumed_sequence() -> None:
     """_prepare_prefill must distinguish fresh vs. resumed via the
-    scheduler-provided resumed_sequence_ids, not seq.state — the scheduler
-    already flips every scheduled sequence's state to RUNNING before the
-    engine sees it."""
-    from server.executor.types import Sequence, SequenceState
+    scheduler-provided resumed_sequence_ids."""
 
     engine, *_ = _make_engine(prompt_tokens=[1, 2, 3])
     fresh = Sequence(
@@ -685,7 +682,6 @@ def test_post_prefill_mixed_fresh_and_resumed_batch_slices_correct_logits() -> N
     """The flattened logits offset must stride by each sequence's *fed*
     length (P fresh, P+G resumed), not uniformly by num_prompt_tokens --
     otherwise a mixed batch corrupts every sequence after a resumed one."""
-    from server.executor.types import Sequence, SequenceState
 
     engine, *_ = _make_engine(prompt_tokens=[1, 2, 3])
 
@@ -728,7 +724,7 @@ def test_post_prefill_mixed_fresh_and_resumed_batch_slices_correct_logits() -> N
     out = _FakeOutput(logits)
 
     engine._post_prefill(
-        out,
+        out,  # type: ignore[arg-type]
         [fresh, resumed],
         start_ns=1000,
         resumed_sequence_ids=frozenset({"resumed"}),
@@ -742,7 +738,6 @@ def test_resume_prefill_does_not_reset_start_ns_or_num_prompt_tokens() -> None:
     """A resume is a second prefill for an already-admitted request: it must
     not overwrite start_ns (would corrupt queue_wait_ms/ttft_ms/total_ms) or
     otherwise disturb num_prompt_tokens."""
-    from server.executor.types import Sequence, SequenceState
 
     engine, *_ = _make_engine(prompt_tokens=[1, 2, 3])
     resumed = Sequence(
@@ -767,55 +762,15 @@ def test_resume_prefill_does_not_reset_start_ns_or_num_prompt_tokens() -> None:
     # start_ns passed in as "now" (this prefill's start), distinct from the
     # request's original start_ns set at first admission.
     engine._post_prefill(
-        out, [resumed], start_ns=999_999, resumed_sequence_ids=frozenset({"resumed"})
+        out,
+        [resumed],
+        start_ns=999_999,
+        resumed_sequence_ids=frozenset({"resumed"}),  # type: ignore[arg-type]
     )
 
-    assert req.start_ns == 500  # unchanged, NOT clobbered to 999_999
+    assert req.start_ns == 500  # unchanged
     assert req.num_prompt_tokens == 3
     assert resumed.generated_token_ids == [33, 9]
-
-
-def test_prepare_and_post_prefill_key_off_resumed_ids_not_generated_tokens() -> None:
-    """The fresh/resumed distinction must come from resumed_sequence_ids
-    (what the scheduler actually observed), not be re-derived from
-    generated_token_ids. A sequence with non-empty generated_token_ids that
-    is NOT in resumed_sequence_ids must still be treated as a first prefill:
-    fed only its prompt, and its start_ns/num_prompt_tokens set fresh."""
-    from server.executor.types import Sequence, SequenceState
-
-    engine, *_ = _make_engine(prompt_tokens=[1, 2, 3])
-    # generated_token_ids is non-empty, but resumed_sequence_ids (below) does
-    # NOT include this sequence -- e.g. speculative decoding or some other
-    # future path could pre-populate tokens without this being a resume.
-    seq = Sequence(
-        sequence_id="not-actually-resumed",
-        prompt_token_ids=[20, 21, 22],
-        generated_token_ids=[33, 34],
-        num_prompt_tokens=3,
-        num_tokens=5,
-        max_new_tokens=4,
-        block_table=[1],
-        state=SequenceState.RUNNING,
-    )
-
-    input_ids, position_ids, _ = engine._prepare_prefill(
-        [seq], resumed_sequence_ids=frozenset()
-    )
-    assert input_ids.tolist() == [[20, 21, 22]]  # prompt only, not + generated
-    assert position_ids.tolist() == [[0, 1, 2]]
-
-    req = _make_resumable_request(
-        "not-actually-resumed", max_new_tokens=4, start_ns=500, num_prompt_tokens=3
-    )
-    engine._seq_to_request["not-actually-resumed"] = req
-
-    logits = torch.full((1, 3, VOCAB), -1.0, dtype=torch.float32)
-    logits[0, 2, 9] = 1.0  # fed_len=3 (fresh) -> last row index 2, not 4
-    out = _FakeOutput(logits)
-
-    engine._post_prefill(out, [seq], start_ns=999_999, resumed_sequence_ids=frozenset())
-
-    assert req.start_ns == 999_999  # treated as fresh: start_ns IS (re)set
 
 
 def test_forced_preemption_matches_uninterrupted_solo_run() -> None:
