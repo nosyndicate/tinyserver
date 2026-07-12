@@ -6,6 +6,7 @@ from queue import Empty, Queue
 from typing import Callable, Protocol, runtime_checkable
 
 import torch
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from server.executor.events import RequestEventEmitter
 from server.executor.scheduler import Scheduler
@@ -470,10 +471,7 @@ class ScheduleInferenceEngine:
         """Prepare the inputs and context for prefill given a list of sequences.
 
         ``resumed_sequence_ids`` (from ``ScheduledBatch``) is the source of
-        truth for which sequences are being resumed after a preemption,
-        rather than prefilled for the first time — NOT ``seq.state``, since
-        the scheduler already flips every scheduled sequence's state to
-        ``RUNNING`` in ``schedule()`` before this runs.
+        truth for which sequences are being resumed after a preemption.
         - New sequence: only the prompt tokens need to be processed.
         - Preempted (resumed) sequence: recompute-based preemption re-feeds
             both the prompt and the already-generated tokens.
@@ -608,7 +606,7 @@ class ScheduleInferenceEngine:
 
     def _post_prefill(
         self,
-        out,
+        out: CausalLMOutputWithPast,
         sequences: list[Sequence],
         start_ns: int,
         resumed_sequence_ids: frozenset[str],
@@ -617,20 +615,7 @@ class ScheduleInferenceEngine:
 
         ``resumed_sequence_ids`` must be the same set passed to
         ``_prepare_prefill`` for this batch — it determines both what was fed
-        (there) and how the logits are sliced and side effects skipped
-        (here).
-
-        Prefill committed the fed tokens' k/v to the cache (positions
-        ``0..fed_len-1``) during the forward, so ``num_tokens`` already
-        equals the fed length and is NOT advanced here (for a fresh sequence
-        that's ``P``; for a resumed one ``_preempt`` never touched
-        ``num_tokens``, so it still holds ``P+G`` from before eviction — the
-        invariant "num_tokens == tokens whose KV is committed" holds either
-        way, which is what makes ``_prepare_decode`` work unchanged). The
-        next token's k/v is stored later, during the first decode step. The
-        flattened ``out.logits`` is sliced per sequence using each
-        sequence's *fed* length (``P`` fresh, ``P+G`` resumed), so this is
-        correct for batches mixing fresh and resumed sequences.
+        to the model (there) and how the logits are sliced and side effects skipped (here).
         """
         offset = 0
         for seq in sequences:
@@ -641,7 +626,7 @@ class ScheduleInferenceEngine:
                 if is_resumed
                 else seq.num_prompt_tokens
             )
-            last_logit = out.logits[0, offset + fed_len - 1, :].unsqueeze(0)
+            last_logit = out.logits[0, offset + fed_len - 1, :].unsqueeze(0)  # type: ignore
             offset += fed_len
 
             try:

@@ -139,9 +139,7 @@ class Scheduler:
 
             if enough_memory and enough_budget:
                 seq = self.waiting.popleft()
-                # Capture the fresh/resumed distinction before it's
-                # overwritten below — RUNNING is the only state the engine
-                # ever observes once this batch is handed off.
+                # If this is a resumed sequence, mark it
                 if seq.state == SequenceState.PREEMPTED:
                     resumed_ids.add(seq.sequence_id)
                 self.block_manager.allocate(seq)
