@@ -643,9 +643,10 @@ def _make_resumable_request(
 
 
 def test_prepare_prefill_feeds_prompt_plus_generated_for_resumed_sequence() -> None:
-    """_prepare_prefill must distinguish fresh vs. resumed via
-    generated_token_ids, not seq.state — the scheduler already flips every
-    scheduled sequence's state to RUNNING before the engine sees it."""
+    """_prepare_prefill must distinguish fresh vs. resumed via the
+    scheduler-provided resumed_sequence_ids, not seq.state — the scheduler
+    already flips every scheduled sequence's state to RUNNING before the
+    engine sees it."""
     from server.executor.types import Sequence, SequenceState
 
     engine, *_ = _make_engine(prompt_tokens=[1, 2, 3])
@@ -670,7 +671,9 @@ def test_prepare_prefill_feeds_prompt_plus_generated_for_resumed_sequence() -> N
         state=SequenceState.RUNNING,
     )
 
-    input_ids, position_ids, ctx = engine._prepare_prefill([fresh, resumed])
+    input_ids, position_ids, ctx = engine._prepare_prefill(
+        [fresh, resumed], resumed_sequence_ids=frozenset({"resumed"})
+    )
 
     assert input_ids.tolist() == [[10, 11, 20, 21, 22, 33, 34]]
     assert position_ids.tolist() == [[0, 1, 0, 1, 2, 3, 4]]
@@ -724,7 +727,12 @@ def test_post_prefill_mixed_fresh_and_resumed_batch_slices_correct_logits() -> N
     logits[0, 4, 9] = 1.0  # the WRONG row a stride-by-prompt-len bug would read
     out = _FakeOutput(logits)
 
-    engine._post_prefill(out, [fresh, resumed], start_ns=1000)
+    engine._post_prefill(
+        out,
+        [fresh, resumed],
+        start_ns=1000,
+        resumed_sequence_ids=frozenset({"resumed"}),
+    )
 
     assert fresh.generated_token_ids == [7]
     assert resumed.generated_token_ids == [33, 34, 15]
@@ -758,11 +766,56 @@ def test_resume_prefill_does_not_reset_start_ns_or_num_prompt_tokens() -> None:
 
     # start_ns passed in as "now" (this prefill's start), distinct from the
     # request's original start_ns set at first admission.
-    engine._post_prefill(out, [resumed], start_ns=999_999)
+    engine._post_prefill(
+        out, [resumed], start_ns=999_999, resumed_sequence_ids=frozenset({"resumed"})
+    )
 
     assert req.start_ns == 500  # unchanged, NOT clobbered to 999_999
     assert req.num_prompt_tokens == 3
     assert resumed.generated_token_ids == [33, 9]
+
+
+def test_prepare_and_post_prefill_key_off_resumed_ids_not_generated_tokens() -> None:
+    """The fresh/resumed distinction must come from resumed_sequence_ids
+    (what the scheduler actually observed), not be re-derived from
+    generated_token_ids. A sequence with non-empty generated_token_ids that
+    is NOT in resumed_sequence_ids must still be treated as a first prefill:
+    fed only its prompt, and its start_ns/num_prompt_tokens set fresh."""
+    from server.executor.types import Sequence, SequenceState
+
+    engine, *_ = _make_engine(prompt_tokens=[1, 2, 3])
+    # generated_token_ids is non-empty, but resumed_sequence_ids (below) does
+    # NOT include this sequence -- e.g. speculative decoding or some other
+    # future path could pre-populate tokens without this being a resume.
+    seq = Sequence(
+        sequence_id="not-actually-resumed",
+        prompt_token_ids=[20, 21, 22],
+        generated_token_ids=[33, 34],
+        num_prompt_tokens=3,
+        num_tokens=5,
+        max_new_tokens=4,
+        block_table=[1],
+        state=SequenceState.RUNNING,
+    )
+
+    input_ids, position_ids, _ = engine._prepare_prefill(
+        [seq], resumed_sequence_ids=frozenset()
+    )
+    assert input_ids.tolist() == [[20, 21, 22]]  # prompt only, not + generated
+    assert position_ids.tolist() == [[0, 1, 2]]
+
+    req = _make_resumable_request(
+        "not-actually-resumed", max_new_tokens=4, start_ns=500, num_prompt_tokens=3
+    )
+    engine._seq_to_request["not-actually-resumed"] = req
+
+    logits = torch.full((1, 3, VOCAB), -1.0, dtype=torch.float32)
+    logits[0, 2, 9] = 1.0  # fed_len=3 (fresh) -> last row index 2, not 4
+    out = _FakeOutput(logits)
+
+    engine._post_prefill(out, [seq], start_ns=999_999, resumed_sequence_ids=frozenset())
+
+    assert req.start_ns == 999_999  # treated as fresh: start_ns IS (re)set
 
 
 def test_forced_preemption_matches_uninterrupted_solo_run() -> None:

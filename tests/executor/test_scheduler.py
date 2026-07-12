@@ -293,6 +293,10 @@ def test_preempted_sequence_resumes_before_newer_waiting() -> None:
     assert [s.sequence_id for s in batch.sequences][0] == "b"
     resumed = next(s for s in sched.running if s.sequence_id == "b")
     assert resumed.state is SequenceState.RUNNING
+    # The engine needs to know "b" is a resume (to recompute prompt+generated)
+    # and "c" is fresh (prompt only) -- captured before "b"'s state was
+    # overwritten to RUNNING above, since that's the only place it's known.
+    assert batch.resumed_sequence_ids == frozenset({"b"})
 
 
 def test_schedule_decode_drops_finished_sequences() -> None:

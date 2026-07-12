@@ -465,24 +465,23 @@ class ScheduleInferenceEngine:
         self._seq_to_request.clear()
 
     def _prepare_prefill(
-        self, sequences: list[Sequence]
+        self, sequences: list[Sequence], resumed_sequence_ids: frozenset[str]
     ) -> tuple[torch.Tensor, torch.Tensor, InferenceContext]:
         """Prepare the inputs and context for prefill given a list of sequences.
 
-        Note, here we are dealing with two situations, distinguished by
-        whether ``generated_token_ids`` is non-empty (NOT ``seq.state``: the
-        scheduler already flips every scheduled sequence's state to
-        ``RUNNING`` in ``schedule()`` before this runs, so state can't tell
-        fresh and resumed sequences apart here):
-        - New sequence: no generated tokens yet. Only the prompt tokens need
-            to be processed.
+        ``resumed_sequence_ids`` (from ``ScheduledBatch``) is the source of
+        truth for which sequences are being resumed after a preemption,
+        rather than prefilled for the first time — NOT ``seq.state``, since
+        the scheduler already flips every scheduled sequence's state to
+        ``RUNNING`` in ``schedule()`` before this runs.
+        - New sequence: only the prompt tokens need to be processed.
         - Preempted (resumed) sequence: recompute-based preemption re-feeds
             both the prompt and the already-generated tokens.
         """
         seq_token_lists: list[list[int]] = []
         block_tables: list[list[int]] = []
         for seq in sequences:
-            if seq.generated_token_ids:
+            if seq.sequence_id in resumed_sequence_ids:
                 seq_token_lists.append(seq.prompt_token_ids + seq.generated_token_ids)
             else:
                 seq_token_lists.append(seq.prompt_token_ids)
@@ -548,7 +547,7 @@ class ScheduleInferenceEngine:
                     start_ns = now_ns()
                     if batch.kind == SequenceBatchTask.PREFILL:
                         input_ids, position_ids, ctx = self._prepare_prefill(
-                            batch.sequences
+                            batch.sequences, batch.resumed_sequence_ids
                         )
                     elif batch.kind == SequenceBatchTask.DECODE:
                         input_ids, position_ids, ctx = self._prepare_decode(
@@ -565,7 +564,9 @@ class ScheduleInferenceEngine:
                         )
 
                     if batch.kind == SequenceBatchTask.PREFILL:
-                        self._post_prefill(out, batch.sequences, start_ns)
+                        self._post_prefill(
+                            out, batch.sequences, start_ns, batch.resumed_sequence_ids
+                        )
                     else:
                         self._post_decode(out, batch.sequences)
 
@@ -610,8 +611,14 @@ class ScheduleInferenceEngine:
         out,
         sequences: list[Sequence],
         start_ns: int,
+        resumed_sequence_ids: frozenset[str],
     ) -> None:
         """Sample the first generated token for each prefilled sequence.
+
+        ``resumed_sequence_ids`` must be the same set passed to
+        ``_prepare_prefill`` for this batch — it determines both what was fed
+        (there) and how the logits are sliced and side effects skipped
+        (here).
 
         Prefill committed the fed tokens' k/v to the cache (positions
         ``0..fed_len-1``) during the forward, so ``num_tokens`` already
@@ -628,11 +635,12 @@ class ScheduleInferenceEngine:
         offset = 0
         for seq in sequences:
             request_state = self._seq_to_request[seq.sequence_id]
-            # Captured before appending this step's sampled token below: a
-            # non-empty generated_token_ids here means this prefill is a
-            # resume (recompute), not a first prefill.
-            is_resumed = bool(seq.generated_token_ids)
-            fed_len = seq.num_prompt_tokens + len(seq.generated_token_ids)
+            is_resumed = seq.sequence_id in resumed_sequence_ids
+            fed_len = (
+                seq.num_prompt_tokens + len(seq.generated_token_ids)
+                if is_resumed
+                else seq.num_prompt_tokens
+            )
             last_logit = out.logits[0, offset + fed_len - 1, :].unsqueeze(0)
             offset += fed_len
 

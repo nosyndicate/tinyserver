@@ -125,6 +125,7 @@ class Scheduler:
         self._reap_finished()
 
         scheduled: list[Sequence] = []
+        resumed_ids: set[str] = set()
         total_tokens = 0
         while self.waiting and len(scheduled) < self.max_num_sequences:
             seq_to_add = self.waiting[0]
@@ -138,6 +139,11 @@ class Scheduler:
 
             if enough_memory and enough_budget:
                 seq = self.waiting.popleft()
+                # Capture the fresh/resumed distinction before it's
+                # overwritten below — RUNNING is the only state the engine
+                # ever observes once this batch is handed off.
+                if seq.state == SequenceState.PREEMPTED:
+                    resumed_ids.add(seq.sequence_id)
                 self.block_manager.allocate(seq)
                 seq.state = SequenceState.RUNNING
                 self.running.append(seq)
@@ -147,7 +153,11 @@ class Scheduler:
                 break
 
         if scheduled:
-            return ScheduledBatch(kind=SequenceBatchTask.PREFILL, sequences=scheduled)
+            return ScheduledBatch(
+                kind=SequenceBatchTask.PREFILL,
+                sequences=scheduled,
+                resumed_sequence_ids=frozenset(resumed_ids),
+            )
 
         scheduled = []
         total_tokens = 0
