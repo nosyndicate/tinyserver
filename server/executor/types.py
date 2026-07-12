@@ -234,3 +234,7 @@ class SequenceBatchTask(Enum):
 class ScheduledBatch:
     kind: SequenceBatchTask
     sequences: list[Sequence]
+    # Sequence IDs in this batch that were resumed from PREEMPTED (recompute)
+    # rather than prefilled for the first time. Only meaningful for PREFILL
+    # batches
+    resumed_sequence_ids: frozenset[str] = frozenset()

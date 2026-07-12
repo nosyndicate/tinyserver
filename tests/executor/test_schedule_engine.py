@@ -22,6 +22,8 @@ from server.executor.types import (
     ErrorEvent,
     GenerationRequestState,
     RequestStatus,
+    Sequence,
+    SequenceState,
     TokenEvent,
 )
 from server.model.block_manager import BlockManager
@@ -260,7 +262,6 @@ def test_cancel_inflight_clears_state_and_invokes_callback() -> None:
 
 def test_prepare_decode_builds_one_token_per_sequence() -> None:
     """Unit-level check of _prepare_decode's tensor shapes and context."""
-    from server.executor.types import Sequence, SequenceState
 
     engine, *_ = _make_engine(prompt_tokens=[1, 2, 3])
     seqs = [
@@ -565,7 +566,6 @@ def test_cancel_inflight_fails_pending_requests() -> None:
 
 def test_post_decode_isolates_sampling_failure() -> None:
     """A sampling failure for one sequence fails only it; the batch continues."""
-    from server.executor.types import Sequence, SequenceState
 
     engine, *_ = _make_engine(prompt_tokens=[1, 2, 3])
 
@@ -621,6 +621,211 @@ def test_post_decode_isolates_sampling_failure() -> None:
     assert req_b.num_output_tokens == 1
     assert seq_b.finished is False
     assert any(isinstance(e, ErrorEvent) for e in drain_events(req_a))
+
+
+def _make_resumable_request(
+    request_id: str, max_new_tokens: int, start_ns: int, num_prompt_tokens: int
+) -> GenerationRequestState:
+    """A request that has already been through one prefill + some decoding,
+    as if it were about to be resumed after a preemption."""
+    req = GenerationRequestState(
+        request_id=request_id,
+        sampling_params=SamplingParams(
+            max_new_tokens=max_new_tokens, temperature=0.0, top_p=1.0
+        ),
+        prompt="hello",
+        enqueued_ns=0,
+        start_ns=start_ns,
+        num_prompt_tokens=num_prompt_tokens,
+    )
+    req.status = RequestStatus.DECODING
+    return req
+
+
+def test_prepare_prefill_feeds_prompt_plus_generated_for_resumed_sequence() -> None:
+    """_prepare_prefill must distinguish fresh vs. resumed via the
+    scheduler-provided resumed_sequence_ids."""
+
+    engine, *_ = _make_engine(prompt_tokens=[1, 2, 3])
+    fresh = Sequence(
+        sequence_id="fresh",
+        prompt_token_ids=[10, 11],
+        generated_token_ids=[],
+        num_prompt_tokens=2,
+        num_tokens=2,
+        max_new_tokens=4,
+        block_table=[0],
+        state=SequenceState.RUNNING,
+    )
+    resumed = Sequence(
+        sequence_id="resumed",
+        prompt_token_ids=[20, 21, 22],
+        generated_token_ids=[33, 34],
+        num_prompt_tokens=3,
+        num_tokens=5,
+        max_new_tokens=4,
+        block_table=[1, 2],
+        state=SequenceState.RUNNING,
+    )
+
+    input_ids, position_ids, ctx = engine._prepare_prefill(
+        [fresh, resumed], resumed_sequence_ids=frozenset({"resumed"})
+    )
+
+    assert input_ids.tolist() == [[10, 11, 20, 21, 22, 33, 34]]
+    assert position_ids.tolist() == [[0, 1, 0, 1, 2, 3, 4]]
+    assert [s["num_tokens"] for s in ctx.sequences] == [2, 5]
+    assert [s["block_table"] for s in ctx.sequences] == [[0], [1, 2]]
+
+
+def test_post_prefill_mixed_fresh_and_resumed_batch_slices_correct_logits() -> None:
+    """The flattened logits offset must stride by each sequence's *fed*
+    length (P fresh, P+G resumed), not uniformly by num_prompt_tokens --
+    otherwise a mixed batch corrupts every sequence after a resumed one."""
+
+    engine, *_ = _make_engine(prompt_tokens=[1, 2, 3])
+
+    fresh = Sequence(
+        sequence_id="fresh",
+        prompt_token_ids=[10, 11],
+        generated_token_ids=[],
+        num_prompt_tokens=2,
+        num_tokens=2,
+        max_new_tokens=4,
+        block_table=[0],
+        state=SequenceState.RUNNING,
+    )
+    resumed = Sequence(
+        sequence_id="resumed",
+        prompt_token_ids=[20, 21, 22],
+        generated_token_ids=[33, 34],
+        num_prompt_tokens=3,
+        num_tokens=5,
+        max_new_tokens=4,
+        block_table=[1, 2],
+        state=SequenceState.RUNNING,
+    )
+    req_fresh = _make_req(max_new_tokens=4)
+    req_fresh.request_id = "fresh"
+    req_resumed = _make_resumable_request(
+        "resumed", max_new_tokens=4, start_ns=500, num_prompt_tokens=3
+    )
+    engine._seq_to_request["fresh"] = req_fresh
+    engine._seq_to_request["resumed"] = req_resumed
+
+    # Fed lengths: fresh=2, resumed=3+2=5 -> flattened length 7. The
+    # "correct" last-token row for fresh is index 1 (offset 0 + 2 - 1); for
+    # resumed it's index 6 (offset 2 + 5 - 1), NOT index 4 (the pre-fix bug:
+    # offset would advance by num_prompt_tokens=3 instead of fed_len=5).
+    logits = torch.full((1, 7, VOCAB), -1.0, dtype=torch.float32)
+    logits[0, 1, 7] = 1.0  # fresh's correct row -> argmax 7
+    logits[0, 6, 15] = 1.0  # resumed's correct row -> argmax 15
+    logits[0, 4, 9] = 1.0  # the WRONG row a stride-by-prompt-len bug would read
+    out = _FakeOutput(logits)
+
+    engine._post_prefill(
+        out,  # type: ignore[arg-type]
+        [fresh, resumed],
+        start_ns=1000,
+        resumed_sequence_ids=frozenset({"resumed"}),
+    )
+
+    assert fresh.generated_token_ids == [7]
+    assert resumed.generated_token_ids == [33, 34, 15]
+
+
+def test_resume_prefill_does_not_reset_start_ns_or_num_prompt_tokens() -> None:
+    """A resume is a second prefill for an already-admitted request: it must
+    not overwrite start_ns (would corrupt queue_wait_ms/ttft_ms/total_ms) or
+    otherwise disturb num_prompt_tokens."""
+
+    engine, *_ = _make_engine(prompt_tokens=[1, 2, 3])
+    resumed = Sequence(
+        sequence_id="resumed",
+        prompt_token_ids=[20, 21, 22],
+        generated_token_ids=[33],
+        num_prompt_tokens=3,
+        num_tokens=4,
+        max_new_tokens=4,
+        block_table=[1],
+        state=SequenceState.RUNNING,
+    )
+    req = _make_resumable_request(
+        "resumed", max_new_tokens=4, start_ns=500, num_prompt_tokens=3
+    )
+    engine._seq_to_request["resumed"] = req
+
+    logits = torch.full((1, 4, VOCAB), -1.0, dtype=torch.float32)
+    logits[0, 3, 9] = 1.0  # fed_len = 3 + 1 = 4 -> last row index 3
+    out = _FakeOutput(logits)
+
+    # start_ns passed in as "now" (this prefill's start), distinct from the
+    # request's original start_ns set at first admission.
+    engine._post_prefill(
+        out,
+        [resumed],
+        start_ns=999_999,
+        resumed_sequence_ids=frozenset({"resumed"}),  # type: ignore[arg-type]
+    )
+
+    assert req.start_ns == 500  # unchanged
+    assert req.num_prompt_tokens == 3
+    assert resumed.generated_token_ids == [33, 9]
+
+
+def test_forced_preemption_matches_uninterrupted_solo_run() -> None:
+    """End-to-end: two concurrent requests sharing a tiny block pool force a
+    real preemption (via the scheduler's preempt-youngest policy) and
+    resume-by-recompute (via the engine). The preempted request's output must
+    be byte-identical to running the same prompt alone with no contention."""
+    prompt_tokens = [3, 4]
+    max_new_tokens = 4
+
+    # Baseline: same prompt, uninterrupted, plenty of blocks.
+    solo_engine, *_ = _make_engine(prompt_tokens=prompt_tokens)
+    solo_req = _make_req(max_new_tokens=max_new_tokens)
+    solo_req.request_id = "solo"
+    _run_to_completion(solo_engine, solo_req)
+    solo_tokens = [t.token for t in drain_events(solo_req) if isinstance(t, TokenEvent)]
+
+    # Contended run: block pool sized so decoding both concurrently forces the
+    # scheduler to preempt the younger request at least once.
+    backend = _FakeBackend(prompt_tokens)
+    block_manager = BlockManager(total_blocks=6, block_size=1)
+    scheduler = Scheduler(
+        block_manager=block_manager,
+        max_waiting=4,
+        max_num_sequences=4,
+        max_num_tokens=1024,
+    )
+    engine = ScheduleInferenceEngine(scheduler=scheduler, backend=backend)
+
+    req_a = _make_req(max_new_tokens=max_new_tokens)
+    req_a.request_id = "a"
+    req_b = _make_req(max_new_tokens=max_new_tokens)
+    req_b.request_id = "b"
+
+    inbound: Queue = Queue()
+    inbound.put(req_a)
+    inbound.put(req_b)
+    control = _StopWhenDone([req_a, req_b])
+    recorder: dict = {}
+    engine.run(inbound=inbound, control=control, callbacks=_callbacks(recorder))
+
+    assert "fatal" not in recorder, f"engine hit fatal error: {recorder.get('fatal')}"
+    assert scheduler.preemption_count > 0  # the scenario actually exercised resume
+
+    for req in (req_a, req_b):
+        assert req.status == RequestStatus.DONE
+        tokens = [t.token for t in drain_events(req) if isinstance(t, TokenEvent)]
+        assert tokens == solo_tokens
+
+    # Blocks fully reclaimed, no tracking leaks (mirrors item D's concerns).
+    assert scheduler.running == []
+    assert len(scheduler.waiting) == 0
+    assert sorted(block_manager.free_blocks) == list(range(block_manager.total_blocks))
+    assert engine._all_requests == {}
+    assert engine._seq_to_request == {}
 
 
 if __name__ == "__main__":

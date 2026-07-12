@@ -6,6 +6,7 @@ from queue import Empty, Queue
 from typing import Callable, Protocol, runtime_checkable
 
 import torch
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from server.executor.events import RequestEventEmitter
 from server.executor.scheduler import Scheduler
@@ -465,13 +466,23 @@ class ScheduleInferenceEngine:
         self._seq_to_request.clear()
 
     def _prepare_prefill(
-        self, sequences: list[Sequence]
+        self, sequences: list[Sequence], resumed_sequence_ids: frozenset[str]
     ) -> tuple[torch.Tensor, torch.Tensor, InferenceContext]:
-        """Prepare the inputs and context for prefill given a list of sequences."""
+        """Prepare the inputs and context for prefill given a list of sequences.
+
+        ``resumed_sequence_ids`` (from ``ScheduledBatch``) is the source of
+        truth for which sequences are being resumed after a preemption.
+        - New sequence: only the prompt tokens need to be processed.
+        - Preempted (resumed) sequence: recompute-based preemption re-feeds
+            both the prompt and the already-generated tokens.
+        """
         seq_token_lists: list[list[int]] = []
         block_tables: list[list[int]] = []
         for seq in sequences:
-            seq_token_lists.append(seq.prompt_token_ids)
+            if seq.sequence_id in resumed_sequence_ids:
+                seq_token_lists.append(seq.prompt_token_ids + seq.generated_token_ids)
+            else:
+                seq_token_lists.append(seq.prompt_token_ids)
             block_tables.append(seq.block_table)
 
         input_ids, position_ids, ctx = build_prefill_inputs(
@@ -534,7 +545,7 @@ class ScheduleInferenceEngine:
                     start_ns = now_ns()
                     if batch.kind == SequenceBatchTask.PREFILL:
                         input_ids, position_ids, ctx = self._prepare_prefill(
-                            batch.sequences
+                            batch.sequences, batch.resumed_sequence_ids
                         )
                     elif batch.kind == SequenceBatchTask.DECODE:
                         input_ids, position_ids, ctx = self._prepare_decode(
@@ -551,7 +562,9 @@ class ScheduleInferenceEngine:
                         )
 
                     if batch.kind == SequenceBatchTask.PREFILL:
-                        self._post_prefill(out, batch.sequences, start_ns)
+                        self._post_prefill(
+                            out, batch.sequences, start_ns, batch.resumed_sequence_ids
+                        )
                     else:
                         self._post_decode(out, batch.sequences)
 
@@ -593,33 +606,44 @@ class ScheduleInferenceEngine:
 
     def _post_prefill(
         self,
-        out,
+        out: CausalLMOutputWithPast,
         sequences: list[Sequence],
         start_ns: int,
+        resumed_sequence_ids: frozenset[str],
     ) -> None:
         """Sample the first generated token for each prefilled sequence.
 
-        Prefill committed the prompt's k/v to the cache (positions ``0..P-1``)
-        during the forward, so ``num_tokens`` already equals ``P`` and is NOT
-        advanced here. The first token's k/v is stored later, during the first
-        decode step. The flattened ``out.logits`` is sliced per sequence using
-        each prompt's length.
+        ``resumed_sequence_ids`` must be the same set passed to
+        ``_prepare_prefill`` for this batch — it determines both what was fed
+        to the model (there) and how the logits are sliced and side effects skipped (here).
         """
         offset = 0
         for seq in sequences:
             request_state = self._seq_to_request[seq.sequence_id]
-            prompt_len = seq.num_prompt_tokens
-            last_logit = out.logits[0, offset + prompt_len - 1, :].unsqueeze(0)
-            offset += prompt_len
+            is_resumed = seq.sequence_id in resumed_sequence_ids
+            fed_len = (
+                seq.num_prompt_tokens + len(seq.generated_token_ids)
+                if is_resumed
+                else seq.num_prompt_tokens
+            )
+            last_logit = out.logits[0, offset + fed_len - 1, :].unsqueeze(0)  # type: ignore
+            offset += fed_len
 
             try:
-                # num_prompt_tokens is required by the emitter's _finish path,
-                # and start_ns/DECODING transition are driven via
-                # on_prefill_started + on_token. We skip on_prefill_succeeded:
-                # it expects a per-request PrefillResult with tensors this
-                # engine does not carry.
-                request_state.num_prompt_tokens = prompt_len
-                self._emitter.on_prefill_started(request_state, start_ns)
+                if not is_resumed:
+                    # num_prompt_tokens is required by the emitter's _finish
+                    # path, and start_ns/DECODING transition are driven via
+                    # on_prefill_started + on_token. We skip
+                    # on_prefill_succeeded: it expects a per-request
+                    # PrefillResult with tensors this engine does not carry.
+                    #
+                    # On resume this is a second prefill for an
+                    # already-admitted request, so both are skipped:
+                    # num_prompt_tokens is already correct, and calling
+                    # on_prefill_started again would clobber start_ns
+                    # (corrupting queue_wait_ms/ttft_ms/total_ms in _finish).
+                    request_state.num_prompt_tokens = seq.num_prompt_tokens
+                    self._emitter.on_prefill_started(request_state, start_ns)
                 result = self._sample_one(last_logit, request_state)
                 seq.generated_token_ids.append(result.token_id)
                 self._emitter.on_token(

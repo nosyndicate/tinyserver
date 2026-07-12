@@ -104,6 +104,9 @@ class Scheduler:
         victim = self.running.pop()  # youngest == last appended
         self.block_manager.free(victim)
         victim.state = SequenceState.PREEMPTED
+        victim.num_tokens = len(victim.prompt_token_ids) + len(
+            victim.generated_token_ids
+        )
         self.waiting.appendleft(victim)
         self.preemption_count += 1
         return victim
@@ -125,6 +128,7 @@ class Scheduler:
         self._reap_finished()
 
         scheduled: list[Sequence] = []
+        resumed_ids: set[str] = set()
         total_tokens = 0
         while self.waiting and len(scheduled) < self.max_num_sequences:
             seq_to_add = self.waiting[0]
@@ -138,6 +142,9 @@ class Scheduler:
 
             if enough_memory and enough_budget:
                 seq = self.waiting.popleft()
+                # If this is a resumed sequence, mark it
+                if seq.state == SequenceState.PREEMPTED:
+                    resumed_ids.add(seq.sequence_id)
                 self.block_manager.allocate(seq)
                 seq.state = SequenceState.RUNNING
                 self.running.append(seq)
@@ -147,7 +154,11 @@ class Scheduler:
                 break
 
         if scheduled:
-            return ScheduledBatch(kind=SequenceBatchTask.PREFILL, sequences=scheduled)
+            return ScheduledBatch(
+                kind=SequenceBatchTask.PREFILL,
+                sequences=scheduled,
+                resumed_sequence_ids=frozenset(resumed_ids),
+            )
 
         scheduled = []
         total_tokens = 0
