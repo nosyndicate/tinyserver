@@ -104,6 +104,9 @@ class Scheduler:
         victim = self.running.pop()  # youngest == last appended
         self.block_manager.free(victim)
         victim.state = SequenceState.PREEMPTED
+        victim.num_tokens = len(victim.prompt_token_ids) + len(
+            victim.generated_token_ids
+        )
         self.waiting.appendleft(victim)
         self.preemption_count += 1
         return victim
