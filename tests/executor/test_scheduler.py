@@ -233,6 +233,31 @@ def test_preempt_evicts_youngest_and_requeues_at_front() -> None:
     assert sched.preemption_count == 1
 
 
+def test_preempt_recomputes_num_tokens_from_prompt_and_generated_lengths() -> None:
+    # Regression for 5ab64a1: after preemption, num_tokens must reflect ALL
+    # fed tokens (prompt + generated) that resume-prefill will recompute KV
+    # for -- including the most recently generated token, whose KV was NOT
+    # yet committed at preemption time (it's fed as input to the *next*
+    # decode step, not written by the previous one). Before the fix,
+    # num_tokens kept its stale pre-preemption value (P + G - 1), which would
+    # silently misalign decode positions after resume.
+    sched = make_scheduler(block_size=4, total_blocks=16)
+    seq = Sequence(
+        sequence_id="a",
+        prompt_token_ids=[1, 2, 3],  # P = 3
+        generated_token_ids=[9, 10],  # G = 2
+        num_prompt_tokens=3,
+        num_tokens=4,  # stale: P + G - 1 = 3 + 2 - 1
+        max_new_tokens=5,
+        block_table=[0],
+    )
+    sched.running.append(seq)
+
+    victim = sched._preempt()
+
+    assert victim.num_tokens == 5  # corrected to P + G = 3 + 2
+
+
 def test_schedule_decode_preempts_multiple_youngest_for_older_sequences() -> None:
     # block_size=1, all 4 blocks used by 4 running sequences. Decoding the two
     # oldest requires evicting the two youngest, one preemption each.
