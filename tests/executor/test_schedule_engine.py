@@ -132,6 +132,26 @@ class _StopWhenDone:
         return False
 
 
+class _StopOnPreemption:
+    """Stops the run loop as soon as the scheduler records a preemption,
+    leaving the victim sitting in ``waiting`` with state PREEMPTED (not yet
+    resumed) -- used to test cleanup paths mid-preemption."""
+
+    def __init__(self, scheduler: Scheduler, max_calls: int = 2000):
+        self._scheduler = scheduler
+        self._calls = 0
+        self._max_calls = max_calls
+
+    def should_stop(self) -> bool:
+        self._calls += 1
+        if self._calls > self._max_calls:
+            return True
+        return self._scheduler.preemption_count > 0
+
+    def wait_idle(self, _timeout: float) -> bool:
+        return False
+
+
 def _callbacks(recorder: dict) -> EngineCallbacks:
     def cancel_request(req: GenerationRequestState, message: str) -> None:
         recorder.setdefault("cancelled", []).append((req.request_id, message))
@@ -821,6 +841,47 @@ def test_forced_preemption_matches_uninterrupted_solo_run() -> None:
         assert tokens == solo_tokens
 
     # Blocks fully reclaimed, no tracking leaks (mirrors item D's concerns).
+    assert scheduler.running == []
+    assert len(scheduler.waiting) == 0
+    assert sorted(block_manager.free_blocks) == list(range(block_manager.total_blocks))
+    assert engine._all_requests == {}
+    assert engine._seq_to_request == {}
+
+
+def test_shutdown_mid_preemption_cancels_and_frees_preempted_request() -> None:
+    """A PREEMPTED sequence sitting in scheduler.waiting must still be
+    cancelled and untracked on graceful shutdown."""
+    prompt_tokens = [3, 4]
+    max_new_tokens = 4
+
+    backend = _FakeBackend(prompt_tokens)
+    block_manager = BlockManager(total_blocks=6, block_size=1)
+    scheduler = Scheduler(
+        block_manager=block_manager,
+        max_waiting=4,
+        max_num_sequences=4,
+        max_num_tokens=1024,
+    )
+    engine = ScheduleInferenceEngine(scheduler=scheduler, backend=backend)  # type: ignore[arg-type]
+
+    req_a = _make_req(max_new_tokens=max_new_tokens)
+    req_a.request_id = "a"
+    req_b = _make_req(max_new_tokens=max_new_tokens)
+    req_b.request_id = "b"
+
+    inbound: Queue = Queue()
+    inbound.put(req_a)
+    inbound.put(req_b)
+    control = _StopOnPreemption(scheduler)
+    recorder: dict = {}
+    engine.run(inbound=inbound, control=control, callbacks=_callbacks(recorder))  # type: ignore[arg-type]
+
+    assert "fatal" not in recorder, f"engine hit fatal error: {recorder.get('fatal')}"
+    assert scheduler.preemption_count > 0
+
+    cancelled_ids = {req_id for req_id, _msg in recorder.get("cancelled", [])}
+    assert cancelled_ids == {"a", "b"}
+
     assert scheduler.running == []
     assert len(scheduler.waiting) == 0
     assert sorted(block_manager.free_blocks) == list(range(block_manager.total_blocks))

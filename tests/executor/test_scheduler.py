@@ -390,3 +390,19 @@ def test_clear_frees_running_blocks() -> None:
     assert not sched.waiting
     assert len(sched.block_manager.free_blocks) > free_before_clear
     assert len(sched.block_manager.free_blocks) == 16
+
+
+def test_clear_handles_preempted_sequence_in_waiting() -> None:
+    # A PREEMPTED sequence in `waiting` already holds no blocks (freed at
+    # eviction) -- clear() must not double-free or otherwise choke on it.
+    sched = make_scheduler(block_size=4, total_blocks=16)
+    _prefill_running(sched, ["a"], num_tokens=4)
+    preempted = make_sequence(sequence_id="b", num_tokens=4)
+    preempted.state = SequenceState.PREEMPTED
+    sched.waiting.append(preempted)
+
+    sched.clear()
+
+    assert not sched.running
+    assert not sched.waiting
+    assert len(sched.block_manager.free_blocks) == 16
