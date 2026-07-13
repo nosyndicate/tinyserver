@@ -537,6 +537,15 @@ class ScheduleInferenceEngine:
                     batch = self._scheduler.schedule()
 
                     if batch is None:
+                        # With correct preemption, schedule() cannot return None
+                        # while sequences are still running: log an error here
+                        if self._scheduler.running:
+                            logger.error(
+                                "schedule() returned None with %d running "
+                                "sequence(s) -- preemption/eviction invariant "
+                                "violated",
+                                len(self._scheduler.running),
+                            )
                         # No sequences are scheduled, sleep for a short while to avoid busy loop. Use the sleep on _shutdown_event so when shutdown
                         # signal is set, it can break the sleep immediately and exit the loop.
                         control.wait_idle(0.01)

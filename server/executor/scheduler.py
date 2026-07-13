@@ -1,3 +1,4 @@
+import logging
 from collections import deque
 
 from server.executor.types import (
@@ -7,6 +8,8 @@ from server.executor.types import (
     SequenceState,
 )
 from server.model.block_manager import BlockManager
+
+logger = logging.getLogger(__name__)
 
 
 class Scheduler:
@@ -109,6 +112,9 @@ class Scheduler:
         )
         self.waiting.appendleft(victim)
         self.preemption_count += 1
+        logger.debug(
+            "preempted %s (count=%d)", victim.sequence_id, self.preemption_count
+        )
         return victim
 
     def schedule(self) -> ScheduledBatch | None:
