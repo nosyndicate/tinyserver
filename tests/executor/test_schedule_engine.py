@@ -881,6 +881,9 @@ def test_preemption_does_not_retokenize_resumed_request() -> None:
     assert scheduler.preemption_count > 0  # a real preemption actually happened
     # Exactly once per request: the resumed request was NOT re-tokenized.
     assert backend.tokenize_calls == 2
+    # Make sure both requests finished successfully and produced the same output.
+    assert req_a.status == RequestStatus.DONE
+    assert req_b.status == RequestStatus.DONE
 
 
 def test_shutdown_mid_preemption_cancels_and_frees_preempted_request() -> None:
