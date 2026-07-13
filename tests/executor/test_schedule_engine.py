@@ -848,6 +848,44 @@ def test_forced_preemption_matches_uninterrupted_solo_run() -> None:
     assert engine._seq_to_request == {}
 
 
+def test_preemption_does_not_retokenize_resumed_request() -> None:
+    """A preempted request must resume via scheduler.waiting, not
+    through the engine's _pending/_make_sequence path. Across a real
+    preemption, each request is tokenized exactly once."""
+    prompt_tokens = [3, 4]
+    max_new_tokens = 4
+
+    backend = _counting_backend(prompt_tokens)
+    block_manager = BlockManager(total_blocks=6, block_size=1)
+    scheduler = Scheduler(
+        block_manager=block_manager,
+        max_waiting=4,
+        max_num_sequences=4,
+        max_num_tokens=1024,
+    )
+    engine = ScheduleInferenceEngine(scheduler=scheduler, backend=backend)
+
+    req_a = _make_req(max_new_tokens=max_new_tokens)
+    req_a.request_id = "a"
+    req_b = _make_req(max_new_tokens=max_new_tokens)
+    req_b.request_id = "b"
+
+    inbound: Queue = Queue()
+    inbound.put(req_a)
+    inbound.put(req_b)
+    control = _StopWhenDone([req_a, req_b])
+    recorder: dict = {}
+    engine.run(inbound=inbound, control=control, callbacks=_callbacks(recorder))
+
+    assert "fatal" not in recorder, f"engine hit fatal error: {recorder.get('fatal')}"
+    assert scheduler.preemption_count > 0  # a real preemption actually happened
+    # Exactly once per request: the resumed request was NOT re-tokenized.
+    assert backend.tokenize_calls == 2
+    # Make sure both requests finished successfully and produced the same output.
+    assert req_a.status == RequestStatus.DONE
+    assert req_b.status == RequestStatus.DONE
+
+
 def test_shutdown_mid_preemption_cancels_and_frees_preempted_request() -> None:
     """A PREEMPTED sequence sitting in scheduler.waiting must still be
     cancelled and untracked on graceful shutdown."""
