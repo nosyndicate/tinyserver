@@ -181,7 +181,7 @@ def test_batched_decode_returns_token_text_and_updated_model_state() -> None:
         token_map={42: "hello"},
     )
 
-    with patch("server.executor.executor.sample_token", return_value=42):
+    with patch("server.executor.executor.sample_tokens", return_value=[42]):
         results = BatchExecutor(runner).batched_decode([req])
 
     assert len(results) == 1
@@ -199,7 +199,7 @@ def test_batched_decode_eos_returns_finished_result_without_decode_batch() -> No
     req = make_decode_req("r0")
     runner = FakeModelRunner()
 
-    with patch("server.executor.executor.sample_token", return_value=EOS):
+    with patch("server.executor.executor.sample_tokens", return_value=[EOS]):
         results = BatchExecutor(runner).batched_decode([req])
 
     assert len(results) == 1
@@ -219,7 +219,7 @@ def test_batched_decode_max_length_returns_finished_result_without_decode_batch(
     req = make_decode_req("r0", max_new_tokens=1)
     runner = FakeModelRunner(token_map={42: "a"})
 
-    with patch("server.executor.executor.sample_token", return_value=42):
+    with patch("server.executor.executor.sample_tokens", return_value=[42]):
         results = BatchExecutor(runner).batched_decode([req])
 
     assert len(results) == 1
@@ -265,7 +265,7 @@ def test_batched_decode_one_bad_request_does_not_block_valid_requests() -> None:
         token_map={42: "a"},
     )
 
-    with patch("server.executor.executor.sample_token", return_value=42):
+    with patch("server.executor.executor.sample_tokens", return_value=[42]):
         results = BatchExecutor(runner).batched_decode([bad, good])
 
     assert isinstance(results[0], RequestFailure)
@@ -288,7 +288,7 @@ def test_batched_decode_decode_batch_exception_fails_unfinished_requests_only() 
 
     runner.decode_batch = raise_decode
 
-    with patch("server.executor.executor.sample_token", side_effect=[EOS, 42]):
+    with patch("server.executor.executor.sample_tokens", side_effect=[[EOS, 42]]):
         results = BatchExecutor(runner).batched_decode([eos, unfinished])
 
     assert isinstance(results[0], DecodeResult)
@@ -306,7 +306,7 @@ def test_batched_decode_output_count_mismatch_fails_unfinished_requests_only() -
         token_map={42: "a"},
     )
 
-    with patch("server.executor.executor.sample_token", side_effect=[EOS, 42]):
+    with patch("server.executor.executor.sample_tokens", side_effect=[[EOS, 42]]):
         results = BatchExecutor(runner).batched_decode([eos, unfinished])
 
     assert isinstance(results[0], DecodeResult)

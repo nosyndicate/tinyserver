@@ -105,6 +105,51 @@ def sample_token(
     )
 
 
+@torch.inference_mode()
+def sample_tokens(
+    logits: torch.Tensor,
+    sampling_params: list[SamplingParams],
+    generators: list[torch.Generator | None] | None = None,
+) -> list[int]:
+    """Sample token IDs for a batch of logits and corresponding sampling parameters."""
+    if logits.ndim != 2:
+        raise ValueError(
+            f"Expected logits shape [batch_size, vocab_size], got {tuple(logits.shape)}"
+        )
+    batch_size = logits.shape[0]
+    if len(sampling_params) != batch_size:
+        raise ValueError(
+            f"Length of sampling_params ({len(sampling_params)}) must match batch size ({batch_size})"
+        )
+
+    top_ps = torch.tensor([s.top_p for s in sampling_params], device=logits.device)
+    temperatures = torch.tensor(
+        [s.temperature for s in sampling_params], device=logits.device
+    )
+    if generators:
+        parts = []
+        for i in range(batch_size):
+            gen = generators[i]
+            if gen is not None:
+                parts.append(
+                    torch.randint(0, 1 << 31, (1,), generator=gen, device=gen.device)
+                )
+            else:
+                parts.append(torch.randint(0, 1 << 31, (1,), device=logits.device))
+        seeds = torch.cat(parts).to(device=logits.device, dtype=torch.int64)
+    else:
+        seeds = torch.randint(
+            0, 1 << 31, (batch_size,), device=logits.device, dtype=torch.int64
+        )
+    scaled_logits = logits.float() / torch.clamp(
+        temperatures.unsqueeze(-1), min=LOWEST_TEMPERATURE
+    )
+    argmax_tokens = torch.argmax(scaled_logits, dim=-1)
+    sampled_tokens = top_p_sample_rejection(scaled_logits, top_ps, seeds)
+    use_argmax = temperatures < LOWEST_TEMPERATURE
+    return torch.where(use_argmax, argmax_tokens, sampled_tokens).tolist()
+
+
 def top_p_sample_rejection(
     logits: torch.Tensor,  # [B, V]
     top_p: torch.Tensor,  # [B]

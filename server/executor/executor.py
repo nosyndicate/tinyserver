@@ -13,7 +13,7 @@ from server.executor.types import (
 )
 from server.metrics.timers import now_ns
 from server.model.hf_runner import ModelRunner
-from server.model.sampling import sample_token
+from server.model.sampling import sample_token, sample_tokens
 
 T = TypeVar("T")
 
@@ -51,6 +51,52 @@ def _sample(
         token=next_token,
         finish_reason=FinishReason.MAX_LENGTH if is_last else None,
     )
+
+
+def _sample_batch(
+    runner: ModelRunner,
+    request_states: list[GenerationRequestState],
+) -> list[DecodeResult]:
+    logits = torch.stack(
+        [
+            assert_not_none(request_state.all_logits)[0, -1, :]
+            for request_state in request_states
+        ]
+    )
+    next_token_ids = sample_tokens(
+        logits,
+        [request_state.sampling_params for request_state in request_states],
+        [request_state.generator for request_state in request_states],
+    )
+
+    results = []
+    for i, request_state in enumerate(request_states):
+        next_token_id = next_token_ids[i]
+        if next_token_id == runner.eos_token_id:
+            results.append(
+                DecodeResult(
+                    token_id=next_token_id,
+                    token="",
+                    finish_reason=FinishReason.EOS,
+                )
+            )
+            continue
+
+        next_token = runner.tokenizer.decode([next_token_id], skip_special_tokens=True)
+        is_last = (
+            request_state.num_output_tokens + 1
+            >= request_state.sampling_params.max_new_tokens
+        )
+
+        results.append(
+            DecodeResult(
+                token_id=next_token_id,
+                token=next_token,
+                finish_reason=FinishReason.MAX_LENGTH if is_last else None,
+            )
+        )
+
+    return results
 
 
 class Executor(BaseExecutor):
@@ -145,23 +191,36 @@ class BatchExecutor(BaseBatchExecutor):
             request_states
         )
         unfinished_request_states: list[tuple[int, GenerationRequestState, int]] = []
+        valid_indices: list[int] = []
+        valid_states: list[GenerationRequestState] = []
         for i, request_state in enumerate(request_states):
-            try:
-                if request_state.all_logits is None:
-                    raise ValueError("No logits available for decoding step")
-                if request_state.past_key_values is None:
-                    raise ValueError("No past_key_values available for decoding step")
+            if request_state.all_logits is None:
+                results[i] = RequestFailure(
+                    error="No logits available for decoding step"
+                )
+            elif request_state.past_key_values is None:
+                results[i] = RequestFailure(
+                    error="No past_key_values available for decoding step"
+                )
+            else:
+                valid_indices.append(i)
+                valid_states.append(request_state)
 
-                result = _sample(self._runner, request_state)
-                if result.is_finished:
-                    results[i] = result
-                else:
-                    unfinished_request_states.append(
-                        (i, request_state, result.token_id)
-                    )
-                    results[i] = result
+        if valid_states:
+            try:
+                decode_results = _sample_batch(self._runner, valid_states)
+                for j, decode_result in enumerate(decode_results):
+                    i = valid_indices[j]
+                    if decode_result.is_finished:
+                        results[i] = decode_result
+                    else:
+                        results[i] = decode_result
+                        unfinished_request_states.append(
+                            (i, request_states[i], decode_result.token_id)
+                        )
             except Exception as e:
-                results[i] = RequestFailure(error=str(e))
+                for i in valid_indices:
+                    results[i] = RequestFailure(error=str(e))
 
         if not unfinished_request_states:
             return [assert_not_none(result) for result in results]
