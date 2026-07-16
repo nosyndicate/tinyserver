@@ -225,6 +225,11 @@ def _stream_generation(
                 yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
                 return
     finally:
+        # No matter how we exit the generator:
+        # - normal finish (DoneEvent and return)
+        # - timeout on output_queue.get
+        # - client disconnect (on yield, FastAPI raises GeneratorExit)
+        # cancel the request to free KV blocks
         worker.cancel(state)
 
 

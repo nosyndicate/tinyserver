@@ -172,8 +172,7 @@ class GenerationRequestState:
     generator: torch.Generator | None = None
 
     # Set by the HTTP thread (Worker.cancel) on timeout/disconnect; polled by the
-    # engine thread. An Event is thread-safe, so no lock is needed. Queue.put/get
-    # around submit already gives the needed happens-before.
+    # engine thread. An Event is thread-safe, so no lock is needed. 
     cancelled: threading.Event = field(default_factory=threading.Event)
 
     @property
