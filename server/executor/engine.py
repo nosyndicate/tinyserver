@@ -465,6 +465,38 @@ class ScheduleInferenceEngine:
         self._all_requests.clear()
         self._seq_to_request.clear()
 
+    def _reap_cancelled(self) -> None:
+        """Honor per-request cancellation flags set by the HTTP thread.
+
+        Runs on the engine thread (right after ``_drain_inbound``, before
+        ``schedule()``), so mutating tracking dicts and ``seq.finished`` is
+        safe. Two populations can hold a cancelled request:
+
+        - Deferred (in ``self._pending``, not yet admitted): nobody is listening
+          on their ``output_queue``, so just discard the ``(req, seq)`` tuples.
+          They hold no blocks.
+        - Admitted (tracked in ``self._all_requests``): mark the sequence
+          finished and drop it from engine tracking. The scheduler's
+          ``_reap_finished`` frees its blocks on the next ``schedule()`` (the
+          existing reclamation path — no new one is added).
+        """
+        if self._pending:
+            self._pending = deque(
+                (req, seq)
+                for (req, seq) in self._pending
+                if not req.cancelled.is_set()
+            )
+
+        # Snapshot: _cleanup_request mutates _all_requests during iteration.
+        for context in list(self._all_requests.values()):
+            if context.request.cancelled.is_set():
+                context.sequence.finished = True
+                context.request.status = RequestStatus.CANCELLED
+                logger.debug("cancelled request %s", context.request.request_id)
+                self._cleanup_request(
+                    context.sequence.sequence_id, context.request.request_id
+                )
+
     def _prepare_prefill(
         self, sequences: list[Sequence], resumed_sequence_ids: frozenset[str]
     ) -> tuple[torch.Tensor, torch.Tensor, InferenceContext]:
@@ -532,6 +564,11 @@ class ScheduleInferenceEngine:
                 # Move new requests from the inbound queue to the waiting list of scheduler
                 # and let scheduler decide which sequences to run next.
                 self._drain_inbound(inbound)
+
+                # Honor cancellation requests before scheduling so cancelled
+                # sequences stop occupying blocks/batch slots within one
+                # iteration (blocks reclaimed by the scheduler's reap path).
+                self._reap_cancelled()
 
                 if not control.should_stop():
                     batch = self._scheduler.schedule()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from queue import Queue
@@ -169,6 +170,10 @@ class GenerationRequestState:
     output_queue: Queue[Event] = field(default_factory=Queue)
 
     generator: torch.Generator | None = None
+
+    # Set by the HTTP thread (Worker.cancel) on timeout/disconnect; polled by the
+    # engine thread. An Event is thread-safe, so no lock is needed. 
+    cancelled: threading.Event = field(default_factory=threading.Event)
 
     @property
     def num_output_tokens(self) -> int:
