@@ -332,6 +332,28 @@ def test_schedule_decode_drops_finished_sequences() -> None:
     assert [s.sequence_id for s in sched.running] == ["b"]
 
 
+def test_schedule_reaps_finished_sequences_from_waiting() -> None:
+    # A cancelled sequence can be sitting in `waiting` (e.g. PREEMPTED, blocks
+    # already freed, or admitted-but-not-yet-prefilled). Marking it finished
+    # must drop it so the prefill pass never re-schedules/re-prefills it.
+    sched = make_scheduler(block_size=4, total_blocks=16)
+    keep = make_sequence(sequence_id="keep", num_tokens=4)
+    cancelled = make_sequence(sequence_id="cancelled", num_tokens=4)
+    sched.add(cancelled)
+    sched.add(keep)
+    cancelled.finished = True
+
+    batch = sched.schedule()
+
+    assert batch is not None
+    assert batch.kind is SequenceBatchTask.PREFILL
+    # Only the live sequence is scheduled; the cancelled one is gone from both
+    # the batch and the waiting queue, and never allocated a block.
+    assert [s.sequence_id for s in batch.sequences] == ["keep"]
+    assert "cancelled" not in [s.sequence_id for s in sched.waiting]
+    assert "cancelled" not in sched.block_manager.allocated_blocks
+
+
 # --- reap + capacity contract ---------------------------------------------
 
 

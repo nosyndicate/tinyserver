@@ -280,6 +280,33 @@ def test_cancel_inflight_clears_state_and_invokes_callback() -> None:
     assert sorted(block_manager.free_blocks) == list(range(block_manager.total_blocks))
 
 
+def test_reap_cancelled_marks_admitted_sequence_finished_and_frees_blocks() -> None:
+    # A tracked (admitted, running) request whose cancelled flag is set must be
+    # marked finished and dropped from engine tracking; the scheduler's existing
+    # reap path then frees its blocks on the next schedule().
+    engine, scheduler, block_manager, backend = _make_engine(prompt_tokens=[3, 4, 5])
+    req = _make_req(max_new_tokens=4)
+    inbound: Queue = Queue()
+    inbound.put(req)
+    engine._drain_inbound(inbound)
+    scheduler.schedule()  # prefill: sequence is now RUNNING and holds blocks
+
+    seq = scheduler.running[0]
+    assert block_manager.allocated_blocks  # blocks are held before cancellation
+
+    req.cancelled.set()
+    engine._reap_cancelled()
+
+    assert seq.finished is True
+    assert req.status == RequestStatus.CANCELLED
+    assert engine._all_requests == {}
+    assert engine._seq_to_request == {}
+
+    scheduler.schedule()  # reaps the finished sequence, returning its blocks
+    assert scheduler.running == []
+    assert sorted(block_manager.free_blocks) == list(range(block_manager.total_blocks))
+
+
 def test_prepare_decode_builds_one_token_per_sequence() -> None:
     """Unit-level check of _prepare_decode's tensor shapes and context."""
 
@@ -464,6 +491,28 @@ def test_pending_preserves_fifo_across_drains() -> None:
     assert [seq for seq in scheduler.added]  # something admitted
     assert engine._seq_to_request[scheduler.added[0].sequence_id].request_id == "A"
     assert scheduler.added[1] is engine._all_requests["B"].sequence
+
+
+def test_reap_cancelled_drops_deferred_request_without_emitting() -> None:
+    # A request parked in `_pending` (deferred, never admitted) that gets
+    # cancelled is simply discarded: nobody is listening on its output_queue,
+    # so no event is emitted.
+    backend = _FakeBackend(prompt_tokens=[3, 4, 5])
+    scheduler = _RejectAllScheduler()
+    engine = ScheduleInferenceEngine(scheduler=scheduler, backend=backend)
+
+    req = _make_req(max_new_tokens=4)
+    inbound: Queue = Queue()
+    inbound.put(req)
+    engine._drain_inbound(inbound)
+    assert len(engine._pending) == 1
+
+    req.cancelled.set()
+    engine._reap_cancelled()
+
+    assert len(engine._pending) == 0
+    assert scheduler.added == []  # never admitted
+    assert req.output_queue.empty()  # no event emitted for an abandoned request
 
 
 def test_new_small_request_cannot_overtake_deferred_large() -> None:

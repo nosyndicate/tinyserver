@@ -164,3 +164,13 @@ class Worker:
 
         request_state.enqueued_ns = now_ns()
         self._inbound.put_nowait(request_state)
+
+    def cancel(self, request_state: GenerationRequestState) -> None:
+        """Request cancellation of an in-flight request.
+
+        Thread-safe: only sets a flag the engine thread polls, because the
+        worker cannot safely reach into single-threaded scheduler/block state
+        from an HTTP handler thread. Idempotent and safe to call after the
+        request has already finished (the engine simply won't find it to reap).
+        """
+        request_state.cancelled.set()

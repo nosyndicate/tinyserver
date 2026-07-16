@@ -89,6 +89,14 @@ class Scheduler:
                 remain_running.append(seq)
         self.running = remain_running
 
+        # A cancelled sequence may also be sitting in `waiting` — either
+        # PREEMPTED (blocks already freed by `_preempt`) or admitted-but-not-yet
+        # prefilled (never allocated). Drop them so the prefill pass doesn't
+        # re-schedule and re-prefill a cancelled request. No free() needed: they
+        # hold no blocks in either case.
+        if any(seq.finished for seq in self.waiting):
+            self.waiting = deque(seq for seq in self.waiting if not seq.finished)
+
     def _preempt(self) -> Sequence:
         """Evict the youngest running sequence to free blocks for a
         higher-priority one, returning the evicted sequence.

@@ -76,7 +76,9 @@ def _build_request_state(req: GenerateRequest, device: str) -> GenerationRequest
     )
 
 
-def _await_generation(state: GenerationRequestState) -> GenerateResponse:
+def _await_generation(
+    state: GenerationRequestState, worker: Worker
+) -> GenerateResponse:
     """
     Wait on the request's output queue for a terminal event and build the
     non-streaming response. Intermediate TokenEvents are discarded.
@@ -85,6 +87,9 @@ def _await_generation(state: GenerationRequestState) -> GenerateResponse:
         try:
             event: Event = state.output_queue.get(timeout=_GENERATION_TIMEOUT_S)
         except Empty:
+            # Client is giving up: tell the worker to stop decoding this request
+            # and free its KV blocks instead of running to max_new_tokens.
+            worker.cancel(state)
             raise HTTPException(
                 status_code=504,
                 detail="Generation timed out.",
@@ -119,95 +124,108 @@ def _await_generation(state: GenerationRequestState) -> GenerateResponse:
             )
 
 
-def _stream_generation(state: GenerationRequestState) -> Generator[str, None, None]:
+def _stream_generation(
+    state: GenerationRequestState, worker: Worker
+) -> Generator[str, None, None]:
     """
     Consume the request's output queue and yield SSE chunks. The final token
     is held until the terminal DoneEvent so the last chunk carries the same
     timing metadata as the non-streaming endpoint.
+
+    The ``finally`` cancels the request on every exit path — timeout return,
+    ``GeneratorExit`` from a client disconnect, and normal completion. On
+    normal completion the request is already reaped, so cancel is a harmless
+    no-op; on abandonment it frees the KV blocks instead of decoding to
+    max_new_tokens.
     """
-    while True:
-        try:
-            event: Event = state.output_queue.get(timeout=_GENERATION_TIMEOUT_S)
-        except Empty:
-            error_chunk = StreamChunk(
-                token_str="",
-                is_first=False,
-                is_done=True,
-                error="Generation timed out.",
-            )
-            yield f"data: {error_chunk.model_dump_json(exclude_none=True)}\n\n"
-            return
-
-        if isinstance(event, TokenEvent):
-            if event.is_last:
-                try:
-                    done_event = state.output_queue.get(timeout=_GENERATION_TIMEOUT_S)
-                except Empty:
-                    error_chunk = StreamChunk(
-                        token_str="",
-                        is_first=False,
-                        is_done=True,
-                        error="Generation timed out waiting for final event.",
-                    )
-                    yield f"data: {error_chunk.model_dump_json(exclude_none=True)}\n\n"
-                    return
-                if isinstance(done_event, DoneEvent):
-                    tokens_per_s = _compute_tokens_per_s(
-                        done_event.num_output_tokens, done_event.total_ms
-                    )
-                    chunk = StreamChunk(
-                        token_str=event.token,
-                        is_first=event.is_first,
-                        is_done=True,
-                        prompt_tokens=done_event.num_prompt_tokens,
-                        output_tokens=done_event.num_output_tokens,
-                        ttft_ms=done_event.ttft,
-                        total_ms=done_event.total_ms,
-                        tokens_per_s=tokens_per_s,
-                        queue_wait_ms=done_event.queue_wait_ms,
-                        execution_ms=done_event.execution_ms,
-                    )
-                    yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
-                    log_event(
-                        "stream_done",
-                        output_tokens=done_event.num_output_tokens,
-                        ttft_ms=done_event.ttft,
-                    )
-                elif isinstance(done_event, ErrorEvent):
-                    error_chunk = StreamChunk(
-                        token_str="",
-                        is_first=False,
-                        is_done=True,
-                        error=done_event.error,
-                    )
-                    yield f"data: {error_chunk.model_dump_json(exclude_none=True)}\n\n"
-                else:
-                    # Unexpected event type after last token, yield a generic error
-                    error_chunk = StreamChunk(
-                        token_str="",
-                        is_first=False,
-                        is_done=True,
-                        error="Unexpected event type after last token",
-                    )
-                    yield f"data: {error_chunk.model_dump_json(exclude_none=True)}\n\n"
-
+    try:
+        while True:
+            try:
+                event: Event = state.output_queue.get(timeout=_GENERATION_TIMEOUT_S)
+            except Empty:
+                error_chunk = StreamChunk(
+                    token_str="",
+                    is_first=False,
+                    is_done=True,
+                    error="Generation timed out.",
+                )
+                yield f"data: {error_chunk.model_dump_json(exclude_none=True)}\n\n"
                 return
-            chunk = StreamChunk(
-                token_str=event.token,
-                is_first=event.is_first,
-                is_done=False,
-            )
-            yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
-        elif isinstance(event, ErrorEvent):
-            chunk = StreamChunk(
-                token_str="",
-                is_first=False,
-                is_done=True,
-                error=event.error,
-            )
-            yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
-            return
+            if isinstance(event, TokenEvent):
+                if event.is_last:
+                    try:
+                        done_event = state.output_queue.get(
+                            timeout=_GENERATION_TIMEOUT_S
+                        )
+                    except Empty:
+                        error_chunk = StreamChunk(
+                            token_str="",
+                            is_first=False,
+                            is_done=True,
+                            error="Generation timed out waiting for final event.",
+                        )
+                        yield f"data: {error_chunk.model_dump_json(exclude_none=True)}\n\n"
+                        return
+                    if isinstance(done_event, DoneEvent):
+                        tokens_per_s = _compute_tokens_per_s(
+                            done_event.num_output_tokens, done_event.total_ms
+                        )
+                        chunk = StreamChunk(
+                            token_str=event.token,
+                            is_first=event.is_first,
+                            is_done=True,
+                            prompt_tokens=done_event.num_prompt_tokens,
+                            output_tokens=done_event.num_output_tokens,
+                            ttft_ms=done_event.ttft,
+                            total_ms=done_event.total_ms,
+                            tokens_per_s=tokens_per_s,
+                            queue_wait_ms=done_event.queue_wait_ms,
+                            execution_ms=done_event.execution_ms,
+                        )
+                        yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                        log_event(
+                            "stream_done",
+                            output_tokens=done_event.num_output_tokens,
+                            ttft_ms=done_event.ttft,
+                        )
+                    elif isinstance(done_event, ErrorEvent):
+                        error_chunk = StreamChunk(
+                            token_str="",
+                            is_first=False,
+                            is_done=True,
+                            error=done_event.error,
+                        )
+                        yield f"data: {error_chunk.model_dump_json(exclude_none=True)}\n\n"
+                    else:
+                        # Unexpected event type after last token, yield a generic error
+                        error_chunk = StreamChunk(
+                            token_str="",
+                            is_first=False,
+                            is_done=True,
+                            error="Unexpected event type after last token",
+                        )
+                        yield f"data: {error_chunk.model_dump_json(exclude_none=True)}\n\n"
+
+                    return
+                chunk = StreamChunk(
+                    token_str=event.token,
+                    is_first=event.is_first,
+                    is_done=False,
+                )
+                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+
+            elif isinstance(event, ErrorEvent):
+                chunk = StreamChunk(
+                    token_str="",
+                    is_first=False,
+                    is_done=True,
+                    error=event.error,
+                )
+                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                return
+    finally:
+        worker.cancel(state)
 
 
 def _submit_or_fail(request: Request, req: GenerateRequest) -> GenerationRequestState:
@@ -291,14 +309,14 @@ def generate(req: GenerateRequest, request: Request) -> GenerateResponse:
 def generate_v2(req: GenerateRequest, request: Request) -> GenerateResponse:
     state = _submit_or_fail(request, req)
 
-    return _await_generation(state)
+    return _await_generation(state, _get_worker(request))
 
 
 @v3_router.post("/generate_v3", response_model=GenerateResponse)
 def generate_v3(req: GenerateRequest, request: Request) -> GenerateResponse:
     state = _submit_or_fail(request, req)
 
-    return _await_generation(state)
+    return _await_generation(state, _get_worker(request))
 
 
 @v4_router.post("/generate_v4", response_model=GenerateResponse)
@@ -306,7 +324,7 @@ def generate_v4(req: GenerateRequest, request: Request) -> GenerateResponse:
     """Generate text via the paged-attention scheduled engine."""
     state = _submit_or_fail(request, req)
 
-    return _await_generation(state)
+    return _await_generation(state, _get_worker(request))
 
 
 @v1_router.post("/generate/stream")
@@ -352,14 +370,20 @@ def generate_stream(req: GenerateRequest, request: Request) -> StreamingResponse
 def generate_stream_v2(req: GenerateRequest, request: Request) -> StreamingResponse:
     state = _submit_or_fail(request, req)
 
-    return StreamingResponse(_stream_generation(state), media_type="text/event-stream")
+    return StreamingResponse(
+        _stream_generation(state, _get_worker(request)),
+        media_type="text/event-stream",
+    )
 
 
 @v3_router.post("/generate/stream_v3", response_model=None)
 def generate_stream_v3(req: GenerateRequest, request: Request) -> StreamingResponse:
     state = _submit_or_fail(request, req)
 
-    return StreamingResponse(_stream_generation(state), media_type="text/event-stream")
+    return StreamingResponse(
+        _stream_generation(state, _get_worker(request)),
+        media_type="text/event-stream",
+    )
 
 
 @v4_router.post("/generate/stream_v4", response_model=None)
@@ -367,4 +391,7 @@ def generate_stream_v4(req: GenerateRequest, request: Request) -> StreamingRespo
     """Stream generated tokens via the paged-attention scheduled engine."""
     state = _submit_or_fail(request, req)
 
-    return StreamingResponse(_stream_generation(state), media_type="text/event-stream")
+    return StreamingResponse(
+        _stream_generation(state, _get_worker(request)),
+        media_type="text/event-stream",
+    )

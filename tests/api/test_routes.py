@@ -4,11 +4,17 @@ from typing import Callable, cast
 import pytest
 from fastapi import HTTPException, Request
 
-from server.api.routes import _submit_or_fail
+from server.api import routes
+from server.api.routes import (
+    _await_generation,
+    _stream_generation,
+    _submit_or_fail,
+)
 from server.api.schema import GenerateRequest
 from server.executor.engine import EngineCallbacks, EngineControl
-from server.executor.types import GenerationRequestState
+from server.executor.types import GenerationRequestState, TokenEvent
 from server.executor.worker import Worker
+from server.model.sampling import SamplingParams
 from tests.executor.worker_helpers import make_req
 
 
@@ -108,3 +114,48 @@ def test_submit_or_fail_happy_path_returns_state() -> None:
     assert isinstance(state, GenerationRequestState)
     assert state.prompt == "hello"
     assert worker._inbound.qsize() == 1
+
+
+def make_state(request_id: str = "req-1") -> GenerationRequestState:
+    return GenerationRequestState(
+        request_id=request_id,
+        sampling_params=SamplingParams(
+            max_new_tokens=8, temperature=0.0, top_p=1.0
+        ),
+        prompt="hello",
+    )
+
+
+def test_await_generation_cancels_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    # When the client's wait times out (nothing ever lands on output_queue), the
+    # handler must tell the worker to cancel before raising the 504, so the
+    # engine stops decoding and frees the request's KV blocks.
+    monkeypatch.setattr(routes, "_GENERATION_TIMEOUT_S", 0.01)
+    worker = make_worker()
+    state = make_state()
+
+    with pytest.raises(HTTPException) as excinfo:
+        _await_generation(state, worker)
+
+    assert excinfo.value.status_code == 504
+    assert state.cancelled.is_set()
+
+
+def test_stream_generation_cancels_on_client_disconnect() -> None:
+    # Closing the generator (what Starlette does on client disconnect) must run
+    # the finally and cancel the request.
+    worker = make_worker()
+    state = make_state()
+    # Prime one non-terminal token so the first next() enters the try and yields.
+    state.output_queue.put(
+        TokenEvent(token="hi", is_first=True, is_last=False, index=0)
+    )
+
+    gen = _stream_generation(state, worker)
+    first_chunk = next(gen)
+    assert "hi" in first_chunk
+    assert not state.cancelled.is_set()  # still streaming
+
+    gen.close()  # simulate GeneratorExit from a disconnected client
+
+    assert state.cancelled.is_set()
