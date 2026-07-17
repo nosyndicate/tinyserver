@@ -12,9 +12,7 @@ part of the exhibit, not defects to fix:
   non-streaming endpoint, because there is no queue and no incremental
   delivery to measure.
 
-The later versions (v2+) exist precisely because of these limitations; see
-``async_handoff_options.md`` for the full analysis. Do not route production
-traffic here, and do not "modernize" this file — retire it instead.
+The later versions (v2+) exist precisely because of these limitations.
 
 Served only when the server is started with ``--api-version v1``; the
 queue-based versions never mount this router (see ``server/main.py``).

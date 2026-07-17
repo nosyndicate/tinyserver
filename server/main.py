@@ -128,10 +128,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     runner = load_hf_model(config)
     if version == "v1":
-        # Only v1 mode serves the legacy endpoints, which read app.state.runner.
-        # v2/v3 use the runner solely through their executors below, so it is
-        # deliberately NOT exposed on app state — no CUDA-backed object leaks
-        # into the API surface outside v1 mode.
         app.state.runner = runner
 
     if version == "v2":
@@ -166,10 +162,6 @@ def create_app(cli_args: argparse.Namespace) -> FastAPI:
     app.state.cli_args = cli_args
     app.include_router(health_router)
     if cli_args.api_version == "v1":
-        # The legacy phase-1 endpoints are an explicit opt-in mode, not a
-        # rider on v2/v3: they need app.state.runner in the API process,
-        # which the queue-based versions no longer expose (and, after the
-        # process split, could not provide without loading the model twice).
         app.include_router(v1_router)
     elif cli_args.api_version == "v2":
         app.include_router(v2_router)
