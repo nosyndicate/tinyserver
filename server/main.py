@@ -10,11 +10,11 @@ from fastapi import FastAPI
 
 from server.api.routes import (
     health_router,
-    v1_router,
     v2_router,
     v3_router,
     v4_router,
 )
+from server.api.v1_legacy import v1_router
 from server.executor.engine import (
     BatchInferenceEngine,
     ScheduleInferenceEngine,
@@ -49,9 +49,10 @@ def parse_args() -> argparse.Namespace:
         choices=["v1", "v2", "v3", "v4"],
         default="v3",
         help=(
-            "Which endpoint version to expose (default: v3). v1 endpoints are "
-            "always included, except in v4 mode, which only serves the "
-            "paged-attention endpoints."
+            "Which endpoint version to expose (default: v3). Each mode serves "
+            "only its own endpoints (plus /health). v1 is the preserved "
+            "phase-1 baseline (direct, unqueued) and is only available in v1 "
+            "mode."
         ),
     )
     parser.add_argument(
@@ -126,7 +127,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         return
 
     runner = load_hf_model(config)
-    app.state.runner = runner
+    if version == "v1":
+        # Only v1 mode serves the legacy endpoints, which read app.state.runner.
+        # v2/v3 use the runner solely through their executors below, so it is
+        # deliberately NOT exposed on app state — no CUDA-backed object leaks
+        # into the API surface outside v1 mode.
+        app.state.runner = runner
 
     if version == "v2":
         executor = Executor(runner)
@@ -159,10 +165,13 @@ def create_app(cli_args: argparse.Namespace) -> FastAPI:
     app = FastAPI(title="LLM Inference Server", lifespan=lifespan)
     app.state.cli_args = cli_args
     app.include_router(health_router)
-    if cli_args.api_version != "v4":
-        # v4 mode doesn't load the ModelRunner the v1 endpoints depend on.
+    if cli_args.api_version == "v1":
+        # The legacy phase-1 endpoints are an explicit opt-in mode, not a
+        # rider on v2/v3: they need app.state.runner in the API process,
+        # which the queue-based versions no longer expose (and, after the
+        # process split, could not provide without loading the model twice).
         app.include_router(v1_router)
-    if cli_args.api_version == "v2":
+    elif cli_args.api_version == "v2":
         app.include_router(v2_router)
     elif cli_args.api_version == "v3":
         app.include_router(v3_router)
