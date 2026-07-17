@@ -1,4 +1,4 @@
-"""Mounting contract for the preserved v1 baseline (see server/api/v1_legacy.py).
+"""Mounting contract for the preserved v1 baseline (see server/api/v1.py).
 
 v1 endpoints are an explicit opt-in mode: they exist only when the server is
 started with ``--api-version v1`` and never ride along with the queue-based

@@ -14,7 +14,7 @@ from server.api.routes import (
     v3_router,
     v4_router,
 )
-from server.api.v1_legacy import v1_router
+from server.api.v1 import v1_router
 from server.executor.engine import (
     BatchInferenceEngine,
     ScheduleInferenceEngine,
