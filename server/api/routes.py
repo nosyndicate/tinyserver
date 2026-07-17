@@ -15,9 +15,7 @@ from server.executor.types import (
 )
 from server.executor.worker import Worker, WorkerShuttingDown
 from server.metrics.logging import log_event
-from server.metrics.timers import now_ns, ns_to_ms, timed
 from server.model.determinism import make_generator
-from server.model.hf_runner import ModelRunner
 from server.model.sampling import build_sampling_params
 
 _GENERATION_TIMEOUT_S = 300  # 5 minutes
@@ -29,20 +27,9 @@ def _compute_tokens_per_s(num_output_tokens: int, total_ms: float) -> float:
 
 
 health_router = APIRouter()
-v1_router = APIRouter()
 v2_router = APIRouter()
 v3_router = APIRouter()
 v4_router = APIRouter()
-
-
-def _get_runner(request: Request) -> ModelRunner:
-    """
-    Retrieve the model runner instance from the request's app state.
-    """
-    runner = request.app.state.runner
-    if runner is None:
-        raise RuntimeError("Model runner not found in app state")
-    return runner
 
 
 def _get_worker(request: Request) -> Worker:
@@ -260,56 +247,6 @@ def health() -> dict[str, bool]:
     return {"ok": True}
 
 
-@v1_router.post("/generate", response_model=GenerateResponse)
-def generate(req: GenerateRequest, request: Request) -> GenerateResponse:
-    """Generate text based on the input prompt."""
-
-    runner = _get_runner(request)
-    sampling_params = build_sampling_params(
-        max_new_tokens=req.max_new_tokens,
-        temperature=req.temperature,
-        top_p=req.top_p,
-        seed=req.seed,
-    )
-
-    log_event(
-        "request_start",
-        max_new_tokens=req.max_new_tokens,
-        temperature=req.temperature,
-        top_p=req.top_p,
-    )
-
-    with timed() as total_timer:
-        text, prompt_tokens, output_tokens = runner.generate_text(
-            req.prompt, sampling_params
-        )
-
-    total_ms = ns_to_ms(total_timer["end_ns"] - total_timer["start_ns"])
-
-    # We don't have streaming right now, so ttft_ms is the same as total_ms.
-    ttft_ms = total_ms
-    tokens_per_s = _compute_tokens_per_s(output_tokens, total_ms)
-
-    log_event(
-        "request_done",
-        prompt_tokens=prompt_tokens,
-        output_tokens=output_tokens,
-        total_ms=total_ms,
-        tokens_per_s=tokens_per_s,
-    )
-
-    return GenerateResponse(
-        text=text,
-        prompt_tokens=prompt_tokens,
-        output_tokens=output_tokens,
-        ttft_ms=ttft_ms,
-        total_ms=total_ms,
-        tokens_per_s=tokens_per_s,
-        queue_wait_ms=0.0,
-        execution_ms=total_ms,  # V1 doesn't queue, so execution_ms == total_ms
-    )
-
-
 @v2_router.post("/generate_v2", response_model=GenerateResponse)
 def generate_v2(req: GenerateRequest, request: Request) -> GenerateResponse:
     state = _submit_or_fail(request, req)
@@ -330,45 +267,6 @@ def generate_v4(req: GenerateRequest, request: Request) -> GenerateResponse:
     state = _submit_or_fail(request, req)
 
     return _await_generation(state, _get_worker(request))
-
-
-@v1_router.post("/generate/stream")
-def generate_stream(req: GenerateRequest, request: Request) -> StreamingResponse:
-    runner = _get_runner(request)
-    sampling_params = build_sampling_params(
-        max_new_tokens=req.max_new_tokens,
-        temperature=req.temperature,
-        top_p=req.top_p,
-        seed=req.seed,
-    )
-
-    def _event_stream() -> Generator[str, None, None]:
-        start_ns = now_ns()
-        ttft_ms = None
-        index = 0
-
-        for token_str, is_first_token, is_done in runner.generate_stream(
-            req.prompt, sampling_params
-        ):
-            if is_first_token:
-                ttft_ms = ns_to_ms(now_ns() - start_ns)
-
-            if token_str:
-                index += 1
-
-            chunk = StreamChunk(
-                token_str=token_str,
-                is_first=is_first_token,
-                is_done=is_done,
-            )
-
-            yield f"data: {chunk.model_dump_json()}\n\n"
-
-            if is_done:
-                log_event("stream_done", output_tokens=index, ttft_ms=ttft_ms)
-                return
-
-    return StreamingResponse(_event_stream(), media_type="text/event-stream")
 
 
 @v2_router.post("/generate/stream_v2", response_model=None)

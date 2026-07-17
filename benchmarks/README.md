@@ -94,6 +94,11 @@ python -m scripts.bench \
 |---|---|---|
 | `--base-url` | `http://127.0.0.1:8000` | Server address |
 | `--endpoint` | `stream_v2` | API endpoint: `generate`, `generate_v2`, `stream`, `stream_v2`, `generate/stream`, `generate/stream_v2` |
+
+**Note:** each server mode only serves its own endpoints. The v1 endpoints
+(`generate`, `stream`) require a server started with `--api-version v1`; the
+versioned endpoints (`*_v2`/`*_v3`/`*_v4`) require the matching mode. To
+compare v1 against v2 you must run the server twice, once per mode.
 | `--timeout-seconds` | `120.0` | Per-request HTTP timeout |
 
 ### Scenario
