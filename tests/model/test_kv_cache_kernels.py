@@ -1,7 +1,12 @@
 import pytest
 import torch
 
-from server.model.kernels.kv_cache import store_kv_cache, store_kv_cache_batched
+pytest.importorskip("triton")
+
+from server.model.kernels.kv_cache import (  # noqa: E402
+    store_kv_cache,
+    store_kv_cache_batched,
+)
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="Triton requires CUDA"
