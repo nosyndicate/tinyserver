@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from scripts.bench_paged_attention import (
+import pytest
+
+pytest.importorskip("triton")
+
+from scripts.bench_paged_attention import (  # noqa: E402
     BenchResult,
     _build_results_table,
     _build_row,

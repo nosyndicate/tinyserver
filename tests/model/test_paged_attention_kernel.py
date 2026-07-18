@@ -13,8 +13,10 @@ import math
 import pytest
 import torch
 
-from server.model.kernels.paged_attention import paged_attention_forward
-from tests.model.utils import requires_cuda
+pytest.importorskip("triton")
+
+from server.model.kernels.paged_attention import paged_attention_forward  # noqa: E402
+from tests.model.utils import requires_cuda  # noqa: E402
 
 _DEVICE = "cuda"
 _ATOL = 1e-3
