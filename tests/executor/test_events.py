@@ -127,9 +127,11 @@ def test_eos_emits_final_empty_token_and_done_event() -> None:
     assert isinstance(events[0], TokenEvent)
     assert events[0].token == ""
     assert events[0].is_last is True
+    assert events[0].request_id == req.request_id
     assert isinstance(events[1], DoneEvent)
     assert events[1].text == "a"
     assert events[1].num_output_tokens == 1
+    assert events[1].request_id == req.request_id
 
 
 def test_max_length_emits_final_token_and_done_event() -> None:

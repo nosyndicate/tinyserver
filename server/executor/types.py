@@ -19,12 +19,15 @@ class TokenEvent:
     Indicates a new token is generated.
 
     Attributes:
+        request_id: The unique identifier for the request this token belongs to.
+            Lets a single shared transport route the event to the right consumer.
         token: The decoded text for this token, might be an empty string for special tokens like EOS.
         is_first: Whether this token is the first token in the sequence.
         is_last: Whether this token is the last token in the sequence. This can be true when the generation is stopped by max_new_tokens limit.
         index: The index of the token in the sequence, starting from 0.
     """
 
+    request_id: str
     token: str
     is_first: bool
     is_last: bool
@@ -37,6 +40,8 @@ class DoneEvent:
     Indicates the generation is done, and provides the final results.
 
     Attributes:
+        request_id: The unique identifier for the request this result belongs to.
+            Lets a single shared transport route the event to the right consumer.
         text: The full decoded text for the sequence, including all tokens.
         num_prompt_tokens: The number of tokens in the prompt.
         num_output_tokens: The number of tokens in the output sequence.
@@ -45,6 +50,8 @@ class DoneEvent:
         queue_wait_ms: The time spent waiting in the queue before prefill started, in milliseconds.
         execution_ms: Time spent executing after leaving the queue (total_ms - queue_wait_ms).
     """
+
+    request_id: str
 
     text: str
     num_prompt_tokens: int
@@ -71,6 +78,19 @@ class ErrorEvent:
 
 
 Event = TokenEvent | DoneEvent | ErrorEvent
+
+
+class EventSink(Protocol):
+    """Where the engine side hands off client-facing events.
+
+    Isolating this behind a one-method protocol keeps the producer call sites
+    (``events.py``, ``worker.py``) identical across transports:
+
+    - Stage 1 (B2): puts events on a ``queue.Queue`` drained by the pump thread.
+    - Stage 2 (C): serializes and sends on the engine process's outbound socket.
+    """
+
+    def emit(self, event: Event) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -169,11 +189,24 @@ class GenerationRequestState:
 
     output_queue: Queue[Event] = field(default_factory=Queue)
 
+    # Where events are handed off. Defaults (in __post_init__) to a sink wrapping
+    # this request's own output_queue, so producers emit through sink.emit(...)
+    # while consumers still read output_queue — behavior-preserving until the
+    # consumer side moves to the collector in a later PR.
+    sink: EventSink | None = None
+
     generator: torch.Generator | None = None
 
     # Set by the HTTP thread (Worker.cancel) on timeout/disconnect; polled by the
-    # engine thread. An Event is thread-safe, so no lock is needed. 
+    # engine thread. An Event is thread-safe, so no lock is needed.
     cancelled: threading.Event = field(default_factory=threading.Event)
+
+    def __post_init__(self) -> None:
+        if self.sink is None:
+            # Local import avoids a types <-> sinks module import cycle.
+            from server.executor.sinks import DirectQueueSink
+
+            self.sink = DirectQueueSink(self.output_queue)
 
     @property
     def num_output_tokens(self) -> int:
