@@ -4,7 +4,7 @@ import threading
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from queue import Queue
-from typing import Protocol
+from typing import Protocol, cast
 
 import torch
 from torch import Tensor
@@ -189,7 +189,7 @@ class GenerationRequestState:
 
     output_queue: Queue[Event] = field(default_factory=Queue)
 
-    sink: EventSink | None = None
+    sink: EventSink = field(default=cast("EventSink", None))
 
     generator: torch.Generator | None = None
 
