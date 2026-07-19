@@ -12,13 +12,14 @@ from server.metrics.timers import now_ns, ns_to_ms
 
 
 class RequestEventEmitter:
-    """Translates executor results into events pushed to each request's output queue.
+    """Translates executor results into events emitted to each request's sink.
 
     The engine calls the ``on_*`` methods as a request progresses through
     prefill and decode phases.  This class updates the mutable
-    ``GenerationRequestState`` (timestamps, tokens, cache state) and pushes
-    ``TokenEvent``, ``DoneEvent``, or ``ErrorEvent`` instances so that
-    downstream consumers (e.g., the HTTP/SSE layer) can read them.
+    ``GenerationRequestState`` (timestamps, tokens, cache state) and emits
+    ``TokenEvent``, ``DoneEvent``, or ``ErrorEvent`` instances through the
+    request's ``EventSink`` so that downstream consumers (e.g., the HTTP/SSE
+    layer) can read them.
     """
 
     def on_prefill_started(
@@ -51,8 +52,9 @@ class RequestEventEmitter:
             request_state.first_token_ns = now_ns()
 
         if result.finish_reason == FinishReason.EOS:
-            request_state.output_queue.put(
+            request_state.sink.emit(
                 TokenEvent(
+                    request_id=request_state.request_id,
                     token="",
                     is_first=is_first,
                     is_last=True,
@@ -64,8 +66,9 @@ class RequestEventEmitter:
             return
 
         request_state.output_tokens.append(result.token)
-        request_state.output_queue.put(
+        request_state.sink.emit(
             TokenEvent(
+                request_id=request_state.request_id,
                 token=result.token,
                 is_first=is_first,
                 is_last=result.is_finished,
@@ -86,7 +89,7 @@ class RequestEventEmitter:
         """Mark the request as failed and push an ErrorEvent."""
         request_state.status = RequestStatus.FAILED
         request_state.error = error
-        request_state.output_queue.put(
+        request_state.sink.emit(
             ErrorEvent(request_id=request_state.request_id, error=error)
         )
 
@@ -116,8 +119,9 @@ class RequestEventEmitter:
         if request_state.num_prompt_tokens is None:
             raise RuntimeError("num_prompt_tokens is required to finish the request")
 
-        request_state.output_queue.put(
+        request_state.sink.emit(
             DoneEvent(
+                request_id=request_state.request_id,
                 text="".join(request_state.output_tokens),
                 num_prompt_tokens=request_state.num_prompt_tokens,
                 num_output_tokens=request_state.num_output_tokens,

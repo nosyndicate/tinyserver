@@ -62,10 +62,10 @@ class Worker:
     def _cancel_request(
         self, request_state: GenerationRequestState, error_message: str
     ) -> None:
-        """Mark a request as failed and push an ErrorEvent to its output queue."""
+        """Mark a request as failed and emit an ErrorEvent to its sink."""
         request_state.status = RequestStatus.FAILED
         request_state.error = error_message
-        request_state.output_queue.put(
+        request_state.sink.emit(
             ErrorEvent(
                 request_id=request_state.request_id,
                 error=request_state.error,

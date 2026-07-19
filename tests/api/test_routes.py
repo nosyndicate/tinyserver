@@ -148,7 +148,13 @@ def test_stream_generation_cancels_on_client_disconnect() -> None:
     state = make_state()
     # Prime one non-terminal token so the first next() enters the try and yields.
     state.output_queue.put(
-        TokenEvent(token="hi", is_first=True, is_last=False, index=0)
+        TokenEvent(
+            request_id=state.request_id,
+            token="hi",
+            is_first=True,
+            is_last=False,
+            index=0,
+        )
     )
 
     gen = _stream_generation(state, worker)
