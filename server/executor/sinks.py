@@ -5,10 +5,10 @@ client-facing events. Isolating this behind a tiny protocol lets the same
 producer call sites (``events.py``, ``worker.py``) work unchanged whether the
 consumer is:
 
-- Stage 1 (B2): an in-process ``queue.Queue`` drained by a pump thread, or
-- Stage 2 (C): a socket to a separate engine process.
+- an in-process ``queue.Queue`` drained by a pump thread, or
+- a socket to a separate engine process.
 
-Only ``queue``-backed sinks live here; the socket sink arrives with Stage 2.
+Only ``queue``-backed sinks live here; the socket sink arrives later.
 """
 
 from __future__ import annotations
@@ -38,8 +38,7 @@ class SharedQueueSink:
     """Emit events onto one server-wide ``queue.Queue`` drained by the pump.
 
     Every request state shares a single instance, so the pump thread has just
-    one queue to drain and route by ``request_id``. Introduced now for the
-    Stage-2 seam; it is wired into the app in a later PR.
+    one queue to drain and route by ``request_id``. 
     """
 
     def __init__(self) -> None:

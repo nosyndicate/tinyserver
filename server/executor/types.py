@@ -86,8 +86,8 @@ class EventSink(Protocol):
     Isolating this behind a one-method protocol keeps the producer call sites
     (``events.py``, ``worker.py``) identical across transports:
 
-    - Stage 1 (B2): puts events on a ``queue.Queue`` drained by the pump thread.
-    - Stage 2 (C): serializes and sends on the engine process's outbound socket.
+    - Puts events on a ``queue.Queue`` drained by the pump thread.
+    - Serializes and sends events on the engine process's outbound socket.
     """
 
     def emit(self, event: Event) -> None: ...
@@ -189,10 +189,6 @@ class GenerationRequestState:
 
     output_queue: Queue[Event] = field(default_factory=Queue)
 
-    # Where events are handed off. Defaults (in __post_init__) to a sink wrapping
-    # this request's own output_queue, so producers emit through sink.emit(...)
-    # while consumers still read output_queue — behavior-preserving until the
-    # consumer side moves to the collector in a later PR.
     sink: EventSink | None = None
 
     generator: torch.Generator | None = None

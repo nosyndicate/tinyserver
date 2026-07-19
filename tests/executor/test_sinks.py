@@ -1,5 +1,3 @@
-"""Tests for the Stage-1 queue-backed event sinks."""
-
 from queue import Queue
 
 from server.executor.sinks import DirectQueueSink, SharedQueueSink
