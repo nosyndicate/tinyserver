@@ -10,6 +10,7 @@ class GenerateRequest(BaseModel):
     top_p: float = Field(
         0.95, ge=0.0, le=1.0, description="Nucleus sampling top-p value"
     )
+    top_k: int = Field(0, ge=0, description="Top-k filtering; 0 disables it")
     seed: int | None = Field(
         default=None, ge=0, description="Optional random seed for reproducibility"
     )
