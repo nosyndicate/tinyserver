@@ -4,6 +4,7 @@ import torch
 from server.model.sampling import (
     LOWEST_TEMPERATURE,
     SamplingParams,
+    build_sampling_params,
     sample_token,
     top_p_sample_rejection,
 )
@@ -14,13 +15,29 @@ def make_params(
     temperature: float = 1.0,
     top_p: float = 1.0,
     max_new_tokens: int = 10,
+    top_k: int = 0,
     seed: int | None = None,
 ) -> SamplingParams:
     return SamplingParams(
         max_new_tokens=max_new_tokens,
         temperature=temperature,
         top_p=top_p,
+        top_k=top_k,
         seed=seed,
+    )
+
+
+def test_top_k_defaults_to_disabled() -> None:
+    assert SamplingParams(max_new_tokens=1, temperature=1.0, top_p=1.0).top_k == 0
+
+
+def test_build_sampling_params_round_trips_top_k() -> None:
+    params = build_sampling_params(
+        max_new_tokens=4, temperature=0.7, top_p=0.9, top_k=32, seed=1
+    )
+    assert params.top_k == 32
+    assert (
+        build_sampling_params(max_new_tokens=4, temperature=0.7, top_p=0.9).top_k == 0
     )
 
 

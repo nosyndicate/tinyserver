@@ -50,6 +50,7 @@ def _build_request_state(req: GenerateRequest, device: str) -> GenerationRequest
         max_new_tokens=req.max_new_tokens,
         temperature=req.temperature,
         top_p=req.top_p,
+        top_k=req.top_k,
         seed=req.seed,
     )
 

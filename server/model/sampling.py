@@ -12,6 +12,7 @@ class SamplingParams:
     max_new_tokens: int
     temperature: float
     top_p: float
+    top_k: int = 0
     seed: int | None = None
 
 
@@ -19,6 +20,7 @@ def build_sampling_params(
     max_new_tokens: int,
     temperature: float,
     top_p: float,
+    top_k: int = 0,
     seed: int | None = None,
 ) -> SamplingParams:
     """Builds a SamplingParams object from the given parameters."""
@@ -26,6 +28,7 @@ def build_sampling_params(
         max_new_tokens=max_new_tokens,
         temperature=temperature,
         top_p=top_p,
+        top_k=top_k,
         seed=seed,
     )
 
@@ -103,6 +106,92 @@ def sample_token(
             torch.softmax(scaled_logits, dim=-1), num_samples=1, generator=generator
         ).item()
     )
+
+
+def _check_param(name: str, tensor: torch.Tensor, batch_size: int) -> None:
+    if tensor.shape != (batch_size,):
+        raise ValueError(
+            f"Expected {name} shape [{batch_size}], got {tuple(tensor.shape)}"
+        )
+
+
+@torch.inference_mode()
+def sample_tokens(
+    logits: torch.Tensor,  # [B, V]
+    temperature: torch.Tensor,  # [B]
+    top_k: torch.Tensor,  # [B], 0 disables
+    top_p: torch.Tensor,  # [B], 1.0 disables
+    uniforms: torch.Tensor,  # [B] in [0, 1)
+) -> torch.Tensor:
+    """Sample one token per row, in one batched pass, with no GPU->CPU sync.
+
+    Filtering order is top-k first, then top-p over the survivors, matching
+    vLLM/SGLang/HF.  All randomness enters through `uniforms`, so the function is
+    pure: identical arguments always produce identical outputs, and a row's token
+    never depends on who else is in the batch, avoiding the batch variant issue
+    identified from https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/
+
+    Args:
+        logits: [B, vocab_size] raw logits for the next token of each sequence.
+        temperature: per-row temperature; rows <= 0 are greedy (plain argmax).
+        top_k: per-row top-k cutoff; 0 (or >= vocab_size) disables it.
+        top_p: per-row nucleus threshold; 1.0 disables it.
+        uniforms: per-row uniform noise in [0, 1), typically from
+            `determinism.uniforms_from_seeds`.
+
+    Returns:
+        [B] int64 tensor of sampled token ids, on the same device as `logits`.
+    """
+    if logits.ndim != 2:
+        raise ValueError(f"Expected logits shape [B, vocab_size], got {logits.ndim}D")
+
+    batch_size, vocab_size = logits.shape
+    _check_param("temperature", temperature, batch_size)
+    _check_param("top_k", top_k, batch_size)
+    _check_param("top_p", top_p, batch_size)
+    _check_param("uniforms", uniforms, batch_size)
+
+    # Per-row temperature scaling, in float32 for stable softmax/cumsum math.
+    scaled_logits = logits.float() / temperature.float().clamp(
+        min=LOWEST_TEMPERATURE
+    ).unsqueeze(-1)
+
+    # stable=True makes ties break by index, which is the one place this filter
+    # math could otherwise be nondeterministic on CUDA.
+    sorted_logits, sorted_indices = torch.sort(
+        scaled_logits, dim=-1, descending=True, stable=True
+    )
+
+    # top-k: drop everything ranked at or beyond k. top_k == 0 and top_k >= V
+    # both no-op through this same expression, so there is no per-row branching.
+    ranks = torch.arange(vocab_size, device=logits.device).unsqueeze(0)
+    effective_k = torch.where(top_k > 0, top_k, vocab_size).unsqueeze(-1)
+    sorted_logits = sorted_logits.masked_fill(ranks >= effective_k, float("-inf"))
+
+    sorted_probs = torch.softmax(sorted_logits, dim=-1)
+
+    # top-p: drop tokens whose cumulative mass *before* them already exceeds
+    # top_p. Column 0 is always kept, so no row can end up empty.
+    cumulative = torch.cumsum(sorted_probs, dim=-1)
+    remove = (cumulative - sorted_probs) > top_p.unsqueeze(-1)
+    remove[:, 0] = False
+    sorted_probs = sorted_probs.masked_fill(remove, 0.0)
+
+    # Inverse-CDF pick. Scaling the uniform by the total surviving mass
+    # renormalizes implicitly, so no separate divide is needed.
+    cdf = torch.cumsum(sorted_probs, dim=-1)
+    targets = (uniforms.float().unsqueeze(-1) * cdf[:, -1:]).contiguous()
+    picked_rank = torch.searchsorted(cdf.contiguous(), targets).clamp(
+        max=vocab_size - 1
+    )
+
+    # Column 0 of the stably-sorted order is the argmax, with ties broken to the
+    # lowest index -- exactly what torch.argmax returns. So greedy rows cost no
+    # extra kernel.
+    greedy_rank = torch.zeros_like(picked_rank)
+    rank = torch.where(temperature.unsqueeze(-1) <= 0, greedy_rank, picked_rank)
+
+    return sorted_indices.gather(-1, rank).squeeze(-1)
 
 
 def top_p_sample_rejection(

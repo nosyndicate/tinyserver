@@ -3,10 +3,12 @@ from typing import Callable, cast
 
 import pytest
 from fastapi import HTTPException, Request
+from pydantic import ValidationError
 
 from server.api import routes
 from server.api.routes import (
     _await_generation,
+    _build_request_state,
     _stream_generation,
     _submit_or_fail,
 )
@@ -79,6 +81,21 @@ def make_generate_request(prompt: str = "hello") -> GenerateRequest:
     )
 
 
+def test_top_k_defaults_to_disabled() -> None:
+    assert GenerateRequest(prompt="hi").top_k == 0
+
+
+def test_negative_top_k_is_rejected() -> None:
+    with pytest.raises(ValidationError):
+        GenerateRequest(prompt="hi", top_k=-1)
+
+
+def test_top_k_reaches_sampling_params() -> None:
+    req = GenerateRequest(prompt="hi", max_new_tokens=1, top_k=5)
+    state = _build_request_state(req, device="cpu")
+    assert state.sampling_params.top_k == 5
+
+
 def test_submit_or_fail_maps_worker_shutting_down_to_503() -> None:
     # stop() sets the shutdown event without ever starting the worker thread,
     # so the next submit() raises WorkerShuttingDown for real.
@@ -119,9 +136,7 @@ def test_submit_or_fail_happy_path_returns_state() -> None:
 def make_state(request_id: str = "req-1") -> GenerationRequestState:
     return GenerationRequestState(
         request_id=request_id,
-        sampling_params=SamplingParams(
-            max_new_tokens=8, temperature=0.0, top_p=1.0
-        ),
+        sampling_params=SamplingParams(max_new_tokens=8, temperature=0.0, top_p=1.0),
         prompt="hello",
     )
 

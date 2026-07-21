@@ -60,6 +60,7 @@ def generate(req: GenerateRequest, request: Request) -> GenerateResponse:
         max_new_tokens=req.max_new_tokens,
         temperature=req.temperature,
         top_p=req.top_p,
+        top_k=req.top_k,
         seed=req.seed,
     )
 
@@ -108,6 +109,7 @@ def generate_stream(req: GenerateRequest, request: Request) -> StreamingResponse
         max_new_tokens=req.max_new_tokens,
         temperature=req.temperature,
         top_p=req.top_p,
+        top_k=req.top_k,
         seed=req.seed,
     )
 
