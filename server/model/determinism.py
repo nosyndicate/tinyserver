@@ -53,18 +53,26 @@ def uniform_from_hash(seed: int, step: int) -> float:
 
 def uniforms_from_seeds(
     seeds: Sequence[int],
-    step: int,
+    steps: Sequence[int],
     device: str | torch.device = "cpu",
-    dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """Build the per-row uniform noise tensor [B] for a batched sampling step.
 
-    Pure function of (seeds, step): row i's value depends only on `seeds[i]` and
-    `step`, so a request draws the same noise regardless of batch size or of
-    which row it lands on.
+    Pure function of (seeds, steps): row i's value depends only on `seeds[i]`
+    and `steps[i]`, so a request draws the same noise regardless of batch
+    size, which row it lands on, or what step other rows in the batch are at.
+    Requests are admitted at different times, so their per-request step
+    counters (output-token counts) generally differ within a batch.
+
+    Always float32: `_MAX_UNIFORM` is calibrated to the float32 mantissa
+    width, so a wider dtype would just add fake precision.
     """
-    values = [uniform_from_hash(seed, step) for seed in seeds]
-    return torch.tensor(values, dtype=dtype, device=device)
+    if len(seeds) != len(steps):
+        raise ValueError(
+            f"seeds and steps must be the same length, got {len(seeds)} and {len(steps)}"
+        )
+    values = [uniform_from_hash(seed, int(step)) for seed, step in zip(seeds, steps)]
+    return torch.tensor(values, dtype=torch.float32, device=device)
 
 
 def configure_deterministic_mode() -> None:
