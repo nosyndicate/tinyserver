@@ -1,4 +1,5 @@
 import logging
+import random
 import uuid
 from collections import deque
 from dataclasses import dataclass
@@ -26,9 +27,10 @@ from server.executor.types import (
     SequenceBatchTask,
 )
 from server.metrics.timers import now_ns
+from server.model.determinism import uniforms_from_seeds
 from server.model.inference_context import InferenceContext, inference_context
 from server.model.prefill_helpers import build_prefill_inputs
-from server.model.sampling import sample_token
+from server.model.sampling import sample_token, sample_tokens
 from server.model.types import ModelBackend
 
 logger = logging.getLogger(__name__)
@@ -364,9 +366,28 @@ class ScheduleInferenceEngine:
 
     def _admit(self, req: GenerationRequestState, seq: Sequence) -> None:
         """Track a request and hand its sequence to the scheduler's waiting list."""
+        # Unseeded requests still need a concrete integer seed for the batched
+        # counter-based noise source. Draw a stable per-request salt once here
+        # (engine thread, each request passes through exactly once): reproducible
+        # across the request's decode steps, random across requests.
+        if req.sampling_params.seed is None and req.noise_salt is None:
+            req.noise_salt = random.getrandbits(63)
         self._all_requests[req.request_id] = RequestContext(request=req, sequence=seq)
         self._seq_to_request[seq.sequence_id] = req
         self._scheduler.add(seq)
+
+    def _noise_seed(self, request_state: GenerationRequestState) -> int:
+        """Effective sampling seed: the request's seed, else its per-request salt.
+
+        The salt is normally assigned at admission; assign it lazily here too so
+        any request reaching the sampler always has a concrete integer seed.
+        """
+        seed = request_state.sampling_params.seed
+        if seed is not None:
+            return seed
+        if request_state.noise_salt is None:
+            request_state.noise_salt = random.getrandbits(63)
+        return request_state.noise_salt
 
     def _try_admit(
         self, candidates: deque[tuple[GenerationRequestState, Sequence]]
@@ -482,9 +503,7 @@ class ScheduleInferenceEngine:
         """
         if self._pending:
             self._pending = deque(
-                (req, seq)
-                for (req, seq) in self._pending
-                if not req.cancelled.is_set()
+                (req, seq) for (req, seq) in self._pending if not req.cancelled.is_set()
             )
 
         # Snapshot: _cleanup_request mutates _all_requests during iteration.
@@ -635,6 +654,16 @@ class ScheduleInferenceEngine:
         token_id = sample_token(
             logits, request_state.sampling_params, request_state.generator
         )
+        return self._decode_result_for_token(token_id, request_state)
+
+    def _decode_result_for_token(
+        self, token_id: int, request_state: GenerationRequestState
+    ) -> DecodeResult:
+        """Turn a sampled ``token_id`` into a ``DecodeResult`` (EOS/detok/max-len).
+
+        Shared by the per-row prefill path (``_sample_one``) and the batched
+        decode path (``_post_decode``), so both apply identical finish logic.
+        """
         if token_id == self._backend.tokenizer.eos_token_id:
             return DecodeResult(
                 token_id=token_id, token="", finish_reason=FinishReason.EOS
@@ -727,15 +756,53 @@ class ScheduleInferenceEngine:
         (the value passed as ``position_id`` in ``_prepare_decode``), so we
         advance ``num_tokens`` by one to reflect the new cached length before
         the next decode step. ``out.logits`` has one row per sequence.
+
+        The whole batch is sampled in a single ``sample_tokens`` call with one
+        ``.tolist()`` sync, replacing the old per-row ``.item()`` loop (cost C1
+        in the engine-loop plan). Randomness is deterministic and
+        batch-invariant: each row draws from ``(its seed, its output-token
+        count)`` via ``uniforms_from_seeds``, independent of batch composition.
         """
-        for i, seq in enumerate(sequences):
-            request_state = self._seq_to_request[seq.sequence_id]
+        batch_size = len(sequences)
+        if batch_size == 0:
+            return
+
+        request_states = [self._seq_to_request[seq.sequence_id] for seq in sequences]
+        device = out.logits.device
+        logits = out.logits[0, :batch_size, :]  # [B, V]
+
+        temperature = torch.tensor(
+            [rs.sampling_params.temperature for rs in request_states],
+            dtype=torch.float32,
+            device=device,
+        )
+        top_k = torch.tensor(
+            [rs.sampling_params.top_k for rs in request_states],
+            dtype=torch.long,
+            device=device,
+        )
+        top_p = torch.tensor(
+            [rs.sampling_params.top_p for rs in request_states],
+            dtype=torch.float32,
+            device=device,
+        )
+        # step = the request's output-token count so far; output_tokens is
+        # appended inside on_token *after* this call, so it is the correct
+        # 0-based step index for the token being drawn now.
+        seeds = [self._noise_seed(rs) for rs in request_states]
+        steps = [rs.num_output_tokens for rs in request_states]
+        uniforms = uniforms_from_seeds(seeds, steps, device=device)
+
+        # One batched sample, one sync. A failure inside this math would have
+        # poisoned every row anyway, so it is left to propagate to run()'s fatal
+        # handler; per-row params are already validated at the API layer.
+        token_ids = sample_tokens(logits, temperature, top_k, top_p, uniforms).tolist()
+
+        for seq, request_state, token_id in zip(sequences, request_states, token_ids):
             # The input token was committed to the cache during the forward.
             seq.num_tokens += 1
-
-            logit = out.logits[0, i, :].unsqueeze(0)
             try:
-                result = self._sample_one(logit, request_state)
+                result = self._decode_result_for_token(token_id, request_state)
                 seq.generated_token_ids.append(result.token_id)
                 self._emitter.on_token(
                     request_state,
@@ -752,7 +819,7 @@ class ScheduleInferenceEngine:
             except Exception:
                 # Fail just this request instead of tearing down the worker.
                 logger.exception(
-                    "Failed to sample next token for request %s",
+                    "Failed to finalize token for request %s",
                     request_state.request_id,
                 )
                 seq.finished = True

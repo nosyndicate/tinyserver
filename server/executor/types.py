@@ -193,6 +193,11 @@ class GenerationRequestState:
 
     generator: torch.Generator | None = None
 
+    # Stable per-request salt assigned at admission for unseeded requests, so the
+    # batched counter-based noise source has a concrete integer seed. Reproducible
+    # across the request's decode steps, random across requests.
+    noise_salt: int | None = None
+
     # Set by the HTTP thread (Worker.cancel) on timeout/disconnect; polled by the
     # engine thread. An Event is thread-safe, so no lock is needed.
     cancelled: threading.Event = field(default_factory=threading.Event)

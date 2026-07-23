@@ -692,6 +692,75 @@ def test_post_decode_isolates_sampling_failure() -> None:
     assert any(isinstance(e, ErrorEvent) for e in drain_events(req_a))
 
 
+def test_post_decode_mixed_greedy_sampled_topk_batch() -> None:
+    """A batch mixing a greedy row, a sampled top-k=1 row, and a sampled
+    top-k=2 row all decode correctly in one batched sample_tokens call."""
+    engine, *_ = _make_engine(prompt_tokens=[1, 2, 3])
+
+    req_greedy = GenerationRequestState(
+        request_id="greedy",
+        sampling_params=SamplingParams(max_new_tokens=5, temperature=0.0, top_p=1.0),
+        prompt="hello",
+        enqueued_ns=0,
+    )
+    # top_k=1 collapses the nucleus to the single argmax, so its sampled token
+    # is deterministic even though temperature > 0.
+    req_k1 = GenerationRequestState(
+        request_id="k1",
+        sampling_params=SamplingParams(
+            max_new_tokens=5, temperature=1.0, top_p=1.0, top_k=1, seed=123
+        ),
+        prompt="hello",
+        enqueued_ns=0,
+    )
+    # top_k=2 leaves two survivors; the picked token must be one of them.
+    req_k2 = GenerationRequestState(
+        request_id="k2",
+        sampling_params=SamplingParams(
+            max_new_tokens=5, temperature=1.0, top_p=1.0, top_k=2, seed=7
+        ),
+        prompt="hello",
+        enqueued_ns=0,
+    )
+
+    reqs = [req_greedy, req_k1, req_k2]
+    seqs = []
+    for i, req in enumerate(reqs):
+        seq = Sequence(
+            sequence_id=f"s{i}",
+            prompt_token_ids=[1, 2, 3],
+            generated_token_ids=[4],
+            num_prompt_tokens=3,
+            num_tokens=3,
+            max_new_tokens=5,
+            block_table=[i],
+            state=SequenceState.RUNNING,
+        )
+        engine._seq_to_request[seq.sequence_id] = req
+        seqs.append(seq)
+
+    # Row 0 argmax -> 5; row 1 argmax -> 9; row 2 top-2 -> {12, 13}.
+    logits = torch.full((1, 3, VOCAB), -10.0, dtype=torch.float32)
+    logits[0, 0, 5] = 1.0
+    logits[0, 1, 9] = 1.0
+    logits[0, 2, 12] = 2.0
+    logits[0, 2, 13] = 1.5
+    out = _FakeOutput(logits)
+
+    engine._post_decode(out, seqs)
+
+    assert seqs[0].generated_token_ids == [4, 5]  # greedy -> exact argmax
+    assert seqs[1].generated_token_ids == [4, 9]  # top_k=1 -> forced argmax
+    assert seqs[2].generated_token_ids[-1] in {12, 13}  # top_k=2 -> allowed set
+
+    for req in reqs:
+        assert req.status != RequestStatus.FAILED
+        assert req.num_output_tokens == 1
+    for seq in seqs:
+        assert seq.num_tokens == 4  # advanced by one
+        assert seq.finished is False
+
+
 def _make_resumable_request(
     request_id: str, max_new_tokens: int, start_ns: int, num_prompt_tokens: int
 ) -> GenerationRequestState:
