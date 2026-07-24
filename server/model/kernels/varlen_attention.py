@@ -5,6 +5,22 @@ import triton
 import triton.language as tl
 
 
+def _prune_flash_attn_varlen_configs(configs, named_args, **kwargs):
+    q = named_args["q_ptr"]
+    block_d = kwargs["BLOCK_D"]
+    if q.dtype == torch.float32 and block_d >= 128:
+        return [config for config in configs if config.kwargs["BLOCK_M"] == 32]
+    return configs
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}),
+    ],
+    key=["head_dim", "num_heads_q", "num_heads_k", "causal", "BLOCK_D"],
+    prune_configs_by={"early_config_prune": _prune_flash_attn_varlen_configs},
+)
 @triton.jit
 def _flash_attn_varlen_kernel(
     q_ptr,
@@ -183,17 +199,10 @@ def flash_attn_varlen_func(
     if softmax_scale is None:
         softmax_scale = 1.0 / (head_dim**0.5)
 
-    # Keep the query tile modest for fp32 Qwen3 validation runs.  With
-    # BLOCK_M=64 and head_dim rounded to 128, Triton asks for ~104 KiB of
-    # shared memory on some GPUs, just above a 99 KiB per-block limit.
-    BLOCK_M: int = 32
-    BLOCK_N: int = 32
     BLOCK_D = triton.next_power_of_2(head_dim)
 
     out = torch.empty_like(q)
-    # grid: (num_tokens_per_seq, batch, num_heads)
-    num_tokens_per_seq = triton.cdiv(max_seqlen_q, BLOCK_M)
-    grid = (num_tokens_per_seq, batch, num_heads_q)
+    grid = lambda META: (triton.cdiv(max_seqlen_q, META["BLOCK_M"]), batch, num_heads_q)
     _flash_attn_varlen_kernel[grid](
         q,
         k,
@@ -210,8 +219,6 @@ def flash_attn_varlen_func(
         head_dim,
         causal,
         softmax_scale,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
         BLOCK_D=BLOCK_D,
     )
 
