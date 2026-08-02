@@ -9,7 +9,8 @@ dependencies = [
   "pydantic>=2.0",
   "prettytable>=3.12",
   "torch",
-  "transformers>=4.51",
+  "transformers>=4.51,<5",
+  "protobuf>=4.25",
   "accelerate",  # optional but helpful
 ]
 
@@ -22,6 +23,10 @@ dev = [
   "ruff>=0.1.0",
   "mypy>=1.0.0",
 ]
+
+[tool.setuptools.packages.find]
+include = ["server*", "kernels*"]
+namespaces = true
 
 [tool.uvicorn]
 factory = false
