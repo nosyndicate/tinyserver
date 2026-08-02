@@ -1,18 +1,3 @@
-"""Consumer-side async primitives: per-request mailboxes and their routing table.
-
-This is the *other half* of :class:`~server.executor.types.EventSink`. The engine
-side emits events into a sink; this side hands them to the coroutine that is
-awaiting them for a particular request.
-
-**This file is transport-agnostic on purpose.** Right now events reach it from an
-engine thread via a shared ``queue.Queue`` plus the pump thread
-(``server/api/pump.py``). Later the engine moves into its own process and events
-arrive over a socket instead — at which point the pump is deleted and a recv
-coroutine calls :meth:`CollectorRegistry.dispatch` directly. Nothing in this
-module changes. That is why there are deliberately **no ``queue`` or ``threading``
-imports here**: if you find yourself needing one, it belongs in ``pump.py``.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -31,40 +16,42 @@ class OutputCollector:
     few milliseconds. A queue wakes its waiter once per item, so a burst of ten
     tokens costs ten wake-ups and ten task switches. An Event + buffer lets a
     burst **coalesce**: the producer appends ten times and sets the flag, and the
-    single waiter drains all ten with one wake-up. This is the shape both vLLM
-    (``RequestOutputCollector``) and SGLang converged on.
+    single waiter drains all ten with one wake-up.
 
-    **Threading contract: every method here runs on the event loop thread.**
+    Threading contract: every method here runs on the event loop thread.
     ``put`` is never called from the engine thread directly — the pump routes it
     through ``loop.call_soon_threadsafe``, and in the process-split world the
     recv coroutine is already on the loop. That single-threaded discipline is
     what lets this class hold no lock at all.
 
-    It also assumes a **single waiter**: exactly one handler coroutine awaits a
-    given request's collector. Two concurrent ``get`` calls on the same instance
-    would race on ``clear()`` and is not a supported use.
+    Only one coroutine may call ``get`` at a time for each collector. If two
+    coroutines call it concurrently, they may both try to clear the event, so
+    events could be handled incorrectly.
     """
 
     def __init__(self) -> None:
-        # Invariant maintained by put/get below:
-        #     buffer non-empty  <=>  event set
-        # It holds because both methods only ever run on the one loop thread, so
-        # no one can observe the buffer and the flag mid-update.
+        # `put` and `get` keep these states in sync: when the buffer has events,
+        # the event is set; when the buffer is empty, the event is clear. Both
+        # methods run on the same event-loop thread, so no code can see them
+        # partway through an update.
         self._event = asyncio.Event()
         self._buffer: deque[Event] = deque()
 
     def put(self, event: Event) -> None:
         """Deliver one event to whoever is awaiting this request.
 
-        Loop-thread only (see the class docstring). Cheap and non-blocking: the
-        buffer is unbounded, so a producer is never throttled by a slow client
-        here — backpressure is the engine's admission control, not this queue's.
+        Cheap and non-blocking: the buffer is unbounded, so a producer is never
+        throttled by a slow client here — backpressure is the engine's admission
+        control, not this queue's.
         """
         self._buffer.append(event)
         self._event.set()
 
     async def get(self, timeout: float | None = None) -> Event:
         """Return the next event, waiting at most ``timeout`` seconds for one.
+        If _buffer already has an event, this function immediately removes and
+        returns it. It does not await, so the coroutine keeps running without
+        yielding control back to the asyncio event loop.
 
         Raises:
             TimeoutError: if no event arrives in time. Callers map this to the
@@ -74,14 +61,15 @@ class OutputCollector:
                 catches it.)
         """
         if not self._buffer:
-            # Only pay for a suspension when there is genuinely nothing to
-            # return. Mid-stream this branch is usually skipped: the pump has
-            # already buffered the next token, so we hand it back without ever
-            # yielding to the loop. (vLLM's `get_nowait` fast path.)
+            # Wait only when there is no buffered event to return. During
+            # streaming, the pump often buffers the next token first, so
+            # `get` can return it immediately without waiting. Only when
+            # the buffer is empty does it wait on _event, which suspends
+            # the coroutine until a new event arrives.
             await asyncio.wait_for(self._event.wait(), timeout)
 
-        # Safe by the invariant: waking from `_event.wait()` implies a `put`
-        # happened, and nothing else can have consumed it (single waiter).
+        # Waking from `_event.wait()` implies a `put` happened,
+        # and nothing else can have consumed it (single waiter).
         event = self._buffer.popleft()
         if not self._buffer:
             # Drained — re-arm so the next `get` actually waits instead of
@@ -91,16 +79,16 @@ class OutputCollector:
 
 
 class CollectorRegistry:
-    """``request_id`` → :class:`OutputCollector` routing table.
+    """`request_id` → `OutputCollector` routing table.
 
     The producer side no longer knows which consumer an event belongs to: events
     from every in-flight request travel one shared path, tagged with their
-    ``request_id``. This is the lookup that puts them back on the right coroutine.
+    `request_id`. This is the lookup that puts them back on the right coroutine.
 
-    Like :class:`OutputCollector`, **all access happens on the event loop
-    thread** — ``register``/``unregister`` from the request handlers, ``dispatch``
-    from the pump's ``call_soon_threadsafe`` callback (which the loop runs on the
-    loop thread) — so a plain ``dict`` with no lock is correct.
+    Like `OutputCollector`, all access happens on the event loop
+    thread — `register`/`unregister` from the request handlers, `dispatch`
+    from the pump's `call_soon_threadsafe` callback (which the loop runs on the
+    loop thread) — so a plain `dict` with no lock is correct.
     """
 
     def __init__(self) -> None:
@@ -122,7 +110,7 @@ class CollectorRegistry:
 
     def unregister(self, request_id: str) -> None:
         """Forget this request's mailbox. Idempotent, so it is safe in a
-        ``finally:`` block that may run after an earlier cleanup."""
+        `finally:` block that may run after an earlier cleanup."""
         self._collectors.pop(request_id, None)
 
     def dispatch(self, event: Event) -> None:
@@ -141,14 +129,14 @@ class CollectorRegistry:
         collector.put(event)
 
     def fail_all(self, error_message: str) -> None:
-        """Push an ``ErrorEvent`` to every live collector.
+        """Push an `ErrorEvent` to every live collector.
 
         Used when no further events can ever arrive — server shutdown now, and a
         dead engine process later. Without this, handlers would sit awaiting
         their full timeout for events that will never come.
 
         Collectors are left registered; each handler still unregisters itself in
-        its own ``finally:``. Iterating a snapshot keeps that harmless even if a
+        its own `finally:`. Iterating a snapshot keeps that harmless even if a
         woken handler unregisters while we are still looping.
         """
         for request_id, collector in list(self._collectors.items()):

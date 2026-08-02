@@ -1,4 +1,6 @@
-"""The thread → event-loop bridge. **This file is scaffolding, by design.**
+"""The thread → event-loop bridge.
+
+Temporary code that will be deleted when we start having real multiprocessing.
 
 The engine runs on its own thread and knows nothing about asyncio; the HTTP
 handlers are coroutines on the event loop. Those two worlds cannot touch each
@@ -10,13 +12,6 @@ Note the shape: **one** thread for the whole server, not one per request. That
 is the entire point of the exercise — a waiting request is now a suspended
 coroutine costing a few hundred bytes, instead of a parked OS thread from
 FastAPI's bounded worker pool.
-
-When the engine later moves into its own process, this file and its test are
-deleted outright: a ``recv`` coroutine on a socket replaces the thread and calls
-``registry.dispatch`` itself, with no ``call_soon_threadsafe`` in sight. That is
-why the routing logic lives in :class:`~server.api.collector.CollectorRegistry`
-and only the thread plumbing lives here — the throwaway part is kept small and
-quarantined.
 """
 
 from __future__ import annotations
@@ -42,11 +37,9 @@ class OutputPump:
     """Drains the engine's shared event queue onto the event loop.
 
     Args:
-        queue: The one server-wide queue that every request's
-            :class:`~server.executor.sinks.SharedQueueSink` emits into.
-        registry: Where to route each event, by ``request_id``.
-        poll_timeout_s: See :data:`_POLL_TIMEOUT_S`. Tests lower it to keep
-            ``stop()`` snappy.
+        queue: The one server-wide queue that every request emits into.
+        registry: Where to route each event, by `request_id`.
+        poll_timeout_s: See `_POLL_TIMEOUT_S`.
     """
 
     def __init__(
@@ -63,13 +56,7 @@ class OutputPump:
         self._loop: asyncio.AbstractEventLoop | None = None
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
-        """Capture the loop and spawn the pump thread.
-
-        The loop is passed in rather than discovered because the pump thread
-        cannot call ``asyncio.get_running_loop()`` — that only works *on* the
-        loop's own thread. The caller (the app's lifespan handler) does run on
-        the loop, so it captures the reference once here for the pump's lifetime.
-        """
+        """Capture the loop and spawn the pump thread."""
         if self._thread is not None:
             raise RuntimeError("OutputPump.start() called twice")
 
@@ -84,18 +71,7 @@ class OutputPump:
         self._thread.start()
 
     def stop(self) -> None:
-        """Stop the thread, then drain whatever is left on the queue.
-
-        The drain matters: ``Worker.stop()`` emits a final ``ErrorEvent`` per
-        in-flight request as it cancels them, and those land on the shared queue.
-        Killing the thread without draining would silently swallow them and leave
-        the corresponding handlers waiting out their full timeout. Hence the
-        shutdown order in lifespan: stop the worker first, then the pump.
-
-        Blocks the caller (and therefore the loop, since lifespan shutdown runs
-        on it) for up to roughly ``poll_timeout_s``. That is acceptable at
-        shutdown, when there is no traffic left to serve.
-        """
+        """Stop the thread, then drain whatever is left on the queue."""
         self._stopping.set()
 
         if self._thread is not None:
@@ -106,6 +82,10 @@ class OutputPump:
                 logger.warning("output pump thread did not exit; abandoning it")
             self._thread = None
 
+        # Drain any events that arrived after the stop signal but before the
+        # thread actually exited. This is the only way to guarantee that every
+        # ErrorEvent from the worker is delivered to its handler, even if the
+        # pump thread was still mid-`get` when the stop signal arrived.
         while True:
             try:
                 event = self._queue.get_nowait()
@@ -125,12 +105,9 @@ class OutputPump:
             self._dispatch(event)
 
     def _dispatch(self, event: Event) -> None:
-        """Schedule ``registry.dispatch(event)`` to run on the loop thread.
+        """Schedule `registry.dispatch(event)` to run on the loop thread.
 
-        ``call_soon_threadsafe`` is the only asyncio call that is legal from
-        another thread. It does not run the callback; it queues it for the loop,
-        which is why the actual routing (and every ``OutputCollector`` mutation)
-        still happens single-threaded on the loop.
+        Using call_soon_threadsafe is the only way to safely cross the thread boundary.
         """
         assert self._loop is not None, "OutputPump.start() must be called first"
 

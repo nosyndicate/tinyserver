@@ -1,6 +1,6 @@
 """Tests for the async consumer primitives.
 
-``asyncio_mode = "auto"`` in pyproject means a bare ``async def test_...`` runs on
+`asyncio_mode = "auto"` in pyproject means a bare `async def test_...` runs on
 a fresh event loop; no decorator needed.
 """
 
