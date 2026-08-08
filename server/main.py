@@ -1,6 +1,7 @@
 """App Entrypoint"""
 
 import argparse
+import asyncio
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -8,6 +9,8 @@ import torch
 import uvicorn
 from fastapi import FastAPI
 
+from server.api.collector import CollectorRegistry
+from server.api.pump import OutputPump
 from server.api.routes import (
     health_router,
     v2_router,
@@ -22,6 +25,7 @@ from server.executor.engine import (
 )
 from server.executor.executor import BatchExecutor, Executor
 from server.executor.scheduler import Scheduler
+from server.executor.sinks import SharedQueueSink
 from server.executor.types import BatchEngineConfig, EngineConfig
 from server.executor.worker import Worker
 from server.model.block_manager import BlockManager
@@ -76,6 +80,49 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _build_worker(
+    version: str, config: ModelConfig, args: argparse.Namespace
+) -> Worker:
+    """Construct the queue-backed worker for one API version.
+
+    Kept out of ``lifespan`` so the pump/registry lifecycle around it is written
+    once instead of per version. This is also the seam the engine child process
+    will need later: it is exactly the block that has to move across the process
+    boundary, and it depends only on plain config, never on the app.
+    """
+    if version == "v4":
+        # v4 uses the paged-attention HFBackend instead of ModelRunner; the
+        # runner is skipped entirely so only one copy of the model is loaded.
+        backend = HFBackend.load_model(config)
+        block_manager = BlockManager(
+            total_blocks=backend.num_blocks,
+            block_size=backend.block_size,
+        )
+        scheduler = Scheduler(
+            block_manager,
+            max_waiting=args.max_waiting,
+            max_num_sequences=args.max_num_sequences,
+            max_num_tokens=args.max_num_tokens,
+        )
+        return Worker(
+            ScheduleInferenceEngine(scheduler, backend),
+            max_queue_size=64,
+        )
+
+    runner = load_hf_model(config)
+    if version == "v2":
+        return Worker(
+            SimpleInferenceEngine(Executor(runner), EngineConfig()),
+            max_queue_size=64,
+        )
+    if version == "v3":
+        return Worker(
+            BatchInferenceEngine(BatchExecutor(runner), BatchEngineConfig()),
+            max_queue_size=64,
+        )
+    raise ValueError(f"No queue-backed worker for api version {version!r}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
@@ -99,62 +146,43 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.runner = None
     app.state.device = config.device
     app.state.worker = None
+    app.state.registry = None
+    app.state.sink = None
 
-    if version == "v4":
-        # v4 uses the paged-attention HFBackend instead of ModelRunner; the
-        # runner is skipped entirely so only one copy of the model is loaded.
-        backend = HFBackend.load_model(config)
-        block_manager = BlockManager(
-            total_blocks=backend.num_blocks,
-            block_size=backend.block_size,
-        )
-        scheduler = Scheduler(
-            block_manager,
-            max_waiting=args.max_waiting,
-            max_num_sequences=args.max_num_sequences,
-            max_num_tokens=args.max_num_tokens,
-        )
-        worker = Worker(
-            ScheduleInferenceEngine(scheduler, backend),
-            max_queue_size=64,
-        )
-        worker.start()
-        app.state.worker = worker
+    pump: OutputPump | None = None
 
-        yield
-
-        worker.stop()
-        return
-
-    runner = load_hf_model(config)
     if version == "v1":
-        app.state.runner = runner
+        # The preserved phase-1 baseline: direct, unqueued, no worker to pump.
+        app.state.runner = load_hf_model(config)
+    else:
+        registry = CollectorRegistry()
+        sink = SharedQueueSink()
+        app.state.registry = registry
+        app.state.sink = sink
 
-    if version == "v2":
-        executor = Executor(runner)
-        engine_config = EngineConfig()
-        worker = Worker(
-            SimpleInferenceEngine(executor, engine_config),
-            max_queue_size=64,
-        )
+        worker = _build_worker(version, config, args)
         worker.start()
         app.state.worker = worker
-    elif version == "v3":
-        batch_executor = BatchExecutor(runner)
-        engine_config = BatchEngineConfig()
-        worker = Worker(
-            BatchInferenceEngine(batch_executor, engine_config),
-            max_queue_size=64,
-        )
-        worker.start()
-        app.state.worker = worker
+
+        # lifespan itself runs on the event loop, so this is where the loop
+        # reference is captured — once, rather than per request.
+        pump = OutputPump(sink.queue, registry)
+        pump.start(asyncio.get_running_loop())
 
     # App is running now
     yield
 
-    # Everything after the yield runs on shutdown.
+    # Everything after the yield runs on shutdown. The order matters:
+    # `Worker.stop()` drains its inbound queue and cancels in-flight requests,
+    # emitting a final ErrorEvent per request *through the shared sink* — so the
+    # pump must still be alive to route them. `pump.stop()` then joins the thread
+    # and drains whatever is left, and `fail_all` wakes anyone still waiting.
     if app.state.worker is not None:
         app.state.worker.stop()
+    if pump is not None:
+        pump.stop()
+    if app.state.registry is not None:
+        app.state.registry.fail_all("Server is shutting down")
 
 
 def create_app(cli_args: argparse.Namespace) -> FastAPI:

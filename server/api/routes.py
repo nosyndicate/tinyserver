@@ -1,15 +1,17 @@
 import uuid
-from queue import Empty, Full
-from typing import Generator
+from queue import Full
+from typing import AsyncGenerator
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
+from server.api.collector import CollectorRegistry, OutputCollector
 from server.api.schema import GenerateRequest, GenerateResponse, StreamChunk
 from server.executor.types import (
     DoneEvent,
     ErrorEvent,
     Event,
+    EventSink,
     GenerationRequestState,
     TokenEvent,
 )
@@ -42,9 +44,35 @@ def _get_worker(request: Request) -> Worker:
     return worker
 
 
-def _build_request_state(req: GenerateRequest, device: str) -> GenerationRequestState:
+def _get_registry(request: Request) -> CollectorRegistry:
+    """
+    Retrieve the collector registry from the request's app state.
+    """
+    registry = request.app.state.registry
+    if registry is None:
+        raise RuntimeError("Collector registry not found in app state")
+    return registry
+
+
+def _get_sink(request: Request) -> EventSink:
+    """
+    Retrieve the server-wide event sink from the request's app state.
+    """
+    sink = request.app.state.sink
+    if sink is None:
+        raise RuntimeError("Event sink not found in app state")
+    return sink
+
+
+def _build_request_state(
+    req: GenerateRequest, device: str, sink: EventSink
+) -> GenerationRequestState:
     """
     Build a GenerationRequestState from the incoming request and device.
+
+    The state emits through the server-wide ``sink`` rather than a queue of its
+    own, so every request's events travel one path and are routed back by
+    ``request_id``.
     """
     sampling_params = build_sampling_params(
         max_new_tokens=req.max_new_tokens,
@@ -61,76 +89,95 @@ def _build_request_state(req: GenerateRequest, device: str) -> GenerationRequest
         sampling_params=sampling_params,
         prompt=req.prompt,
         generator=generator,
+        sink=sink,
     )
 
 
-def _await_generation(
-    state: GenerationRequestState, worker: Worker
+async def _await_generation(
+    state: GenerationRequestState,
+    worker: Worker,
+    collector: OutputCollector,
+    registry: CollectorRegistry,
+    timeout: float = _GENERATION_TIMEOUT_S,
 ) -> GenerateResponse:
     """
-    Wait on the request's output queue for a terminal event and build the
+    Await this request's collector for a terminal event and build the
     non-streaming response. Intermediate TokenEvents are discarded.
-    """
-    while True:
-        try:
-            event: Event = state.output_queue.get(timeout=_GENERATION_TIMEOUT_S)
-        except Empty:
-            # Client is giving up: tell the worker to stop decoding this request
-            # and free its KV blocks instead of running to max_new_tokens.
-            worker.cancel(state)
-            raise HTTPException(
-                status_code=504,
-                detail="Generation timed out.",
-            )
 
-        if isinstance(event, TokenEvent):
-            continue
-        elif isinstance(event, DoneEvent):
-            tokens_per_s = _compute_tokens_per_s(
-                event.num_output_tokens, event.total_ms
-            )
-
-            return GenerateResponse(
-                text=event.text,
-                prompt_tokens=event.num_prompt_tokens,
-                output_tokens=event.num_output_tokens,
-                ttft_ms=event.ttft,
-                total_ms=event.total_ms,
-                tokens_per_s=tokens_per_s,
-                queue_wait_ms=event.queue_wait_ms,
-                execution_ms=event.execution_ms,
-            )
-        elif isinstance(event, ErrorEvent):
-            raise HTTPException(
-                status_code=500,
-                detail=f"Generation failed: {event.error}",
-            )
-        else:
-            raise HTTPException(
-                status_code=500,
-                detail="Unexpected event type received from worker",
-            )
-
-
-def _stream_generation(
-    state: GenerationRequestState, worker: Worker
-) -> Generator[str, None, None]:
-    """
-    Consume the request's output queue and yield SSE chunks. The final token
-    is held until the terminal DoneEvent so the last chunk carries the same
-    timing metadata as the non-streaming endpoint.
-
-    The ``finally`` cancels the request on every exit path — timeout return,
-    ``GeneratorExit`` from a client disconnect, and normal completion. On
-    normal completion the request is already reaped, so cancel is a harmless
-    no-op; on abandonment it frees the KV blocks instead of decoding to
-    max_new_tokens.
+    Awaiting instead of blocking is the whole point: a waiting request is a
+    suspended coroutine, not a parked thread from the AnyIO pool that ``/health``
+    also needs.
     """
     try:
         while True:
             try:
-                event: Event = state.output_queue.get(timeout=_GENERATION_TIMEOUT_S)
-            except Empty:
+                event: Event = await collector.get(timeout=timeout)
+            except TimeoutError:
+                # Client is giving up: tell the worker to stop decoding this
+                # request and free its KV blocks instead of running to
+                # max_new_tokens.
+                worker.cancel(state)
+                raise HTTPException(
+                    status_code=504,
+                    detail="Generation timed out.",
+                )
+
+            if isinstance(event, TokenEvent):
+                continue
+            elif isinstance(event, DoneEvent):
+                tokens_per_s = _compute_tokens_per_s(
+                    event.num_output_tokens, event.total_ms
+                )
+
+                return GenerateResponse(
+                    text=event.text,
+                    prompt_tokens=event.num_prompt_tokens,
+                    output_tokens=event.num_output_tokens,
+                    ttft_ms=event.ttft,
+                    total_ms=event.total_ms,
+                    tokens_per_s=tokens_per_s,
+                    queue_wait_ms=event.queue_wait_ms,
+                    execution_ms=event.execution_ms,
+                )
+            elif isinstance(event, ErrorEvent):
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Generation failed: {event.error}",
+                )
+            else:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Unexpected event type received from worker",
+                )
+    finally:
+        # Nobody is listening any more; later events for this rid are dropped by
+        # the registry instead of piling up in an orphaned collector.
+        registry.unregister(state.request_id)
+
+
+async def _stream_generation(
+    state: GenerationRequestState,
+    worker: Worker,
+    collector: OutputCollector,
+    registry: CollectorRegistry,
+    timeout: float = _GENERATION_TIMEOUT_S,
+) -> AsyncGenerator[str, None]:
+    """
+    Consume this request's collector and yield SSE chunks. The final token
+    is held until the terminal DoneEvent so the last chunk carries the same
+    timing metadata as the non-streaming endpoint.
+
+    The ``finally`` cancels the request on every exit path — timeout return,
+    the ``GeneratorExit``/``CancelledError`` Starlette throws in on a client
+    disconnect, and normal completion. On normal completion the request is
+    already reaped, so cancel is a harmless no-op; on abandonment it frees the
+    KV blocks instead of decoding to max_new_tokens.
+    """
+    try:
+        while True:
+            try:
+                event: Event = await collector.get(timeout=timeout)
+            except TimeoutError:
                 error_chunk = StreamChunk(
                     token_str="",
                     is_first=False,
@@ -143,10 +190,8 @@ def _stream_generation(
             if isinstance(event, TokenEvent):
                 if event.is_last:
                     try:
-                        done_event = state.output_queue.get(
-                            timeout=_GENERATION_TIMEOUT_S
-                        )
-                    except Empty:
+                        done_event = await collector.get(timeout=timeout)
+                    except TimeoutError:
                         error_chunk = StreamChunk(
                             token_str="",
                             is_first=False,
@@ -215,87 +260,129 @@ def _stream_generation(
     finally:
         # No matter how we exit the generator:
         # - normal finish (DoneEvent and return)
-        # - timeout on output_queue.get
-        # - client disconnect (on yield, FastAPI raises GeneratorExit)
-        # cancel the request to free KV blocks
+        # - timeout awaiting the collector
+        # - client disconnect (Starlette throws GeneratorExit/CancelledError in
+        #   at the yield)
+        # cancel the request to free KV blocks, and stop routing to a collector
+        # nobody is reading.
         worker.cancel(state)
+        registry.unregister(state.request_id)
 
 
-def _submit_or_fail(request: Request, req: GenerateRequest) -> GenerationRequestState:
+def _submit_or_fail(
+    request: Request, req: GenerateRequest
+) -> tuple[GenerationRequestState, OutputCollector]:
     """
-    Submit the request state to the worker, raising an HTTPException if the
-    worker is at capacity.
+    Register this request's collector and submit it to the worker, raising an
+    HTTPException if the worker is at capacity.
+
+    Registration happens *before* submit: the engine can emit a first token as
+    soon as it accepts the request, and an event that arrives before its
+    collector exists would be dropped as an unknown rid.
+
+    Stays a plain ``def`` because ``Worker.submit`` is non-blocking
+    (``put_nowait``), so it is safe to call from a coroutine.
     """
     worker = _get_worker(request)
-    state = _build_request_state(req, device=request.app.state.device)
+    registry = _get_registry(request)
+    state = _build_request_state(
+        req, device=request.app.state.device, sink=_get_sink(request)
+    )
+    collector = registry.register(state.request_id)
     try:
         worker.submit(state)
     except Full:
+        registry.unregister(state.request_id)
         raise HTTPException(
             status_code=503,
             detail="Server at capacity. Please try again later.",
         )
     except WorkerShuttingDown:
+        registry.unregister(state.request_id)
         raise HTTPException(
             status_code=503,
             detail="Worker is shutting down. Please try again later.",
         )
-    return state
+    return state, collector
 
 
 @health_router.get("/health")
-def health() -> dict[str, bool]:
+async def health() -> dict[str, bool]:
+    """Liveness probe.
+
+    ``async`` on purpose: a sync ``def`` endpoint runs on the AnyIO threadpool,
+    which the blocking generate handlers used to exhaust — making the server
+    look dead while the GPU was idle.
+    """
     return {"ok": True}
 
 
 @v2_router.post("/generate_v2", response_model=GenerateResponse)
-def generate_v2(req: GenerateRequest, request: Request) -> GenerateResponse:
-    state = _submit_or_fail(request, req)
+async def generate_v2(req: GenerateRequest, request: Request) -> GenerateResponse:
+    state, collector = _submit_or_fail(request, req)
 
-    return _await_generation(state, _get_worker(request))
+    return await _await_generation(
+        state, _get_worker(request), collector, _get_registry(request)
+    )
 
 
 @v3_router.post("/generate_v3", response_model=GenerateResponse)
-def generate_v3(req: GenerateRequest, request: Request) -> GenerateResponse:
-    state = _submit_or_fail(request, req)
+async def generate_v3(req: GenerateRequest, request: Request) -> GenerateResponse:
+    state, collector = _submit_or_fail(request, req)
 
-    return _await_generation(state, _get_worker(request))
+    return await _await_generation(
+        state, _get_worker(request), collector, _get_registry(request)
+    )
 
 
 @v4_router.post("/generate_v4", response_model=GenerateResponse)
-def generate_v4(req: GenerateRequest, request: Request) -> GenerateResponse:
+async def generate_v4(req: GenerateRequest, request: Request) -> GenerateResponse:
     """Generate text via the paged-attention scheduled engine."""
-    state = _submit_or_fail(request, req)
+    state, collector = _submit_or_fail(request, req)
 
-    return _await_generation(state, _get_worker(request))
+    return await _await_generation(
+        state, _get_worker(request), collector, _get_registry(request)
+    )
 
 
 @v2_router.post("/generate/stream_v2", response_model=None)
-def generate_stream_v2(req: GenerateRequest, request: Request) -> StreamingResponse:
-    state = _submit_or_fail(request, req)
+async def generate_stream_v2(
+    req: GenerateRequest, request: Request
+) -> StreamingResponse:
+    state, collector = _submit_or_fail(request, req)
 
     return StreamingResponse(
-        _stream_generation(state, _get_worker(request)),
+        _stream_generation(
+            state, _get_worker(request), collector, _get_registry(request)
+        ),
         media_type="text/event-stream",
     )
 
 
 @v3_router.post("/generate/stream_v3", response_model=None)
-def generate_stream_v3(req: GenerateRequest, request: Request) -> StreamingResponse:
-    state = _submit_or_fail(request, req)
+async def generate_stream_v3(
+    req: GenerateRequest, request: Request
+) -> StreamingResponse:
+    state, collector = _submit_or_fail(request, req)
 
     return StreamingResponse(
-        _stream_generation(state, _get_worker(request)),
+        _stream_generation(
+            state, _get_worker(request), collector, _get_registry(request)
+        ),
         media_type="text/event-stream",
     )
 
 
 @v4_router.post("/generate/stream_v4", response_model=None)
-def generate_stream_v4(req: GenerateRequest, request: Request) -> StreamingResponse:
+async def generate_stream_v4(
+    req: GenerateRequest, request: Request
+) -> StreamingResponse:
     """Stream generated tokens via the paged-attention scheduled engine."""
-    state = _submit_or_fail(request, req)
+    state, collector = _submit_or_fail(request, req)
 
     return StreamingResponse(
-        _stream_generation(state, _get_worker(request)),
+        _stream_generation(
+            state, _get_worker(request), collector, _get_registry(request)
+        ),
         media_type="text/event-stream",
     )
