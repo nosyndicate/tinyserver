@@ -73,6 +73,24 @@ def parse_args() -> argparse.Namespace:
         default=4096,
         help="v4 only: max total tokens per scheduled batch (default: 4096)",
     )
+    parser.add_argument(
+        "--v3-max-decode-batch-size",
+        type=int,
+        default=8,
+        help="v3 only: max sequences per decode batch (default: 8)",
+    )
+    parser.add_argument(
+        "--v3-max-prefill-batch-size",
+        type=int,
+        default=8,
+        help="v3 only: max sequences per prefill batch (default: 8)",
+    )
+    parser.add_argument(
+        "--v3-max-active-requests",
+        type=int,
+        default=16,
+        help="v3 only: max concurrent requests in the engine (default: 16)",
+    )
     return parser.parse_args()
 
 
@@ -141,7 +159,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.worker = worker
     elif version == "v3":
         batch_executor = BatchExecutor(runner)
-        engine_config = BatchEngineConfig()
+        engine_config = BatchEngineConfig(
+            max_active_requests=args.v3_max_active_requests,
+            max_prefill_batch_size=args.v3_max_prefill_batch_size,
+            max_decode_batch_size=args.v3_max_decode_batch_size,
+        )
         worker = Worker(
             BatchInferenceEngine(batch_executor, engine_config),
             max_queue_size=64,
