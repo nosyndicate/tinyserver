@@ -9,18 +9,24 @@ dependencies = [
   "pydantic>=2.0",
   "prettytable>=3.12",
   "torch",
-  "transformers>=4.51",
+  "transformers>=4.51,<5",
+  "protobuf>=4.25",
   "accelerate",  # optional but helpful
 ]
 
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0",
+  "pytest-asyncio>=0.23",
   "pre-commit>=3.0.0",
   "pytest-cov>=4.0.0",
   "ruff>=0.1.0",
   "mypy>=1.0.0",
 ]
+
+[tool.setuptools.packages.find]
+include = ["server*", "kernels*"]
+namespaces = true
 
 [tool.uvicorn]
 factory = false
@@ -28,6 +34,9 @@ factory = false
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+# "auto" runs every `async def test_...` on a fresh event loop without needing a
+# per-test decorator. Safe here because no other test in the suite is async.
+asyncio_mode = "auto"
 markers = [
     "smoke: end-to-end tests using a real randomly-initialized model (slower)",
     "slow: tests requiring model download from HuggingFace Hub",
