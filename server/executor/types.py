@@ -3,8 +3,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from queue import Queue
-from typing import Protocol, cast
+from typing import Protocol
 
 import torch
 from torch import Tensor
@@ -167,6 +166,7 @@ class GenerationRequestState:
     request_id: str
     sampling_params: SamplingParams
     prompt: str
+    sink: EventSink
 
     status: RequestStatus = RequestStatus.QUEUED
 
@@ -187,10 +187,6 @@ class GenerationRequestState:
     finished_reason: FinishReason | None = None
     error: str | None = None
 
-    output_queue: Queue[Event] = field(default_factory=Queue)
-
-    sink: EventSink = field(default=cast("EventSink", None))
-
     generator: torch.Generator | None = None
 
     # Stable per-request salt assigned at admission for unseeded requests, so the
@@ -201,13 +197,6 @@ class GenerationRequestState:
     # Set by the HTTP thread (Worker.cancel) on timeout/disconnect; polled by the
     # engine thread. An Event is thread-safe, so no lock is needed.
     cancelled: threading.Event = field(default_factory=threading.Event)
-
-    def __post_init__(self) -> None:
-        if self.sink is None:
-            # Local import avoids a types <-> sinks module import cycle.
-            from server.executor.sinks import DirectQueueSink
-
-            self.sink = DirectQueueSink(self.output_queue)
 
     @property
     def num_output_tokens(self) -> int:

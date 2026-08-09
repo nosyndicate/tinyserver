@@ -1,12 +1,13 @@
 """Shared helpers for executor tests."""
 
 import itertools
-import queue
 import time
+from queue import Empty
 
 import torch
 from transformers import DynamicCache
 
+from server.executor.sinks import SharedQueueSink
 from server.executor.types import (
     DecodeResult,
     ErrorEvent,
@@ -28,6 +29,7 @@ def make_req(request_id: str | None = None) -> GenerationRequestState:
         request_id=rid,
         sampling_params=SamplingParams(max_new_tokens=10, temperature=1.0, top_p=1.0),
         prompt="hello",
+        sink=SharedQueueSink(),
         enqueued_ns=0,
     )
 
@@ -44,23 +46,25 @@ def make_decoding_req(request_id: str) -> GenerationRequestState:
 
 
 def drain_events(req: GenerationRequestState, timeout: float = 0.0) -> list:
-    """Return all events currently in req.output_queue.
+    """Return all events currently in a test request's sink.
 
     If timeout > 0, block for up to that many seconds waiting for the first
     event, then drain the rest non-blocking.
     """
+    assert isinstance(req.sink, SharedQueueSink)
+    event_queue = req.sink.queue
     events: list = []
     try:
         if timeout > 0:
-            events.append(req.output_queue.get(timeout=timeout))
+            events.append(event_queue.get(timeout=timeout))
         else:
-            events.append(req.output_queue.get_nowait())
-    except queue.Empty:
+            events.append(event_queue.get_nowait())
+    except Empty:
         return events
     while True:
         try:
-            events.append(req.output_queue.get_nowait())
-        except queue.Empty:
+            events.append(event_queue.get_nowait())
+        except Empty:
             break
     return events
 

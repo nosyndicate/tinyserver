@@ -5,6 +5,7 @@ import torch
 from transformers import DynamicCache
 
 from server.executor.executor import BatchExecutor
+from server.executor.sinks import SharedQueueSink
 from server.executor.types import (
     DecodeResult,
     FinishReason,
@@ -68,6 +69,7 @@ def make_req(
             max_new_tokens=max_new_tokens, temperature=1.0, top_p=1.0
         ),
         prompt=f"prompt-{rid}",
+        sink=SharedQueueSink(),
     )
 
 

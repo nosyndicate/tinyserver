@@ -52,7 +52,7 @@ class CallbackRecorder:
     def cancel_request(self, req: GenerationRequestState, message: str) -> None:
         req.status = RequestStatus.FAILED
         req.error = message
-        req.output_queue.put(ErrorEvent(request_id=req.request_id, error=message))
+        req.sink.emit(ErrorEvent(request_id=req.request_id, error=message))
         self.cancelled.append((req, message))
 
     def handle_fatal_error(
