@@ -5,7 +5,7 @@ import pytest
 from fastapi import HTTPException, Request
 from pydantic import ValidationError
 
-from server.api import routes
+from server.api.collector import CollectorRegistry
 from server.api.routes import (
     _await_generation,
     _build_request_state,
@@ -14,7 +14,13 @@ from server.api.routes import (
 )
 from server.api.schema import GenerateRequest
 from server.executor.engine import EngineCallbacks, EngineControl
-from server.executor.types import GenerationRequestState, TokenEvent
+from server.executor.sinks import SharedQueueSink
+from server.executor.types import (
+    DoneEvent,
+    ErrorEvent,
+    GenerationRequestState,
+    TokenEvent,
+)
 from server.executor.worker import Worker
 from server.model.sampling import SamplingParams
 from tests.executor.worker_helpers import make_req
@@ -49,26 +55,59 @@ def make_worker(max_queue_size: int = 16) -> Worker:
 
 
 class _FakeState:
-    def __init__(self, worker: Worker, device: str) -> None:
+    def __init__(
+        self,
+        worker: Worker,
+        device: str,
+        registry: CollectorRegistry,
+        sink: SharedQueueSink,
+    ) -> None:
         self.worker = worker
         self.device = device
+        self.registry = registry
+        self.sink = sink
 
 
 class _FakeApp:
-    def __init__(self, worker: Worker, device: str) -> None:
-        self.state = _FakeState(worker, device)
+    def __init__(
+        self,
+        worker: Worker,
+        device: str,
+        registry: CollectorRegistry,
+        sink: SharedQueueSink,
+    ) -> None:
+        self.state = _FakeState(worker, device, registry, sink)
 
 
 class _FakeRequest:
     """Stand-in for ``fastapi.Request`` exposing only ``app.state``."""
 
-    def __init__(self, worker: Worker, device: str = "cpu") -> None:
-        self.app = _FakeApp(worker, device)
+    def __init__(
+        self,
+        worker: Worker,
+        device: str,
+        registry: CollectorRegistry,
+        sink: SharedQueueSink,
+    ) -> None:
+        self.app = _FakeApp(worker, device, registry, sink)
 
 
-def make_request(worker: Worker, device: str = "cpu") -> Request:
+def make_request(
+    worker: Worker,
+    device: str = "cpu",
+    registry: CollectorRegistry | None = None,
+    sink: SharedQueueSink | None = None,
+) -> Request:
     """Build a minimal stand-in for ``fastapi.Request`` for unit testing."""
-    return cast(Request, _FakeRequest(worker, device))
+    return cast(
+        Request,
+        _FakeRequest(
+            worker,
+            device,
+            registry if registry is not None else CollectorRegistry(),
+            sink if sink is not None else SharedQueueSink(),
+        ),
+    )
 
 
 def make_generate_request(prompt: str = "hello") -> GenerateRequest:
@@ -92,8 +131,24 @@ def test_negative_top_k_is_rejected() -> None:
 
 def test_top_k_reaches_sampling_params() -> None:
     req = GenerateRequest(prompt="hi", max_new_tokens=1, top_k=5)
-    state = _build_request_state(req, device="cpu")
+    state = _build_request_state(req, device="cpu", sink=SharedQueueSink())
     assert state.sampling_params.top_k == 5
+
+
+def test_build_request_state_uses_the_shared_sink() -> None:
+    # Every request must emit onto the one server-wide queue the pump drains,
+    # not onto a queue of its own that nobody is reading.
+    sink = SharedQueueSink()
+    state = _build_request_state(
+        GenerateRequest(prompt="hi", max_new_tokens=1), device="cpu", sink=sink
+    )
+
+    event = TokenEvent(
+        request_id=state.request_id, token="x", is_first=True, is_last=False, index=0
+    )
+    state.sink.emit(event)
+
+    assert sink.queue.get_nowait() is event
 
 
 def test_submit_or_fail_maps_worker_shutting_down_to_503() -> None:
@@ -101,36 +156,61 @@ def test_submit_or_fail_maps_worker_shutting_down_to_503() -> None:
     # so the next submit() raises WorkerShuttingDown for real.
     worker = make_worker()
     worker.stop()
-    request = make_request(worker)
+    registry = CollectorRegistry()
+    request = make_request(worker, registry=registry)
 
     with pytest.raises(HTTPException) as excinfo:
         _submit_or_fail(request, make_generate_request())
 
     assert excinfo.value.status_code == 503
     assert excinfo.value.detail == "Worker is shutting down. Please try again later."
+    # A rejected request must not leave its collector behind.
+    assert len(registry) == 0
 
 
 def test_submit_or_fail_maps_queue_full_to_503() -> None:
     worker = make_worker(max_queue_size=1)
     worker.submit(make_req("filler"))  # single-slot queue is now full
-    request = make_request(worker)
+    registry = CollectorRegistry()
+    request = make_request(worker, registry=registry)
 
     with pytest.raises(HTTPException) as excinfo:
         _submit_or_fail(request, make_generate_request())
 
     assert excinfo.value.status_code == 503
     assert excinfo.value.detail == "Server at capacity. Please try again later."
+    assert len(registry) == 0
 
 
-def test_submit_or_fail_happy_path_returns_state() -> None:
+def test_submit_or_fail_happy_path_returns_state_and_collector() -> None:
     worker = make_worker()
-    request = make_request(worker)
+    registry = CollectorRegistry()
+    request = make_request(worker, registry=registry)
 
-    state = _submit_or_fail(request, make_generate_request(prompt="hello"))
+    state, collector = _submit_or_fail(request, make_generate_request(prompt="hello"))
 
     assert isinstance(state, GenerationRequestState)
     assert state.prompt == "hello"
     assert worker._inbound.qsize() == 1
+    assert len(registry) == 1
+
+
+async def test_submit_or_fail_registers_before_submitting() -> None:
+    # The engine may emit its first token the instant it accepts the request, so
+    # the collector has to exist by the time submit() returns — otherwise the
+    # event is dropped as an unknown request_id.
+    worker = make_worker()
+    registry = CollectorRegistry()
+    request = make_request(worker, registry=registry)
+
+    state, collector = _submit_or_fail(request, make_generate_request())
+
+    event = TokenEvent(
+        request_id=state.request_id, token="hi", is_first=True, is_last=False, index=0
+    )
+    registry.dispatch(event)
+
+    assert await collector.get(timeout=0.01) is event
 
 
 def make_state(request_id: str = "req-1") -> GenerationRequestState:
@@ -141,28 +221,92 @@ def make_state(request_id: str = "req-1") -> GenerationRequestState:
     )
 
 
-def test_await_generation_cancels_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    # When the client's wait times out (nothing ever lands on output_queue), the
-    # handler must tell the worker to cancel before raising the 504, so the
-    # engine stops decoding and frees the request's KV blocks.
-    monkeypatch.setattr(routes, "_GENERATION_TIMEOUT_S", 0.01)
+def make_done(request_id: str = "req-1") -> DoneEvent:
+    return DoneEvent(
+        request_id=request_id,
+        text="hello world",
+        num_prompt_tokens=3,
+        num_output_tokens=2,
+        ttft=12.5,
+        total_ms=50.0,
+        queue_wait_ms=5.0,
+        execution_ms=45.0,
+    )
+
+
+async def test_await_generation_cancels_on_timeout() -> None:
+    # When the client's wait times out (nothing is ever dispatched), the handler
+    # must tell the worker to cancel before raising the 504, so the engine stops
+    # decoding and frees the request's KV blocks.
     worker = make_worker()
     state = make_state()
+    registry = CollectorRegistry()
+    collector = registry.register(state.request_id)
 
     with pytest.raises(HTTPException) as excinfo:
-        _await_generation(state, worker)
+        await _await_generation(state, worker, collector, registry, timeout=0.01)
 
     assert excinfo.value.status_code == 504
     assert state.cancelled.is_set()
+    assert len(registry) == 0
 
 
-def test_stream_generation_cancels_on_client_disconnect() -> None:
-    # Closing the generator (what Starlette does on client disconnect) must run
-    # the finally and cancel the request.
+async def test_await_generation_returns_done_event_metrics() -> None:
+    # scripts/bench reads every one of these fields out of the HTTP response, so
+    # a dropped field silently corrupts summary.json.
     worker = make_worker()
     state = make_state()
-    # Prime one non-terminal token so the first next() enters the try and yields.
-    state.output_queue.put(
+    registry = CollectorRegistry()
+    collector = registry.register(state.request_id)
+    registry.dispatch(
+        TokenEvent(
+            request_id=state.request_id,
+            token="hello",
+            is_first=True,
+            is_last=False,
+            index=0,
+        )
+    )
+    registry.dispatch(make_done(state.request_id))
+
+    response = await _await_generation(state, worker, collector, registry, timeout=1.0)
+
+    assert response.text == "hello world"
+    assert response.prompt_tokens == 3
+    assert response.output_tokens == 2
+    assert response.ttft_ms == 12.5
+    assert response.total_ms == 50.0
+    assert response.queue_wait_ms == 5.0
+    assert response.execution_ms == 45.0
+    assert response.tokens_per_s == pytest.approx(40.0)
+    # Terminal event consumed: the handler is gone, so is its mailbox.
+    assert len(registry) == 0
+
+
+async def test_await_generation_maps_error_event_to_500() -> None:
+    worker = make_worker()
+    state = make_state()
+    registry = CollectorRegistry()
+    collector = registry.register(state.request_id)
+    registry.dispatch(ErrorEvent(request_id=state.request_id, error="boom"))
+
+    with pytest.raises(HTTPException) as excinfo:
+        await _await_generation(state, worker, collector, registry, timeout=1.0)
+
+    assert excinfo.value.status_code == 500
+    assert "boom" in excinfo.value.detail
+    assert len(registry) == 0
+
+
+async def test_stream_generation_cancels_on_client_disconnect() -> None:
+    # Closing the generator (what Starlette does on client disconnect) must run
+    # the finally, cancel the request, and release the collector.
+    worker = make_worker()
+    state = make_state()
+    registry = CollectorRegistry()
+    collector = registry.register(state.request_id)
+    # Prime one non-terminal token so the first step enters the try and yields.
+    registry.dispatch(
         TokenEvent(
             request_id=state.request_id,
             token="hi",
@@ -172,11 +316,42 @@ def test_stream_generation_cancels_on_client_disconnect() -> None:
         )
     )
 
-    gen = _stream_generation(state, worker)
-    first_chunk = next(gen)
+    gen = _stream_generation(state, worker, collector, registry, timeout=1.0)
+    first_chunk = await gen.__anext__()
     assert "hi" in first_chunk
     assert not state.cancelled.is_set()  # still streaming
+    assert len(registry) == 1
 
-    gen.close()  # simulate GeneratorExit from a disconnected client
+    await gen.aclose()  # simulate the disconnect Starlette throws in
 
     assert state.cancelled.is_set()
+    assert len(registry) == 0
+
+
+async def test_stream_generation_final_chunk_carries_done_metrics() -> None:
+    worker = make_worker()
+    state = make_state()
+    registry = CollectorRegistry()
+    collector = registry.register(state.request_id)
+    registry.dispatch(
+        TokenEvent(
+            request_id=state.request_id,
+            token=" world",
+            is_first=False,
+            is_last=True,
+            index=1,
+        )
+    )
+    registry.dispatch(make_done(state.request_id))
+
+    chunks = [
+        chunk
+        async for chunk in _stream_generation(
+            state, worker, collector, registry, timeout=1.0
+        )
+    ]
+
+    assert len(chunks) == 1
+    assert '"is_done":true' in chunks[0]
+    assert '"ttft_ms":12.5' in chunks[0]
+    assert len(registry) == 0
