@@ -1,10 +1,11 @@
-import queue
+from queue import Empty
 
 import pytest
 import torch
 from transformers import DynamicCache
 
 from server.executor.events import RequestEventEmitter
+from server.executor.sinks import SharedQueueSink
 from server.executor.types import (
     DecodeResult,
     DoneEvent,
@@ -23,16 +24,18 @@ def make_req() -> GenerationRequestState:
         request_id="r0",
         sampling_params=SamplingParams(max_new_tokens=2, temperature=1.0, top_p=1.0),
         prompt="hello",
+        sink=SharedQueueSink(),
         enqueued_ns=0,
     )
 
 
 def drain_events(req: GenerationRequestState) -> list:
+    assert isinstance(req.sink, SharedQueueSink)
     events: list = []
     while True:
         try:
-            events.append(req.output_queue.get_nowait())
-        except queue.Empty:
+            events.append(req.sink.queue.get_nowait())
+        except Empty:
             return events
 
 

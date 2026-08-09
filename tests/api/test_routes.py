@@ -218,6 +218,7 @@ def make_state(request_id: str = "req-1") -> GenerationRequestState:
         request_id=request_id,
         sampling_params=SamplingParams(max_new_tokens=8, temperature=0.0, top_p=1.0),
         prompt="hello",
+        sink=SharedQueueSink(),
     )
 
 

@@ -17,6 +17,7 @@ from server.executor.engine import (
     ScheduleInferenceEngine,
 )
 from server.executor.scheduler import Scheduler
+from server.executor.sinks import SharedQueueSink
 from server.executor.types import (
     DoneEvent,
     ErrorEvent,
@@ -110,6 +111,7 @@ def _make_req(max_new_tokens: int) -> GenerationRequestState:
             max_new_tokens=max_new_tokens, temperature=0.0, top_p=1.0
         ),
         prompt="hello",
+        sink=SharedQueueSink(),
         enqueued_ns=0,
     )
 
@@ -495,7 +497,7 @@ def test_pending_preserves_fifo_across_drains() -> None:
 
 def test_reap_cancelled_drops_deferred_request_without_emitting() -> None:
     # A request parked in `_pending` (deferred, never admitted) that gets
-    # cancelled is simply discarded: nobody is listening on its output_queue,
+    # cancelled is simply discarded: the handler has already gone,
     # so no event is emitted.
     backend = _FakeBackend(prompt_tokens=[3, 4, 5])
     scheduler = _RejectAllScheduler()
@@ -512,7 +514,7 @@ def test_reap_cancelled_drops_deferred_request_without_emitting() -> None:
 
     assert len(engine._pending) == 0
     assert scheduler.added == []  # never admitted
-    assert req.output_queue.empty()  # no event emitted for an abandoned request
+    assert req.sink.queue.empty()  # no event emitted for an abandoned request
 
 
 def test_new_small_request_cannot_overtake_deferred_large() -> None:
@@ -701,6 +703,7 @@ def test_post_decode_mixed_greedy_sampled_topk_batch() -> None:
         request_id="greedy",
         sampling_params=SamplingParams(max_new_tokens=5, temperature=0.0, top_p=1.0),
         prompt="hello",
+        sink=SharedQueueSink(),
         enqueued_ns=0,
     )
     # top_k=1 collapses the nucleus to the single argmax, so its sampled token
@@ -711,6 +714,7 @@ def test_post_decode_mixed_greedy_sampled_topk_batch() -> None:
             max_new_tokens=5, temperature=1.0, top_p=1.0, top_k=1, seed=123
         ),
         prompt="hello",
+        sink=SharedQueueSink(),
         enqueued_ns=0,
     )
     # top_k=2 leaves two survivors; the picked token must be one of them.
@@ -720,6 +724,7 @@ def test_post_decode_mixed_greedy_sampled_topk_batch() -> None:
             max_new_tokens=5, temperature=1.0, top_p=1.0, top_k=2, seed=7
         ),
         prompt="hello",
+        sink=SharedQueueSink(),
         enqueued_ns=0,
     )
 
@@ -772,6 +777,7 @@ def _make_resumable_request(
             max_new_tokens=max_new_tokens, temperature=0.0, top_p=1.0
         ),
         prompt="hello",
+        sink=SharedQueueSink(),
         enqueued_ns=0,
         start_ns=start_ns,
         num_prompt_tokens=num_prompt_tokens,

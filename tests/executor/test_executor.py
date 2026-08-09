@@ -4,6 +4,7 @@ import torch
 from transformers import DynamicCache
 
 from server.executor.executor import Executor
+from server.executor.sinks import SharedQueueSink
 from server.executor.types import (
     DecodeResult,
     FinishReason,
@@ -75,6 +76,7 @@ def make_req() -> GenerationRequestState:
         request_id="r0",
         sampling_params=SamplingParams(max_new_tokens=10, temperature=1.0, top_p=1.0),
         prompt="hello",
+        sink=SharedQueueSink(),
     )
 
 
@@ -91,7 +93,7 @@ def test_prefill_returns_prefill_result_without_mutating_request_status() -> Non
     assert result.num_prompt_tokens == 3
     assert req.all_logits is None
     assert req.status == RequestStatus.QUEUED
-    assert req.output_queue.empty()
+    assert req.sink.queue.empty()
 
 
 def test_prefill_returns_request_failure_when_runner_raises() -> None:
@@ -105,7 +107,7 @@ def test_prefill_returns_request_failure_when_runner_raises() -> None:
     assert isinstance(result, RequestFailure)
     assert "prefill boom" in result.error
     assert req.status == RequestStatus.QUEUED
-    assert req.output_queue.empty()
+    assert req.sink.queue.empty()
 
 
 def test_decode_returns_decode_result_with_updated_model_state() -> None:
@@ -125,7 +127,7 @@ def test_decode_returns_decode_result_with_updated_model_state() -> None:
     assert result.all_logits is runner._decode_output.logits
     assert result.past_key_values is runner._decode_output.past_key_values
     assert req.status == RequestStatus.QUEUED
-    assert req.output_queue.empty()
+    assert req.sink.queue.empty()
 
 
 def test_decode_returns_request_failure_when_logits_missing() -> None:
@@ -138,7 +140,7 @@ def test_decode_returns_request_failure_when_logits_missing() -> None:
     assert isinstance(result, RequestFailure)
     assert "No logits available" in result.error
     assert req.status == RequestStatus.QUEUED
-    assert req.output_queue.empty()
+    assert req.sink.queue.empty()
 
 
 def test_decode_returns_eos_without_calling_model() -> None:
@@ -157,7 +159,7 @@ def test_decode_returns_eos_without_calling_model() -> None:
     assert result.finish_reason == FinishReason.EOS
     assert runner.model.calls == 0
     assert req.status == RequestStatus.QUEUED
-    assert req.output_queue.empty()
+    assert req.sink.queue.empty()
 
 
 def test_decode_returns_max_length_without_calling_model() -> None:
@@ -177,7 +179,7 @@ def test_decode_returns_max_length_without_calling_model() -> None:
     assert result.finish_reason == FinishReason.MAX_LENGTH
     assert runner.model.calls == 0
     assert req.status == RequestStatus.QUEUED
-    assert req.output_queue.empty()
+    assert req.sink.queue.empty()
 
 
 def test_decode_returns_request_failure_when_model_decode_raises() -> None:
@@ -194,4 +196,4 @@ def test_decode_returns_request_failure_when_model_decode_raises() -> None:
     assert isinstance(result, RequestFailure)
     assert "decode boom" in result.error
     assert req.status == RequestStatus.QUEUED
-    assert req.output_queue.empty()
+    assert req.sink.queue.empty()

@@ -493,8 +493,8 @@ class ScheduleInferenceEngine:
         ``schedule()``), so mutating tracking dicts and ``seq.finished`` is
         safe. Two populations can hold a cancelled request:
 
-        - Deferred (in ``self._pending``, not yet admitted): nobody is listening
-          on their ``output_queue``, so just discard the ``(req, seq)`` tuples.
+        - Deferred (in ``self._pending``, not yet admitted): the handler has
+          already gone, so just discard the ``(req, seq)`` tuples.
           They hold no blocks.
         - Admitted (tracked in ``self._all_requests``): mark the sequence
           finished and drop it from engine tracking. The scheduler's
