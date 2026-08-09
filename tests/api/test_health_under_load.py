@@ -22,9 +22,16 @@ from server.executor.types import DecodeResult, FinishReason, GenerationRequestS
 from server.executor.worker import Worker
 from server.metrics.timers import now_ns
 
-_REQUESTS = 50
+# The test only means something if it oversubscribes anyio's threadpool: with
+# sync handlers, requests beyond the worker count wait for a free thread, so
+# _REQUESTS holds take ceil(_REQUESTS / 40) * _HOLD_S seconds instead of one
+# _HOLD_S window. 80 > 40 by 2x, so the pre-fix shape needs >= 2 windows (4.0s)
+# while the async path finishes in one (~2.0s) - a 1s gap either side of the
+# 3.0s limit.
+_REQUESTS = 80
 _HOLD_S = 2.0
-_TOTAL_WALL_TIME_LIMIT_S = 3.5
+_TOTAL_WALL_TIME_LIMIT_S = _HOLD_S * 1.5
+_HEALTH_TIMEOUT_S = 1.0
 
 
 class _SlowFakeEngine:
@@ -72,7 +79,7 @@ class _SlowFakeEngine:
 async def _lifespan(app: FastAPI):
     registry = CollectorRegistry()
     sink = SharedQueueSink()
-    worker = Worker(_SlowFakeEngine(), max_queue_size=64)
+    worker = Worker(_SlowFakeEngine(), max_queue_size=256)
     worker.start()
     app.state.worker = worker
     app.state.registry = registry
@@ -123,7 +130,7 @@ def _start_server() -> tuple[uvicorn.Server, threading.Thread, str]:
     raise RuntimeError("test server did not become healthy within 15 seconds")
 
 
-def test_health_remains_responsive_during_50_async_generations() -> None:
+def test_health_remains_responsive_during_concurrent_async_generations() -> None:
     server, server_thread, base_url = _start_server()
     results: list[int | None] = [None] * _REQUESTS
     payload = {"prompt": "hi", "max_new_tokens": 1, "temperature": 1.0, "top_p": 0.95}
@@ -144,12 +151,15 @@ def test_health_remains_responsive_during_50_async_generations() -> None:
         for client in clients:
             client.start()
         time.sleep(0.5)
-        health = requests.get(f"{base_url}/health", timeout=15)
+        probe_started = time.monotonic()
+        health = requests.get(f"{base_url}/health", timeout=_HEALTH_TIMEOUT_S)
+        health_elapsed = time.monotonic() - probe_started
         for client in clients:
             client.join(timeout=15)
         wall_time = time.monotonic() - started
 
         assert health.status_code == 200
+        assert health_elapsed < _HEALTH_TIMEOUT_S
         assert results == [200] * _REQUESTS
         assert wall_time < _TOTAL_WALL_TIME_LIMIT_S
     finally:
