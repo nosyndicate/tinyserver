@@ -4,7 +4,7 @@ import asyncio
 import logging
 from collections import deque
 
-from server.executor.types import ErrorEvent, Event
+from server.executor.types import DoneEvent, ErrorEvent, Event
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +135,11 @@ class CollectorRegistry:
             )
             return
         collector.put(event)
+        if isinstance(event, (DoneEvent, ErrorEvent)):
+            # Unregistering only stops later routing; it does not discard the
+            # terminal event (or earlier tokens) already buffered for the
+            # handler to consume.
+            self.unregister(event.request_id)
 
     def fail_all(self, error_message: str) -> None:
         """Push an `ErrorEvent` to every live collector.

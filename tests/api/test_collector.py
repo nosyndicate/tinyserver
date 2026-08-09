@@ -121,6 +121,29 @@ async def test_dispatch_routes_by_request_id() -> None:
         await first.get(timeout=0.01)
 
 
+@pytest.mark.parametrize(
+    "terminal",
+    [
+        make_done("r1"),
+        ErrorEvent(request_id="r1", error="generation failed"),
+    ],
+)
+async def test_terminal_event_unregisters_collector_and_drops_late_events(
+    terminal: DoneEvent | ErrorEvent,
+) -> None:
+    registry = CollectorRegistry()
+    collector = registry.register("r1")
+
+    registry.dispatch(terminal)
+
+    assert await collector.get(timeout=0) is terminal
+    assert len(registry) == 0
+
+    registry.dispatch(make_token("r1"))
+    with pytest.raises(TimeoutError):
+        await collector.get(timeout=0.01)
+
+
 def test_dispatch_drops_events_for_unknown_request_id() -> None:
     """A late event after unregister is normal; it must not raise."""
     registry = CollectorRegistry()

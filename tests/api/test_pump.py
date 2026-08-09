@@ -11,7 +11,7 @@ import pytest
 
 from server.api.collector import CollectorRegistry
 from server.api.pump import OutputPump
-from server.executor.types import ErrorEvent, Event, TokenEvent
+from server.executor.types import Event, TokenEvent
 from tests.api.test_collector import make_done, make_token
 
 # Short enough that stop()'s join is quick, long enough not to spin.
@@ -80,7 +80,7 @@ async def test_stop_drains_queued_events() -> None:
     assert [e.index for e in events if isinstance(e, TokenEvent)] == [0, 1, 2, 3, 4]
 
 
-async def test_stop_and_flush_preserves_done_before_shutdown_error() -> None:
+async def test_stop_and_flush_delivers_done_before_shutdown_broadcast() -> None:
     registry = CollectorRegistry()
     collector = registry.register("r1")
     queue: Queue[Event] = Queue()
@@ -94,9 +94,9 @@ async def test_stop_and_flush_preserves_done_before_shutdown_error() -> None:
     registry.fail_all("Server is shutting down")
 
     assert await collector.get(timeout=0) is done
-    error = await collector.get(timeout=0)
-    assert isinstance(error, ErrorEvent)
-    assert error.error == "Server is shutting down"
+    assert len(registry) == 0
+    with pytest.raises(TimeoutError):
+        await collector.get(timeout=0.01)
 
 
 def test_pump_drops_events_when_the_loop_is_closed() -> None:
