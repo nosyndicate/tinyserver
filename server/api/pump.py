@@ -75,11 +75,10 @@ class OutputPump:
         self._stopping.set()
 
         if self._thread is not None:
-            # The thread can be mid-`get`, so allow one full poll interval plus
-            # slack for the dispatch it may be finishing.
-            self._thread.join(timeout=self._poll_timeout_s + 1.0)
-            if self._thread.is_alive():
-                logger.warning("output pump thread did not exit; abandoning it")
+            # The worker is stopped before the pump, so no producer remains.
+            # `_run` polls at most once more before exiting; joining guarantees
+            # it cannot schedule an event after the shutdown flush barrier.
+            self._thread.join()
             self._thread = None
 
         # Drain any events that arrived after the stop signal but before the
@@ -92,6 +91,23 @@ class OutputPump:
             except Empty:
                 break
             self._dispatch(event)
+
+    async def stop_and_flush(self) -> None:
+        """Stop the pump and run all queued dispatches before returning.
+
+        ``stop`` schedules its final dispatches onto the event loop. The
+        sentinel is queued after them, so awaiting it establishes that every
+        terminal event drained during shutdown reached its collector before a
+        caller invokes ``CollectorRegistry.fail_all``.
+        """
+        self.stop()
+        assert self._loop is not None, "OutputPump.start() must be called first"
+        if self._loop.is_closed():
+            return
+
+        flushed = self._loop.create_future()
+        self._loop.call_soon(flushed.set_result, None)
+        await flushed
 
     def _run(self) -> None:
         """The pump thread's whole life: block on the queue, hand off, repeat."""

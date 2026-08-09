@@ -98,7 +98,7 @@ async def _lifespan(app: FastAPI):
         yield
     finally:
         worker.stop()
-        pump.stop()
+        await pump.stop_and_flush()
         registry.fail_all("Server is shutting down")
 
 
