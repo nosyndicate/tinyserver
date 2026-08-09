@@ -83,13 +83,7 @@ def parse_args() -> argparse.Namespace:
 def _build_worker(
     version: str, config: ModelConfig, args: argparse.Namespace
 ) -> Worker:
-    """Construct the queue-backed worker for one API version.
-
-    Kept out of ``lifespan`` so the pump/registry lifecycle around it is written
-    once instead of per version. This is also the seam the engine child process
-    will need later: it is exactly the block that has to move across the process
-    boundary, and it depends only on plain config, never on the app.
-    """
+    """Construct the queue-backed worker for one API version."""
     if version == "v4":
         # v4 uses the paged-attention HFBackend instead of ModelRunner; the
         # runner is skipped entirely so only one copy of the model is loaded.
@@ -106,7 +100,7 @@ def _build_worker(
         )
         return Worker(
             ScheduleInferenceEngine(scheduler, backend),
-            max_queue_size=64,
+            max_queue_size=64,  # TODO: revisit if this make sense
         )
 
     runner = load_hf_model(config)
@@ -164,7 +158,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         worker.start()
         app.state.worker = worker
 
-        # lifespan itself runs on the event loop, so this is where the loop
+        # lifespan itself runs on the default event loop, so this is where the loop
         # reference is captured — once, rather than per request.
         pump = OutputPump(sink.queue, registry)
         pump.start(asyncio.get_running_loop())
@@ -174,7 +168,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Everything after the yield runs on shutdown. The order matters:
     # `Worker.stop()` drains its inbound queue and cancels in-flight requests,
-    # emitting a final ErrorEvent per request *through the shared sink* — so the
+    # emitting a final ErrorEvent per request through the shared sink — so the
     # pump must still be alive to route them. `pump.stop()` then joins the thread
     # and drains whatever is left, and `fail_all` wakes anyone still waiting.
     if app.state.worker is not None:

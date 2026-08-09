@@ -69,10 +69,6 @@ def _build_request_state(
 ) -> GenerationRequestState:
     """
     Build a GenerationRequestState from the incoming request and device.
-
-    The state emits through the server-wide ``sink`` rather than a queue of its
-    own, so every request's events travel one path and are routed back by
-    ``request_id``.
     """
     sampling_params = build_sampling_params(
         max_new_tokens=req.max_new_tokens,
@@ -103,10 +99,6 @@ async def _await_generation(
     """
     Await this request's collector for a terminal event and build the
     non-streaming response. Intermediate TokenEvents are discarded.
-
-    Awaiting instead of blocking is the whole point: a waiting request is a
-    suspended coroutine, not a parked thread from the AnyIO pool that ``/health``
-    also needs.
     """
     try:
         while True:
@@ -308,12 +300,7 @@ def _submit_or_fail(
 
 @health_router.get("/health")
 async def health() -> dict[str, bool]:
-    """Liveness probe.
-
-    ``async`` on purpose: a sync ``def`` endpoint runs on the AnyIO threadpool,
-    which the blocking generate handlers used to exhaust — making the server
-    look dead while the GPU was idle.
-    """
+    """Liveness probe."""
     return {"ok": True}
 
 
