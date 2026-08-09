@@ -141,6 +141,21 @@ def test_unregister_is_idempotent() -> None:
     assert len(registry) == 0
 
 
+async def test_register_rejects_duplicate_request_id_without_replacing_collector() -> (
+    None
+):
+    registry = CollectorRegistry()
+    original = registry.register("r1")
+
+    with pytest.raises(ValueError, match="collector already registered"):
+        registry.register("r1")
+
+    event = make_token("r1")
+    registry.dispatch(event)
+    assert await original.get(timeout=0) is event
+    assert len(registry) == 1
+
+
 def test_len_tracks_live_requests() -> None:
     registry = CollectorRegistry()
     assert len(registry) == 0

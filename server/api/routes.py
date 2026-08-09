@@ -283,19 +283,23 @@ def _submit_or_fail(
     )
     collector = registry.register(state.request_id)
     try:
-        worker.submit(state)
-    except Full:
+        try:
+            worker.submit(state)
+        except Full as error:
+            raise HTTPException(
+                status_code=503,
+                detail="Server at capacity. Please try again later.",
+            ) from error
+        except WorkerShuttingDown as error:
+            raise HTTPException(
+                status_code=503,
+                detail="Worker is shutting down. Please try again later.",
+            ) from error
+    except BaseException:
+        # Registration must be transactional: no exception path may leave a
+        # mailbox behind with no handler consuming its events.
         registry.unregister(state.request_id)
-        raise HTTPException(
-            status_code=503,
-            detail="Server at capacity. Please try again later.",
-        )
-    except WorkerShuttingDown:
-        registry.unregister(state.request_id)
-        raise HTTPException(
-            status_code=503,
-            detail="Worker is shutting down. Please try again later.",
-        )
+        raise
     return state, collector
 
 
