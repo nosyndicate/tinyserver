@@ -22,7 +22,7 @@ class SharedQueueSink:
     """Emit events onto one server-wide ``queue.Queue`` drained by the pump.
 
     The server builds one instance and hands it to every request state, so the
-    pummp thread has a single queue to drain the routes by ``request_id``.
+    pump thread has a single queue to drain, and routes by ``request_id``.
     """
 
     def __init__(self) -> None:

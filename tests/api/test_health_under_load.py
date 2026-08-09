@@ -23,7 +23,7 @@ from server.executor.types import DecodeResult, FinishReason, GenerationRequestS
 from server.executor.worker import Worker
 from server.metrics.timers import now_ns
 
-pytestmark = pytest.mark.slow
+pytestmark = pytest.mark.timing
 
 
 # The test only means something if it oversubscribes anyio's threadpool: with
