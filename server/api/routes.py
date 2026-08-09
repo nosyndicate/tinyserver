@@ -142,8 +142,9 @@ async def _await_generation(
                     detail="Unexpected event type received from worker",
                 )
     finally:
-        # Nobody is listening any more; later events for this rid are dropped by
-        # the registry instead of piling up in an orphaned collector.
+        # Cancel on every exit path and stop routing to a collector nobody is
+        # reading.
+        worker.cancel(state)
         registry.unregister(state.request_id)
 
 
