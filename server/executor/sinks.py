@@ -21,8 +21,8 @@ from server.executor.types import Event
 class SharedQueueSink:
     """Emit events onto one server-wide ``queue.Queue`` drained by the pump.
 
-    Every request state shares a single instance, so the pump thread has just
-    one queue to drain and route by ``request_id``.
+    The server builds one instance and hands it to every request state, so the
+    pummp thread has a single queue to drain the routes by ``request_id``.
     """
 
     def __init__(self) -> None:

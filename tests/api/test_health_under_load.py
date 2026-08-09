@@ -9,6 +9,7 @@ import time
 from contextlib import asynccontextmanager
 from queue import Empty
 
+import pytest
 import requests
 import uvicorn
 from fastapi import FastAPI
@@ -21,6 +22,9 @@ from server.executor.sinks import SharedQueueSink
 from server.executor.types import DecodeResult, FinishReason, GenerationRequestState
 from server.executor.worker import Worker
 from server.metrics.timers import now_ns
+
+pytestmark = pytest.mark.slow
+
 
 # The test only means something if it oversubscribes anyio's threadpool: with
 # sync handlers, requests beyond the worker count wait for a free thread, so
@@ -39,7 +43,7 @@ class _SlowFakeEngine:
 
     def __init__(self) -> None:
         self._emitter = RequestEventEmitter()
-        self._active: list[GenerationRequestState] = []
+        self._active: dict[str, GenerationRequestState] = {}
         self._lock = threading.Lock()
 
     def run(self, inbound, control, callbacks) -> None:  # noqa: ANN001
@@ -53,13 +57,15 @@ class _SlowFakeEngine:
             self._emitter.on_prefill_started(request, now_ns())
             request.num_prompt_tokens = 1
             with self._lock:
-                self._active.append(request)
+                self._active[request.request_id] = request
             threading.Thread(
                 target=self._finish_after_delay, args=(request,), daemon=True
             ).start()
 
     def _finish_after_delay(self, request: GenerationRequestState) -> None:
         time.sleep(_HOLD_S)
+        with self._lock:
+            self._active.pop(request.request_id, None)
         if request.cancelled.is_set():
             return
         self._emitter.on_token(
@@ -69,7 +75,7 @@ class _SlowFakeEngine:
 
     def cancel_inflight(self, message, cancel_request) -> None:  # noqa: ANN001
         with self._lock:
-            for request in self._active:
+            for request in self._active.values():
                 request.cancelled.set()
                 cancel_request(request, message)
             self._active.clear()
