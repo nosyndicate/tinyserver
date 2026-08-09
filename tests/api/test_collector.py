@@ -121,6 +121,29 @@ async def test_dispatch_routes_by_request_id() -> None:
         await first.get(timeout=0.01)
 
 
+@pytest.mark.parametrize(
+    "terminal",
+    [
+        make_done("r1"),
+        ErrorEvent(request_id="r1", error="generation failed"),
+    ],
+)
+async def test_terminal_event_unregisters_collector_and_drops_late_events(
+    terminal: DoneEvent | ErrorEvent,
+) -> None:
+    registry = CollectorRegistry()
+    collector = registry.register("r1")
+
+    registry.dispatch(terminal)
+
+    assert await collector.get(timeout=0) is terminal
+    assert len(registry) == 0
+
+    registry.dispatch(make_token("r1"))
+    with pytest.raises(TimeoutError):
+        await collector.get(timeout=0.01)
+
+
 def test_dispatch_drops_events_for_unknown_request_id() -> None:
     """A late event after unregister is normal; it must not raise."""
     registry = CollectorRegistry()
@@ -139,6 +162,21 @@ def test_unregister_is_idempotent() -> None:
     registry.unregister("r1")
 
     assert len(registry) == 0
+
+
+async def test_register_rejects_duplicate_request_id_without_replacing_collector() -> (
+    None
+):
+    registry = CollectorRegistry()
+    original = registry.register("r1")
+
+    with pytest.raises(ValueError, match="collector already registered"):
+        registry.register("r1")
+
+    event = make_token("r1")
+    registry.dispatch(event)
+    assert await original.get(timeout=0) is event
+    assert len(registry) == 1
 
 
 def test_len_tracks_live_requests() -> None:

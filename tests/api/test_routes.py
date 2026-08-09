@@ -195,6 +195,24 @@ def test_submit_or_fail_happy_path_returns_state_and_collector() -> None:
     assert len(registry) == 1
 
 
+def test_submit_or_fail_unregisters_on_unexpected_submit_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = make_worker()
+    registry = CollectorRegistry()
+    request = make_request(worker, registry=registry)
+
+    def fail_submit(_: GenerationRequestState) -> None:
+        raise RuntimeError("submit failed unexpectedly")
+
+    monkeypatch.setattr(worker, "submit", fail_submit)
+
+    with pytest.raises(RuntimeError, match="submit failed unexpectedly"):
+        _submit_or_fail(request, make_generate_request())
+
+    assert len(registry) == 0
+
+
 async def test_submit_or_fail_registers_before_submitting() -> None:
     # The engine may emit its first token the instant it accepts the request, so
     # the collector has to exist by the time submit() returns — otherwise the

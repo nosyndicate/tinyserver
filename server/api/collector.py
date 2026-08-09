@@ -4,7 +4,7 @@ import asyncio
 import logging
 from collections import deque
 
-from server.executor.types import ErrorEvent, Event
+from server.executor.types import DoneEvent, ErrorEvent, Event
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +103,15 @@ class CollectorRegistry:
 
         Callers must register **before** submitting to the engine, otherwise a
         fast first token could arrive with nowhere to go.
+
+        A live request ID must never be replaced: doing so would orphan the
+        original handler's collector and route subsequent events to a mailbox
+        nobody is awaiting.
         """
+        if request_id in self._collectors:
+            raise ValueError(
+                f"collector already registered for request_id {request_id!r}"
+            )
         collector = OutputCollector()
         self._collectors[request_id] = collector
         return collector
@@ -127,6 +135,11 @@ class CollectorRegistry:
             )
             return
         collector.put(event)
+        if isinstance(event, (DoneEvent, ErrorEvent)):
+            # Unregistering only stops later routing; it does not discard the
+            # terminal event (or earlier tokens) already buffered for the
+            # handler to consume.
+            self.unregister(event.request_id)
 
     def fail_all(self, error_message: str) -> None:
         """Push an `ErrorEvent` to every live collector.

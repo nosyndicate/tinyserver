@@ -169,12 +169,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Everything after the yield runs on shutdown. The order matters:
     # `Worker.stop()` drains its inbound queue and cancels in-flight requests,
     # emitting a final ErrorEvent per request through the shared sink — so the
-    # pump must still be alive to route them. `pump.stop()` then joins the thread
-    # and drains whatever is left, and `fail_all` wakes anyone still waiting.
+    # pump must still be alive to route them. `pump.stop_and_flush()` joins the
+    # thread, drains remaining events, and runs their dispatch callbacks before
+    # `fail_all` wakes anyone still waiting.
     if app.state.worker is not None:
         app.state.worker.stop()
     if pump is not None:
-        pump.stop()
+        await pump.stop_and_flush()
     if app.state.registry is not None:
         app.state.registry.fail_all("Server is shutting down")
 

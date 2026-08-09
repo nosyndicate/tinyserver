@@ -12,7 +12,7 @@ import pytest
 from server.api.collector import CollectorRegistry
 from server.api.pump import OutputPump
 from server.executor.types import Event, TokenEvent
-from tests.api.test_collector import make_token
+from tests.api.test_collector import make_done, make_token
 
 # Short enough that stop()'s join is quick, long enough not to spin.
 _POLL_S = 0.01
@@ -35,7 +35,7 @@ async def test_pump_delivers_events_across_the_thread_boundary() -> None:
 
         assert await collector.get(timeout=2.0) is event
     finally:
-        pump.stop()
+        await pump.stop_and_flush()
 
 
 async def test_pump_routes_each_request_to_its_own_collector() -> None:
@@ -55,7 +55,7 @@ async def test_pump_routes_each_request_to_its_own_collector() -> None:
         assert isinstance(from_first, TokenEvent) and from_first.token == "first"
         assert isinstance(from_second, TokenEvent) and from_second.token == "second"
     finally:
-        pump.stop()
+        await pump.stop_and_flush()
 
 
 async def test_stop_drains_queued_events() -> None:
@@ -74,13 +74,29 @@ async def test_stop_drains_queued_events() -> None:
     for index in range(5):
         queue.put(make_token("r1", index=index))
 
-    pump.stop()
-    # stop() only *schedules* the drained dispatches via call_soon_threadsafe;
-    # yield once so the loop actually runs them before we assert.
-    await asyncio.sleep(0)
+    await pump.stop_and_flush()
 
     events = [await collector.get(timeout=0) for _ in range(5)]
     assert [e.index for e in events if isinstance(e, TokenEvent)] == [0, 1, 2, 3, 4]
+
+
+async def test_stop_and_flush_delivers_done_before_shutdown_broadcast() -> None:
+    registry = CollectorRegistry()
+    collector = registry.register("r1")
+    queue: Queue[Event] = Queue()
+    pump = OutputPump(queue, registry, poll_timeout_s=_POLL_S)
+    pump.start(asyncio.get_running_loop())
+
+    done = make_done("r1")
+    queue.put(done)
+
+    await pump.stop_and_flush()
+    registry.fail_all("Server is shutting down")
+
+    assert await collector.get(timeout=0) is done
+    assert len(registry) == 0
+    with pytest.raises(TimeoutError):
+        await collector.get(timeout=0.01)
 
 
 def test_pump_drops_events_when_the_loop_is_closed() -> None:
