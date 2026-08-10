@@ -28,7 +28,7 @@ def make_done(request_id: str) -> DoneEvent:
         text="hi",
         num_prompt_tokens=1,
         num_output_tokens=1,
-        ttft=1.0,
+        ttft_ms=1.0,
         total_ms=2.0,
         queue_wait_ms=0.5,
         execution_ms=1.5,

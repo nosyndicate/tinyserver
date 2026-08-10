@@ -23,9 +23,17 @@ from server.model.sampling import build_sampling_params
 _GENERATION_TIMEOUT_S = 300  # 5 minutes
 
 
-def _compute_tokens_per_s(num_output_tokens: int, total_ms: float) -> float:
-    """Compute tokens per second from output token count and total time."""
-    return (num_output_tokens / (total_ms / 1000.0)) if total_ms > 0 else 0.0
+def _compute_tokens_per_s(num_output_tokens: int, execution_ms: float) -> float:
+    """Compute the decode rate in tokens per second.
+
+    Deliberately measured over ``execution_ms`` rather than ``total_ms``: since
+    ``total_ms`` spans enqueue to completion, dividing by it would fold queue
+    wait into the rate and make a request that queued for 4s and decoded for 1s
+    report a fifth of its real decode speed. Aggregate system throughput is a
+    separate number, computed by the benchmark client over its measurement
+    window.
+    """
+    return (num_output_tokens / (execution_ms / 1000.0)) if execution_ms > 0 else 0.0
 
 
 health_router = APIRouter()
@@ -118,14 +126,14 @@ async def _await_generation(
                 continue
             elif isinstance(event, DoneEvent):
                 tokens_per_s = _compute_tokens_per_s(
-                    event.num_output_tokens, event.total_ms
+                    event.num_output_tokens, event.execution_ms
                 )
 
                 return GenerateResponse(
                     text=event.text,
                     prompt_tokens=event.num_prompt_tokens,
                     output_tokens=event.num_output_tokens,
-                    ttft_ms=event.ttft,
+                    ttft_ms=event.ttft_ms,
                     total_ms=event.total_ms,
                     tokens_per_s=tokens_per_s,
                     queue_wait_ms=event.queue_wait_ms,
@@ -195,7 +203,7 @@ async def _stream_generation(
                         return
                     if isinstance(done_event, DoneEvent):
                         tokens_per_s = _compute_tokens_per_s(
-                            done_event.num_output_tokens, done_event.total_ms
+                            done_event.num_output_tokens, done_event.execution_ms
                         )
                         chunk = StreamChunk(
                             token_str=event.token,
@@ -203,7 +211,7 @@ async def _stream_generation(
                             is_done=True,
                             prompt_tokens=done_event.num_prompt_tokens,
                             output_tokens=done_event.num_output_tokens,
-                            ttft_ms=done_event.ttft,
+                            ttft_ms=done_event.ttft_ms,
                             total_ms=done_event.total_ms,
                             tokens_per_s=tokens_per_s,
                             queue_wait_ms=done_event.queue_wait_ms,
@@ -213,7 +221,7 @@ async def _stream_generation(
                         log_event(
                             "stream_done",
                             output_tokens=done_event.num_output_tokens,
-                            ttft_ms=done_event.ttft,
+                            ttft_ms=done_event.ttft_ms,
                         )
                     elif isinstance(done_event, ErrorEvent):
                         error_chunk = StreamChunk(

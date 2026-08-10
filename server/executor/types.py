@@ -44,10 +44,20 @@ class DoneEvent:
         text: The full decoded text for the sequence, including all tokens.
         num_prompt_tokens: The number of tokens in the prompt.
         num_output_tokens: The number of tokens in the output sequence.
-        ttft: The time to first token in milliseconds (from start of prefill to first token).
-        total_ms: The total time from the start of prefill to completion in milliseconds.
-        queue_wait_ms: The time spent waiting in the queue before prefill started, in milliseconds.
-        execution_ms: Time spent executing after leaving the queue (total_ms - queue_wait_ms).
+
+    Every timing field below is derived from a raw timestamp rather than from
+    arithmetic on the other fields, so ``total_ms == queue_wait_ms +
+    execution_ms`` holds by construction:
+
+        ttft_ms: Enqueue to first token, in milliseconds. ``None`` when the
+            request finished without emitting a token.
+        total_ms: Enqueue to completion, in milliseconds.
+        queue_wait_ms: Enqueue to the start of the first prefill, in milliseconds.
+        execution_ms: Start of the first prefill to completion, in milliseconds.
+            For v4 this includes any time the sequence spent preempted, because
+            ``start_ns`` is deliberately not reset when a preempted sequence
+            resumes (see ``ScheduleInferenceEngine._post_prefill``). Preemption
+            cost therefore lands in execution, not in queue wait.
     """
 
     request_id: str
@@ -56,7 +66,7 @@ class DoneEvent:
     num_prompt_tokens: int
     num_output_tokens: int
 
-    ttft: float
+    ttft_ms: float | None
     total_ms: float
     queue_wait_ms: float
     execution_ms: float

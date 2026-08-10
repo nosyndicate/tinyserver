@@ -157,6 +157,33 @@ bench-results/
 | `config.json` | Exact CLI arguments and the resolved scenario definition; sufficient to reproduce the run |
 | `requests.jsonl` | One JSON object per request (including failures); raw data for post-hoc analysis |
 
+### Server-reported timing semantics
+
+The server reports four timings per request, each measured between two raw
+timestamps so that `total_ms == queue_wait_ms + execution_ms`:
+
+```
+enqueue ---- queue_wait_ms ----> first prefill ---- execution_ms ----> completion
+|<---------------------------- total_ms --------------------------------->|
+```
+
+- `ttft_ms` is measured **from enqueue**, so it includes queue wait. It is
+  `null` when a request completes without emitting a token.
+- `tokens_per_s` is the decode rate: output tokens over `execution_ms`. It
+  deliberately excludes queue wait, so it stays comparable across load levels.
+  System-level throughput is a separate figure, computed by the benchmark
+  client over its measurement window and reported in `summary.json`.
+- For v4, `execution_ms` includes any time a sequence spent preempted. The
+  start of the *first* prefill is not reset on resume, so preemption cost is
+  accounted as execution rather than as queue wait.
+
+> **Compatibility:** these definitions changed. Previously `total_ms` and
+> `ttft_ms` were measured from the start of prefill rather than from enqueue,
+> `execution_ms` was computed as `total_ms - queue_wait_ms` (which
+> under-reported it by exactly the queue wait, clamping to `0.0` under load),
+> and `ttft_ms` used a `-1.0` sentinel instead of `null`. Artifacts produced
+> before this change are **not** comparable with artifacts produced after it.
+
 ---
 
 ## Common recipes

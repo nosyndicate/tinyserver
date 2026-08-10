@@ -24,24 +24,39 @@ class GenerateResponse(BaseModel):
     output_tokens: int = Field(
         ..., ge=0, description="Number of tokens generated in the output"
     )
-    ttft_ms: float = Field(
-        ..., ge=0.0, description="Time to first token in milliseconds"
+    ttft_ms: float | None = Field(
+        default=None,
+        ge=0.0,
+        description=(
+            "Time from enqueue to the first token, in milliseconds. Null when "
+            "the request finished without emitting a token."
+        ),
     )
     total_ms: float = Field(
-        ..., ge=0.0, description="Total time for generation in milliseconds"
+        ...,
+        ge=0.0,
+        description=(
+            "Time from enqueue to completion, in milliseconds. Equals "
+            "queue_wait_ms + execution_ms."
+        ),
     )
     tokens_per_s: float = Field(
-        ..., ge=0.0, description="Generation speed in tokens per second"
+        ...,
+        ge=0.0,
+        description=(
+            "Decode rate: output tokens divided by execution_ms. Excludes queue "
+            "wait so the value stays comparable across load levels."
+        ),
     )
     queue_wait_ms: float = Field(
         0.0,
         ge=0.0,
-        description="Time spent waiting in the server queue before execution",
+        description="Time from enqueue to the start of the first prefill",
     )
     execution_ms: float = Field(
         0.0,
         ge=0.0,
-        description="Time spent executing after the request left the queue",
+        description="Time from the start of the first prefill to completion",
     )
 
 
@@ -65,21 +80,27 @@ class StreamChunk(BaseModel):
         default=None, ge=0, description="Output token count when known"
     )
     ttft_ms: float | None = Field(
-        default=None, ge=0.0, description="Time to first token in milliseconds"
+        default=None,
+        ge=0.0,
+        description="Time from enqueue to the first token, in milliseconds",
     )
     total_ms: float | None = Field(
-        default=None, ge=0.0, description="Total generation time in milliseconds"
+        default=None,
+        ge=0.0,
+        description="Time from enqueue to completion, in milliseconds",
     )
     tokens_per_s: float | None = Field(
-        default=None, ge=0.0, description="Generation speed in tokens per second"
+        default=None,
+        ge=0.0,
+        description="Decode rate: output tokens divided by execution_ms",
     )
     queue_wait_ms: float | None = Field(
         default=None,
         ge=0.0,
-        description="Time spent waiting in the server queue before execution",
+        description="Time from enqueue to the start of the first prefill",
     )
     execution_ms: float | None = Field(
         default=None,
         ge=0.0,
-        description="Time spent executing after the request left the queue",
+        description="Time from the start of the first prefill to completion",
     )
