@@ -208,6 +208,18 @@ class TestOpenLoopStats:
         assert stats["client_dispatch_lag_ms"]["mean"] == 2.5
         assert stats["client_saturated"] is False
 
+    def test_requested_duration_is_reported_alongside_the_window(self) -> None:
+        results = [_make_result(0, end_ts=1.0)]
+        stats = _open_loop_stats(
+            1.0, 0.0, 4.0, 16, results, requested_duration_seconds=3.9
+        )
+        assert stats["requested_duration_seconds"] == 3.9
+        assert stats["offer_window_seconds"] == 4.0
+
+    def test_requested_duration_is_none_in_request_count_mode(self) -> None:
+        stats = _open_loop_stats(1.0, 0.0, 4.0, 16, [_make_result(0)])
+        assert stats["requested_duration_seconds"] is None
+
     def test_drain_seconds_zero_when_nothing_drains(self) -> None:
         results = [_make_result(0, end_ts=1.0)]
         stats = _open_loop_stats(1.0, 0.0, 4.0, 16, results)
@@ -295,12 +307,15 @@ class TestDispatchOpenLoop:
             plans,
             "run-1",
             clock,
-            deadline_offset_s=clock.offset() + 0.25,
+            # 0.27s is 5.4 arrival intervals — deliberately not a whole
+            # multiple of 50ms, so this test never rests on a deadline that
+            # happens to land on an arrival boundary. Do not round it off.
+            deadline_offset_s=clock.offset() + 0.27,
             runner=runner,
         )
 
-        # 20/s offered for 250ms is ~5 requests, not the 100 that were planned.
-        assert 3 <= len(outcome.results) <= 7
+        # 20/s offered for 270ms is ~6 requests, not the 100 that were planned.
+        assert 3 <= len(outcome.results) <= 8
         assert all(r.client_http_ms >= 0.0 for r in outcome.results)
 
     def test_in_flight_requests_drain_after_the_deadline(self) -> None:
@@ -321,6 +336,56 @@ class TestDispatchOpenLoop:
         assert outcome.results
         assert outcome.stats["drain_seconds"] > 0.0
         assert outcome.stats["completions_in_offer_window"] == 0
+
+    def test_duration_ending_between_arrivals_still_reports_target_rate(self) -> None:
+        # 20/s for 170ms: arrivals at 0, 50, 100, 150ms all fall inside, but the
+        # last one's interval ends at 200ms — past the deadline. The window is
+        # deliberately not capped there, so the achieved rate stays at target
+        # rather than overshooting it; the requested duration is reported too.
+        runner = _StubRunner()
+        plans = [_make_plan(i) for i in range(4)]
+        clock = RunClock.start()
+
+        outcome = _dispatch_open_loop(
+            _make_args(arrival_rate=20.0, client_max_in_flight=8),
+            plans,
+            "run-1",
+            clock,
+            deadline_offset_s=clock.offset() + 0.17,
+            runner=runner,
+        )
+
+        stats = outcome.stats
+        assert len(outcome.results) == 4
+        assert stats["achieved_arrival_rate"] == pytest.approx(20.0, rel=0.02)
+        # Derived as deadline - offer_start, so a hair under the 0.17 requested.
+        assert stats["requested_duration_seconds"] == pytest.approx(0.17, abs=1e-3)
+        # The overshoot is real but bounded by one arrival interval.
+        overshoot = stats["offer_window_seconds"] - stats["requested_duration_seconds"]
+        assert 0.0 < overshoot < 1.0 / 20.0
+        assert stats["client_saturated"] is False
+
+    def test_saturated_duration_run_reports_rate_below_target(self) -> None:
+        # The property that makes capping the window unnecessary: when the
+        # client falls behind, elapsed wall time dominates the schedule and the
+        # achieved rate collapses on its own.
+        runner = _StubRunner(service_seconds=0.15)
+        plans = [_make_plan(i) for i in range(40)]
+        clock = RunClock.start()
+
+        outcome = _dispatch_open_loop(
+            _make_args(arrival_rate=20.0, client_max_in_flight=2),
+            plans,
+            "run-1",
+            clock,
+            deadline_offset_s=clock.offset() + 0.5,
+            runner=runner,
+        )
+
+        stats = outcome.stats
+        assert stats["achieved_arrival_rate"] is not None
+        assert stats["achieved_arrival_rate"] < 0.95 * 20.0
+        assert stats["client_saturated"] is True
 
     def test_empty_plan_list(self) -> None:
         runner = _StubRunner()

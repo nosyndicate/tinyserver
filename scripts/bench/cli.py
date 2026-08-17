@@ -91,6 +91,17 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--requests must be positive")
     if args.duration_seconds is not None and args.duration_seconds <= 0:
         raise ValueError("--duration-seconds must be positive")
+    # Checked last, once both values above are known good. A window shorter than
+    # one arrival interval cannot sample the rate it claims to offer: the
+    # schedule calls for under one request, so any measurement is an artifact of
+    # rounding rather than of the server.
+    if args.mode == "open" and args.duration_seconds is not None:
+        interval_s = 1.0 / args.arrival_rate
+        if args.duration_seconds < interval_s:
+            raise ValueError(
+                "--duration-seconds must cover at least one arrival interval"
+                f" ({interval_s:.4g}s at --arrival-rate {args.arrival_rate})"
+            )
 
 
 def main(argv: list[str] | None = None) -> int:

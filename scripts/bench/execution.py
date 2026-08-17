@@ -230,8 +230,17 @@ def _open_loop_stats(
     offer_end_s: float,
     max_in_flight: int,
     results: list[RequestResult],
+    requested_duration_seconds: float | None = None,
 ) -> dict[str, Any]:
-    """Reduce a finished open-loop run to its offer-window report."""
+    """
+    Reduce a finished open-loop run to its offer-window report.
+
+    ``requested_duration_seconds`` is what ``--duration-seconds`` asked for, and
+    is ``None`` in request-count mode. It is reported next to
+    ``offer_window_seconds`` rather than replacing it: the two differ by under
+    one arrival interval when ``duration × rate`` is non-integral, and the
+    schedule-relative window is the honest denominator for the achieved rate.
+    """
     offer_seconds = max(offer_end_s - offer_start_s, 0.0)
     achieved_rate = len(results) / offer_seconds if offer_seconds > 0 else None
     dispatch_lags = [result.client_dispatch_lag_ms for result in results]
@@ -246,6 +255,7 @@ def _open_loop_stats(
         "target_arrival_rate": target_rate,
         "achieved_arrival_rate": achieved_rate,
         "offer_window_seconds": offer_seconds,
+        "requested_duration_seconds": requested_duration_seconds,
         "client_max_in_flight": max_in_flight,
         "client_dispatch_lag_ms": _percentiles(dispatch_lags),
         "completions_in_offer_window": len(in_window),
@@ -322,6 +332,14 @@ def _dispatch_open_loop(
         # (N-1)/rate, so ending at the last arrival would report an achieved
         # rate above target. A client that fell behind overshoots this and is
         # scored on the wall time it actually took.
+        #
+        # Deliberately NOT capped at the deadline in duration mode, though that
+        # lets the window exceed --duration-seconds by under one interval when
+        # duration x rate is non-integral. Capping shortens the denominator
+        # without changing the request count, so the achieved rate would read
+        # *above* target — the overshoot this formula exists to remove. The
+        # requested duration is reported alongside instead, and _validate_args
+        # rejects durations too short to sample the rate at all.
         intended_end_s = (
             last_arrival_s + interval_s if last_arrival_s is not None else offer_start_s
         )
@@ -331,7 +349,14 @@ def _dispatch_open_loop(
 
     results.sort(key=lambda item: item.ordinal)
     stats = _open_loop_stats(
-        args.arrival_rate, offer_start_s, offer_end_s, max_in_flight, results
+        args.arrival_rate,
+        offer_start_s,
+        offer_end_s,
+        max_in_flight,
+        results,
+        requested_duration_seconds=(
+            deadline_offset_s - offer_start_s if deadline_offset_s is not None else None
+        ),
     )
     return OpenLoopOutcome(results=results, stats=stats)
 

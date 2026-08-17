@@ -109,14 +109,27 @@ Every open-loop run reports its offer window in `summary.json`:
 | `target_arrival_rate` | The rate requested via `--arrival-rate` |
 | `achieved_arrival_rate` | Requests actually dispatched ÷ offer window |
 | `offer_window_seconds` | First arrival → one interval past the last one, or the wall time taken if that was longer |
+| `requested_duration_seconds` | What `--duration-seconds` asked for; `null` in `--requests` mode |
 | `client_max_in_flight` | The capacity bound in force |
-| `client_dispatch_lag_ms` | Percentile block over scheduled arrival → HTTP start |
+| `client_dispatch_lag_ms` | Percentiles (`mean`, `p50`, `p90`, `p95`, `p99`) over scheduled arrival → HTTP start |
 | `completions_in_offer_window` | Requests that also *finished* before the window closed |
 | `drain_seconds` | How long the tail of in-flight requests took after it closed |
 | `client_saturated` | See below |
 
 `client_saturated` is true when `achieved_arrival_rate` falls below 95% of
 target, **or** when p95 dispatch lag exceeds one full arrival interval.
+
+`offer_window_seconds` is **schedule-relative**: each request owns one arrival
+interval, so N requests occupy N intervals. This is what makes
+`achieved_arrival_rate` come out at exactly the target for a client that keeps
+up, and drop below it for one that does not. A consequence is that in duration
+mode the window can exceed `--duration-seconds` by up to one interval, whenever
+`duration × arrival-rate` is not a whole number — compare it against
+`requested_duration_seconds`. The window is deliberately not capped at the
+deadline: that would shorten the denominator without changing the request count,
+making the achieved rate read *above* target. `--duration-seconds` shorter than
+one arrival interval is rejected outright, since it cannot sample the rate at
+all.
 
 **A saturated cell measures the benchmark client, not the server.** Its latency
 and throughput numbers are not comparable with an unsaturated cell and must not
