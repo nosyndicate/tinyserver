@@ -157,7 +157,7 @@ bench-results/
 | `config.json` | Exact CLI arguments, the run's clock epochs, and the resolved scenario definition; sufficient to reproduce the run |
 | `requests.jsonl` | One JSON object per request (including failures); raw data for post-hoc analysis |
 
-### Corrected measurement semantics
+### Corrected measurement semantics (PR 94)
 
 The definitions below replace measurements that were producing invalid numbers —
 wall-clock timestamps, a client token count that dropped empty decodes, a TPOT
