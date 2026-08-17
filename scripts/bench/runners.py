@@ -98,11 +98,23 @@ class StreamAccumulator:
     Pure apart from the injected ``now`` (monotonic offsets in seconds), so the
     whole streaming measurement path is testable by feeding dicts.
 
-    A chunk is a *token* chunk exactly when it carries no ``error``. The server
-    holds the last token back so it can ride along with the final ``is_done``
-    chunk (``server/api/routes.py``), so the terminal chunk is a token chunk too,
-    and an empty ``token_str`` is a real token (EOS and byte-fragment BPE pieces
-    decode to ``""``) rather than a chunk to skip.
+    A chunk carries a token when it has no ``error`` and is not a token-less
+    terminal chunk. Mid-stream, an empty ``token_str`` *is* a real token —
+    byte-fragment BPE pieces decode to ``""`` — so it is counted, not skipped.
+
+    The two server shapes differ at the end of the stream:
+
+    - v2/v3/v4 (``server/api/routes.py``) hold the last real token back so it
+      rides along with the final ``is_done`` chunk. That terminal chunk does
+      carry a token.
+    - v1 (``server/model/hf_runner.py``, EOS path) appends a *separate*
+      token-less ``is_done`` chunk after the real tokens. Counting it would
+      overstate the generation by one.
+
+    Excluding token-less terminal chunks is right for v1 and harmless for v2+:
+    it can undercount by one there when the final real token decodes to ``""``,
+    but v2+ always reports ``output_tokens``, so ``resolve_output_tokens`` uses
+    the server's count and this tally is never consulted.
     """
 
     now: Callable[[], float]
@@ -127,13 +139,15 @@ class StreamAccumulator:
             return
 
         token_str = chunk.get("token_str", "")
-        if self.first_token_offset_s is None:
-            self.first_token_offset_s = self.now()
-        self.client_token_count += 1
-        self.response_text_chars += len(token_str)
-        self._hasher.update(token_str.encode("utf-8"))
+        is_done = bool(chunk.get("is_done"))
+        if token_str or not is_done:
+            if self.first_token_offset_s is None:
+                self.first_token_offset_s = self.now()
+            self.client_token_count += 1
+            self.response_text_chars += len(token_str)
+            self._hasher.update(token_str.encode("utf-8"))
 
-        if chunk.get("is_done"):
+        if is_done:
             self.server_prompt_tokens = chunk.get("prompt_tokens")
             self.server_output_tokens = chunk.get("output_tokens")
             # Every metric key may be absent: v2+ serializes with
@@ -275,13 +289,16 @@ def _run_sync_request(
             output_tokens = response_data.get("output_tokens")
             response_text = response_data.get("text", "")
 
-            # The sync endpoint reports no intermediate token timing, so the
-            # only client-observable TTFT is the server's, rebased onto the
-            # client clock.
-            client_ttft_ms = (
-                server_ttft_ms if server_ttft_ms is not None else client_http_ms
-            )
-            first_token_ts = start_ts + (client_ttft_ms / 1000.0)
+            # A sync endpoint returns the whole response at once, so there is
+            # no client-observable first token: client_ttft_ms and
+            # client_tpot_ms (which _tpot_ms derives from it) are null here by
+            # definition. Do not "restore" them from server_ttft_ms — that is
+            # measured from server enqueue, on the server's clock, while
+            # client_http_ms starts before the request is even sent. Assigning
+            # one to the other mislabels a server duration rather than rebasing
+            # it. The server's view is preserved in the server_* fields.
+            client_ttft_ms = None
+            first_token_ts = None
             server_decode_start_ms = (
                 server_ttft_ms - server_queue_wait_ms
                 if server_ttft_ms is not None and server_queue_wait_ms is not None

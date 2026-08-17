@@ -193,10 +193,18 @@ clocks from different origins, so combining them in one number is meaningless.
 of `client_ttft_ms`, `client_tpot_ms`, `server_queue_wait_ms`, and
 `server_execution_ms` so existing analysis scripts keep loading.
 
+**Non-streaming endpoints report `client_ttft_ms` and `client_tpot_ms` as
+`null`.** The whole response arrives at once, so there is no client-observable
+first token; use `server_ttft_ms` / `server_tpot_ms` for those runs. The server's
+figure is not copied into the client field, because it is measured from server
+enqueue on a different clock.
+
 **Output tokens come from the server.** Counting non-empty `token_str` chunks
-client-side undercounts, because EOS and byte-fragment BPE pieces legitimately
-decode to `""`. The client keeps its own count only as a fallback, and says so
-via `output_tokens_source`.
+client-side undercounts, because byte-fragment BPE pieces legitimately decode to
+`""`. The client keeps its own count only as a fallback, and says so via
+`output_tokens_source`. That fallback counts every chunk *except* a token-less
+terminal one: the v1 stream appends a separate empty `is_done` chunk on the EOS
+path, while v2/v3/v4 instead hold the last real token back onto theirs.
 
 **`output_sha256` is only comparable where `deterministic_gate` is true.** At
 `temperature > 0`, v2/v3/v4 will not produce byte-identical text across batch

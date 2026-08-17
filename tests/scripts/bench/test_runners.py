@@ -379,15 +379,18 @@ class TestRunSyncRequest:
         assert result.server_execution_ms == 185.0
         # server_tpot = (185 - (50 - 15)) / (5 - 1)
         assert result.server_tpot_ms == pytest.approx(37.5)
-        # The sync endpoint streams nothing, so client TTFT is the server's.
-        assert result.client_ttft_ms == 50.0
+        # The sync endpoint streams nothing, so there is no client-observable
+        # first token. The server's figure stays in server_ttft_ms.
+        assert result.client_ttft_ms is None
+        assert result.client_tpot_ms is None
+        assert result.first_token_ts is None
         # Clock scripted 0.0 -> 0.2, so the client observed 200ms end to end.
         assert result.client_http_ms == pytest.approx(200.0)
         assert result.latency_ms == pytest.approx(200.0)
         assert result.response_text_chars == len("hello world")
         assert result.output_sha256 == hashlib.sha256(b"hello world").hexdigest()
 
-    def test_success_computes_tpot(self) -> None:
+    def test_success_computes_server_tpot(self) -> None:
         fake = _FakeSyncResponse(
             200,
             json_data={
@@ -397,6 +400,8 @@ class TestRunSyncRequest:
                 "output_tokens": 5,
                 "prompt_tokens": 8,
                 "tokens_per_s": 25.0,
+                "queue_wait_ms": 20.0,
+                "execution_ms": 180.0,
             },
         )
         with patch("scripts.bench.runners.requests.post", return_value=fake):
@@ -409,8 +414,12 @@ class TestRunSyncRequest:
                 plan=_DUMMY_PLAN,
                 clock=_scripted_clock(0.0, 0.2),
             )
-        # tpot = (total_ms - ttft_ms) / (output_tokens - 1) = (200 - 40) / 4 = 40.0
-        assert result.tpot_ms == pytest.approx(40.0)
+        # Entirely on the server clock:
+        # (execution_ms - (ttft_ms - queue_wait_ms)) / (output_tokens - 1)
+        # = (180 - (40 - 20)) / 4 = 40.0
+        assert result.server_tpot_ms == pytest.approx(40.0)
+        # No client-side TPOT for a non-streaming endpoint.
+        assert result.client_tpot_ms is None
 
     def test_http_error_with_json(self) -> None:
         fake = _FakeSyncResponse(500, json_data={"error": "internal failure"})
@@ -657,6 +666,64 @@ class TestStreamAccumulator:
             _done_chunk(token_str=" there"),
         )
         assert base.output_sha256 != other.output_sha256
+
+    def test_v1_eos_terminal_chunk_is_not_counted(self) -> None:
+        # v1 appends a separate token-less is_done chunk on the EOS path
+        # (server/model/hf_runner.py) instead of holding the last token back,
+        # and reports every metric as null, so the client count is what gets
+        # used. Counting that chunk would overstate the run by one.
+        acc = _feed(
+            StreamAccumulator(now=_scripted_clock(0.0).offset),
+            {"token_str": "a", "is_first": True, "is_done": False},
+            {"token_str": "b", "is_first": False, "is_done": False},
+            {"token_str": "", "is_first": False, "is_done": True},
+        )
+        assert acc.resolve_output_tokens() == (2, "client_count")
+        assert acc.done is True
+
+    def test_zero_token_eos_stamps_no_first_token(self) -> None:
+        acc = _feed(
+            StreamAccumulator(now=_scripted_clock(0.0, 0.5).offset),
+            {"token_str": "", "is_first": True, "is_done": True},
+        )
+        assert acc.resolve_output_tokens() == (0, "client_count")
+        assert acc.first_token_offset_s is None
+        assert acc.done is True
+
+    def test_token_less_terminal_chunk_leaves_hash_unchanged(self) -> None:
+        chunks: list[dict[str, Any]] = [
+            {"token_str": "a", "is_first": True, "is_done": False},
+            {"token_str": "b", "is_first": False, "is_done": False},
+        ]
+        without = _feed(StreamAccumulator(now=_scripted_clock(0.0).offset), *chunks)
+        with_terminal = _feed(
+            StreamAccumulator(now=_scripted_clock(0.0).offset),
+            *chunks,
+            {"token_str": "", "is_first": False, "is_done": True},
+        )
+        assert with_terminal.output_sha256 == without.output_sha256
+        assert with_terminal.response_text_chars == without.response_text_chars
+
+    def test_v2_terminal_chunk_carrying_a_token_is_counted(self) -> None:
+        # v2+ holds the last real token back onto its is_done chunk, so that
+        # chunk must still count.
+        acc = _feed(
+            StreamAccumulator(now=_scripted_clock(0.0).offset),
+            {"token_str": "a", "is_first": True, "is_done": False},
+            _done_chunk(token_str="b", output_tokens=None),
+        )
+        assert acc.resolve_output_tokens() == (2, "client_count")
+
+    def test_mid_stream_empty_token_is_still_counted(self) -> None:
+        # Only a *terminal* token-less chunk is skipped; mid-stream, an empty
+        # token_str is a real byte-fragment token.
+        acc = _feed(
+            StreamAccumulator(now=_scripted_clock(0.0).offset),
+            {"token_str": "a", "is_first": True, "is_done": False},
+            {"token_str": "", "is_first": False, "is_done": False},
+            {"token_str": "", "is_first": False, "is_done": True},
+        )
+        assert acc.resolve_output_tokens() == (2, "client_count")
 
     def test_hash_is_order_sensitive(self) -> None:
         forward = _feed(
