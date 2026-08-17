@@ -5,6 +5,7 @@ import json
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from .execution import (
     _run_closed_loop,
@@ -57,8 +58,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--top-p", type=float)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--mode", choices=["closed", "open"], default="closed")
+    # Closed-loop worker count. Open loop is bounded by --client-max-in-flight
+    # instead, so that arrival rate and client capacity stay separate knobs.
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--arrival-rate", type=float)
+    parser.add_argument("--client-max-in-flight", type=int, default=256)
     parser.add_argument("--requests", type=int)
     parser.add_argument("--duration-seconds", type=float)
     parser.add_argument("--warmup-requests", type=int, default=0)
@@ -76,9 +80,10 @@ def _validate_args(args: argparse.Namespace) -> None:
     if args.mode == "open":
         if args.arrival_rate is None or args.arrival_rate <= 0:
             raise ValueError("--arrival-rate must be positive for open-loop mode")
-        if args.concurrency <= 0:
+        if args.client_max_in_flight <= 0:
             raise ValueError(
-                "--concurrency must be positive; it sets client worker count in open-loop mode"
+                "--client-max-in-flight must be positive; it bounds client capacity"
+                " in open-loop mode (--concurrency is closed-loop only)"
             )
     if (args.requests is None) == (args.duration_seconds is None):
         raise ValueError("Specify exactly one of --requests or --duration-seconds")
@@ -86,6 +91,17 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--requests must be positive")
     if args.duration_seconds is not None and args.duration_seconds <= 0:
         raise ValueError("--duration-seconds must be positive")
+    # Checked last, once both values above are known good. A window shorter than
+    # one arrival interval cannot sample the rate it claims to offer: the
+    # schedule calls for under one request, so any measurement is an artifact of
+    # rounding rather than of the server.
+    if args.mode == "open" and args.duration_seconds is not None:
+        interval_s = 1.0 / args.arrival_rate
+        if args.duration_seconds < interval_s:
+            raise ValueError(
+                "--duration-seconds must cover at least one arrival interval"
+                f" ({interval_s:.4g}s at --arrival-rate {args.arrival_rate})"
+            )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -122,21 +138,24 @@ def main(argv: list[str] | None = None) -> int:
     warmup_results = _run_warmup(args, all_plans, run_clock)
     run_id = datetime.now(timezone.utc).strftime("run-%Y%m%dT%H%M%S")
     window_start_s = run_clock.offset()
+    open_loop_stats: dict[str, Any] | None = None
     if args.requests is not None:
         measurement_plans = all_plans[args.warmup_requests :]
         if args.mode == "closed":
             results = _run_closed_loop(args, measurement_plans, run_id, run_clock)
         else:
-            results = _run_open_loop(args, measurement_plans, run_id, run_clock)
+            outcome = _run_open_loop(args, measurement_plans, run_id, run_clock)
+            results, open_loop_stats = outcome.results, outcome.stats
     else:
         if args.mode == "closed":
             results = _run_closed_loop_for_duration(
                 args, scenario, run_id, prompt_override, run_clock
             )
         else:
-            results = _run_open_loop_for_duration(
+            outcome = _run_open_loop_for_duration(
                 args, scenario, run_id, prompt_override, run_clock
             )
+            results, open_loop_stats = outcome.results, outcome.stats
     window_end_s = run_clock.offset()
 
     summary = _summarize_results(
@@ -147,6 +166,7 @@ def main(argv: list[str] | None = None) -> int:
         window_end_s,
         results,
         warmup_results,
+        open_loop_stats,
     )
 
     if args.summary_only:
@@ -167,6 +187,8 @@ def main(argv: list[str] | None = None) -> int:
                 ).isoformat(),
                 "perf_epoch_s": run_clock.perf_epoch_s,
             },
+            # Fixed-interval, so a rerun offers requests at the same instants.
+            "arrival_process": "deterministic" if args.mode == "open" else None,
             "scenario_file": str(
                 Path(args.scenario_file)
                 if args.scenario_file is not None

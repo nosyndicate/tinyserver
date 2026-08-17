@@ -72,17 +72,69 @@ python -m scripts.bench \
 
 ### Open-loop (`--mode open`)
 
-Requests are dispatched at a fixed `--arrival-rate` (requests per second) regardless of how many are already in-flight. This exposes queue growth, backpressure, and tail latency under overload.
+Requests are offered at a fixed `--arrival-rate` (requests per second) regardless of how many are already in-flight. This exposes queue growth, backpressure, and tail latency under overload.
 
 ```bash
 python -m scripts.bench \
   --scenario burst \
   --mode open \
   --arrival-rate 12 \
+  --client-max-in-flight 256 \
   --duration-seconds 60
 ```
 
 **Note:** `--arrival-rate` is required for open-loop mode. Exactly one of `--requests` or `--duration-seconds` must always be specified.
+
+#### Arrival rate vs. client capacity
+
+The two are separate knobs. `--arrival-rate` is the schedule the client *offers*;
+`--client-max-in-flight` (default 256) bounds how many requests may be
+outstanding at once. `--concurrency` plays no part in open loop — it is
+closed-loop only.
+
+Arrivals are fixed-interval, recorded as `arrival_process: "deterministic"` in
+`config.json`, so a rerun offers requests at the same instants.
+
+When the in-flight bound is reached the dispatcher blocks, and the wait shows up
+as `client_dispatch_lag_ms` on every request offered afterwards. That is the
+point: a client that cannot keep up says so instead of silently queueing
+requests internally and reporting a load it never actually generated.
+
+#### Client saturation
+
+Every open-loop run reports its offer window in `summary.json`:
+
+| Field | Meaning |
+|---|---|
+| `target_arrival_rate` | The rate requested via `--arrival-rate` |
+| `achieved_arrival_rate` | Requests actually dispatched ÷ offer window |
+| `offer_window_seconds` | First arrival → one interval past the last one, or the wall time taken if that was longer |
+| `requested_duration_seconds` | What `--duration-seconds` asked for; `null` in `--requests` mode |
+| `client_max_in_flight` | The capacity bound in force |
+| `client_dispatch_lag_ms` | Percentiles (`mean`, `p50`, `p90`, `p95`, `p99`) over scheduled arrival → HTTP start |
+| `completions_in_offer_window` | Requests that also *finished* before the window closed |
+| `drain_seconds` | How long the tail of in-flight requests took after it closed |
+| `client_saturated` | See below |
+
+`client_saturated` is true when `achieved_arrival_rate` falls below 95% of
+target, **or** when p95 dispatch lag exceeds one full arrival interval.
+
+`offer_window_seconds` is **schedule-relative**: each request owns one arrival
+interval, so N requests occupy N intervals. This is what makes
+`achieved_arrival_rate` come out at exactly the target for a client that keeps
+up, and drop below it for one that does not. A consequence is that in duration
+mode the window can exceed `--duration-seconds` by up to one interval, whenever
+`duration × arrival-rate` is not a whole number — compare it against
+`requested_duration_seconds`. The window is deliberately not capped at the
+deadline: that would shorten the denominator without changing the request count,
+making the achieved rate read *above* target. `--duration-seconds` shorter than
+one arrival interval is rejected outright, since it cannot sample the rate at
+all.
+
+**A saturated cell measures the benchmark client, not the server.** Its latency
+and throughput numbers are not comparable with an unsaturated cell and must not
+be ranked against one. Raise `--client-max-in-flight`, or lower the arrival rate,
+and rerun.
 
 ---
 
@@ -120,8 +172,9 @@ CLI overrides take precedence over scenario values; unset flags leave scenario v
 | Flag | Default | Description |
 |---|---|---|
 | `--mode` | `closed` | `closed` (fixed concurrency) or `open` (fixed arrival rate) |
-| `--concurrency` | `4` | Worker thread count (both modes) |
-| `--arrival-rate` | — | Requests per second (required for open-loop) |
+| `--concurrency` | `4` | Worker thread count — **closed loop only** |
+| `--arrival-rate` | — | Requests offered per second (required for open-loop) |
+| `--client-max-in-flight` | `256` | Open loop: maximum outstanding requests. Bounds client capacity independently of the arrival rate |
 | `--requests` | — | Total measurement requests (mutually exclusive with `--duration-seconds`) |
 | `--duration-seconds` | — | Measurement window in seconds (mutually exclusive with `--requests`) |
 | `--warmup-requests` | `0` | Sequential warmup requests excluded from results |
@@ -181,7 +234,8 @@ clocks from different origins, so combining them in one number is meaningless.
 | Field | Meaning |
 |---|---|
 | `latency_ms` | Client: scheduled arrival → completion. The headline end-to-end number |
-| `client_dispatch_lag_ms` | Client: scheduled arrival → HTTP start. `0.0` in closed loop, where arrival *is* the HTTP start |
+| `client_dispatch_lag_ms` | Client: scheduled arrival → HTTP start. `0.0` in closed loop, where arrival *is* the HTTP start; in open loop it is the client's own queueing delay, and it drives `client_saturated` |
+| `scheduled_arrival_offset_s` | Client: the instant the open-loop schedule called for this request, from the run epoch |
 | `client_http_ms` | Client: HTTP start → completion |
 | `client_ttft_ms` | Client: HTTP start → first streamed token |
 | `client_tpot_ms` | `(client_http_ms − client_ttft_ms) / (n − 1)`; `null` below two tokens |
@@ -293,10 +347,15 @@ for R in 2 4 8 16 32; do
     --scenario burst \
     --mode open \
     --arrival-rate $R \
+    --client-max-in-flight 256 \
     --duration-seconds 30 \
     --out bench-results
 done
 ```
+
+Check `client_saturated` in each `summary.json` before comparing the cells; at
+the top of the sweep the client can run out of capacity before the server does,
+and such a cell says nothing about the server.
 
 ### Determinism check
 
