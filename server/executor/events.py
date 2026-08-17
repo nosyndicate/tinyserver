@@ -96,12 +96,17 @@ class RequestEventEmitter:
         On EOS the token text is emitted as an empty string (the model's EOS
         token itself is not part of the output).  For all other finished
         reasons (e.g. max length), the final token text is included.
+
+        ``first_token_ns`` is stamped only when an output token is actually
+        appended, so TTFT stays null for a request that finishes without
+        emitting one.
         """
         is_first = request_state.num_output_tokens == 0
-        if is_first:
-            request_state.first_token_ns = now_ns()
 
         if result.finish_reason == FinishReason.EOS:
+            # EOS produces no output token, so first_token_ns is deliberately
+            # left unset here. A request whose very first decode step is EOS
+            # finishes with zero output tokens and therefore a null TTFT.
             request_state.sink.emit(
                 TokenEvent(
                     request_id=request_state.request_id,
@@ -114,6 +119,9 @@ class RequestEventEmitter:
             request_state.finished_reason = FinishReason.EOS
             self._finish(request_state)
             return
+
+        if is_first:
+            request_state.first_token_ns = now_ns()
 
         request_state.output_tokens.append(result.token)
         request_state.sink.emit(

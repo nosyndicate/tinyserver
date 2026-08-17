@@ -287,6 +287,47 @@ def test_done_event_carries_timings_measured_from_enqueue() -> None:
     assert done.ttft_ms >= done.queue_wait_ms
 
 
+def test_immediate_eos_reports_null_ttft() -> None:
+    # The model can sample EOS on the very first decode step. No output token
+    # is produced, so TTFT must stay null rather than timing the empty
+    # end-of-stream event.
+    req = make_req()
+    req.status = RequestStatus.DECODING
+    req.num_prompt_tokens = 3
+    req.start_ns = 25_000_000
+
+    RequestEventEmitter().on_token(
+        req,
+        DecodeResult(token_id=2, token="", finish_reason=FinishReason.EOS),
+    )
+
+    assert req.first_token_ns is None
+    done = drain_events(req)[1]
+    assert isinstance(done, DoneEvent)
+    assert done.num_output_tokens == 0
+    assert done.ttft_ms is None
+
+
+def test_eos_after_a_token_keeps_ttft_from_that_token() -> None:
+    req = make_req()
+    req.status = RequestStatus.DECODING
+    req.num_prompt_tokens = 3
+    req.start_ns = 25_000_000
+
+    emitter = RequestEventEmitter()
+    emitter.on_token(req, DecodeResult(token_id=2, token="a", finish_reason=None))
+    first_token_ns = req.first_token_ns
+    emitter.on_token(
+        req, DecodeResult(token_id=3, token="", finish_reason=FinishReason.EOS)
+    )
+
+    assert req.first_token_ns == first_token_ns
+    done = drain_events(req)[-1]
+    assert isinstance(done, DoneEvent)
+    assert done.num_output_tokens == 1
+    assert done.ttft_ms is not None
+
+
 def test_finish_requires_start_ns() -> None:
     req = make_req()
     req.num_prompt_tokens = 3
