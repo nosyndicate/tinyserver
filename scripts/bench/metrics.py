@@ -6,7 +6,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 
-from .models import RequestResult, Scenario
+from .models import SCHEMA_VERSION, RequestResult, Scenario
 
 
 def _percentiles(values: list[float]) -> dict[str, float | None]:
@@ -42,11 +42,17 @@ def _summarize_results(
     args: argparse.Namespace,
     scenario: Scenario,
     run_id: str,
-    run_started_ts: float,
-    run_ended_ts: float,
+    window_start_s: float,
+    window_end_s: float,
     results: list[RequestResult],
     warmup_results: list[RequestResult],
 ) -> dict[str, Any]:
+    """
+    Reduce per-request results to a run summary.
+
+    ``window_start_s`` / ``window_end_s`` are monotonic offsets from the run's
+    ``RunClock`` epoch, taken around the dispatch loop after warmup.
+    """
     completed = [result for result in results if result.ok]
     ttfts = [result.ttft_ms for result in completed if result.ttft_ms is not None]
     totals = [result.latency_ms for result in completed]
@@ -58,7 +64,7 @@ def _summarize_results(
         result.execution_ms for result in completed if result.execution_ms is not None
     ]
     output_tokens = [result.output_tokens or 0 for result in completed]
-    throughput_window_seconds = max(run_ended_ts - run_started_ts, 0.0)
+    throughput_window_seconds = max(window_end_s - window_start_s, 0.0)
     error_counts = Counter(result.error_type or "ok" for result in results)
     status_counts = Counter(
         str(result.http_status) if result.http_status is not None else "none"
@@ -66,6 +72,7 @@ def _summarize_results(
     )
 
     summary = {
+        "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "base_url": args.base_url,

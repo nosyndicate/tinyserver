@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import hashlib
 import json
-import time
 import uuid
-from typing import Any, Callable
+from dataclasses import dataclass, field
+from typing import Any, Callable, Protocol
 
 import requests
 
 from .metrics import _rate
-from .models import RequestPlan, RequestResult
+from .models import RequestPlan, RequestResult, RunClock
 
 DEFAULT_HEADERS = {"Accept": "application/json"}
 STREAM_HEADERS = {"Accept": "text/event-stream"}
+
+OUTPUT_TOKENS_FROM_SERVER = "server"
+OUTPUT_TOKENS_FROM_CLIENT_COUNT = "client_count"
 
 
 def _endpoint_path(endpoint: str) -> str:
@@ -53,6 +57,111 @@ def _parse_sse_chunk(line: str) -> dict[str, Any] | None:
     return json.loads(line[len("data: ") :])
 
 
+def _float_or_none(value: Any) -> float | None:
+    return float(value) if value is not None else None
+
+
+def _tpot_ms(
+    span_ms: float | None, first_token_ms: float | None, num_tokens: int | None
+) -> float | None:
+    """
+    Time per output token: the decode span after the first token, divided by the
+    number of inter-token gaps.
+
+    ``span_ms`` and ``first_token_ms`` must be measured on the *same* clock and
+    from the same origin — mixing a server numerator with a client token count
+    (the pre-schema-v2 behaviour) produces a number with no meaning. Returns
+    ``None`` below two tokens, where there is no gap to average over.
+    """
+    if span_ms is None or first_token_ms is None or num_tokens is None:
+        return None
+    if num_tokens < 2:
+        return None
+    return max(span_ms - first_token_ms, 0.0) / (num_tokens - 1)
+
+
+def _deterministic_gate(payload: dict[str, Any]) -> bool:
+    """
+    Whether this request's sampling settings make the output reproducible, and
+    therefore whether its ``output_sha256`` is meaningful to compare across
+    server versions. Sampling at temperature > 0 varies with batch shape, so
+    only greedy seeded requests are gated.
+    """
+    return payload.get("temperature") == 0.0 and payload.get("seed") is not None
+
+
+@dataclass
+class StreamAccumulator:
+    """
+    Folds SSE chunks into client-side measurements.
+
+    Pure apart from the injected ``now`` (monotonic offsets in seconds), so the
+    whole streaming measurement path is testable by feeding dicts.
+
+    A chunk is a *token* chunk exactly when it carries no ``error``. The server
+    holds the last token back so it can ride along with the final ``is_done``
+    chunk (``server/api/routes.py``), so the terminal chunk is a token chunk too,
+    and an empty ``token_str`` is a real token (EOS and byte-fragment BPE pieces
+    decode to ``""``) rather than a chunk to skip.
+    """
+
+    now: Callable[[], float]
+    first_token_offset_s: float | None = None
+    client_token_count: int = 0
+    response_text_chars: int = 0
+    done: bool = False
+    error: str | None = None
+    server_prompt_tokens: int | None = None
+    server_output_tokens: int | None = None
+    server_ttft_ms: float | None = None
+    server_total_ms: float | None = None
+    server_queue_wait_ms: float | None = None
+    server_execution_ms: float | None = None
+    server_tokens_per_s: float | None = None
+    _hasher: Any = field(default_factory=hashlib.sha256)
+
+    def feed(self, chunk: dict[str, Any]) -> None:
+        if chunk.get("error"):
+            self.error = str(chunk["error"])
+            self.done = True
+            return
+
+        token_str = chunk.get("token_str", "")
+        if self.first_token_offset_s is None:
+            self.first_token_offset_s = self.now()
+        self.client_token_count += 1
+        self.response_text_chars += len(token_str)
+        self._hasher.update(token_str.encode("utf-8"))
+
+        if chunk.get("is_done"):
+            self.server_prompt_tokens = chunk.get("prompt_tokens")
+            self.server_output_tokens = chunk.get("output_tokens")
+            # Every metric key may be absent: v2+ serializes with
+            # exclude_none, and the v1 stream sends them all as null.
+            self.server_ttft_ms = _float_or_none(chunk.get("ttft_ms"))
+            self.server_total_ms = _float_or_none(chunk.get("total_ms"))
+            self.server_queue_wait_ms = _float_or_none(chunk.get("queue_wait_ms"))
+            self.server_execution_ms = _float_or_none(chunk.get("execution_ms"))
+            self.server_tokens_per_s = _float_or_none(chunk.get("tokens_per_s"))
+            self.done = True
+
+    @property
+    def output_sha256(self) -> str:
+        return self._hasher.hexdigest()
+
+    def resolve_output_tokens(self) -> tuple[int, str]:
+        """The authoritative token count, and where it came from."""
+        if self.server_output_tokens is not None:
+            return int(self.server_output_tokens), OUTPUT_TOKENS_FROM_SERVER
+        return self.client_token_count, OUTPUT_TOKENS_FROM_CLIENT_COUNT
+
+    def server_decode_start_ms(self) -> float | None:
+        """Server TTFT rebased onto the execution clock (both start at prefill)."""
+        if self.server_ttft_ms is None or self.server_queue_wait_ms is None:
+            return None
+        return self.server_ttft_ms - self.server_queue_wait_ms
+
+
 def _make_result(
     *,
     run_id: str,
@@ -61,6 +170,7 @@ def _make_result(
     plan: RequestPlan,
     start_ts: float,
     end_ts: float,
+    scheduled_arrival_offset_s: float | None = None,
     latency_ms: float | None = None,
     first_token_ts: float | None = None,
     ttft_ms: float | None = None,
@@ -68,16 +178,25 @@ def _make_result(
     output_tokens: int | None = None,
     prompt_tokens: int | None = None,
     tokens_per_s: float | None = None,
-    queue_wait_ms: float | None = None,
-    execution_ms: float | None = None,
+    server_total_ms: float | None = None,
+    server_queue_wait_ms: float | None = None,
+    server_execution_ms: float | None = None,
+    server_ttft_ms: float | None = None,
+    server_tpot_ms: float | None = None,
+    output_sha256: str | None = None,
+    output_tokens_source: str | None = None,
     http_status: int | None = None,
     ok: bool = False,
     error_type: str | None = None,
     error: str | None = None,
     response_text_chars: int | None = None,
 ) -> RequestResult:
+    if scheduled_arrival_offset_s is None:
+        scheduled_arrival_offset_s = start_ts
+    client_http_ms = (end_ts - start_ts) * 1000.0
+    client_dispatch_lag_ms = max((start_ts - scheduled_arrival_offset_s) * 1000.0, 0.0)
     if latency_ms is None:
-        latency_ms = (end_ts - start_ts) * 1000.0
+        latency_ms = client_dispatch_lag_ms + client_http_ms
     return RequestResult(
         request_id=str(uuid.uuid4()),
         run_id=run_id,
@@ -95,14 +214,27 @@ def _make_result(
         output_tokens=output_tokens,
         prompt_tokens=prompt_tokens,
         tokens_per_s=tokens_per_s,
-        queue_wait_ms=queue_wait_ms,
-        execution_ms=execution_ms,
+        queue_wait_ms=server_queue_wait_ms,
+        execution_ms=server_execution_ms,
         http_status=http_status,
         ok=ok,
         error_type=error_type,
         error=error,
         prompt_length_chars=plan.prompt_length_chars,
         response_text_chars=response_text_chars,
+        scheduled_arrival_offset_s=scheduled_arrival_offset_s,
+        client_dispatch_lag_ms=client_dispatch_lag_ms,
+        client_http_ms=client_http_ms,
+        client_ttft_ms=ttft_ms,
+        client_tpot_ms=tpot_ms,
+        server_total_ms=server_total_ms,
+        server_queue_wait_ms=server_queue_wait_ms,
+        server_execution_ms=server_execution_ms,
+        server_ttft_ms=server_ttft_ms,
+        server_tpot_ms=server_tpot_ms,
+        output_sha256=output_sha256,
+        output_tokens_source=output_tokens_source,
+        deterministic_gate=_deterministic_gate(plan.payload),
         metadata=dict(plan.metadata),
     )
 
@@ -114,9 +246,11 @@ def _run_sync_request(
     run_id: str,
     mode: str,
     plan: RequestPlan,
+    clock: RunClock,
+    *,
+    scheduled_arrival_offset_s: float | None = None,
 ) -> RequestResult:
-    start_ts = time.time()
-    first_token_ts = None
+    start_ts = clock.offset()
     try:
         response = requests.post(
             _full_url(base_url, endpoint),
@@ -124,8 +258,8 @@ def _run_sync_request(
             timeout=timeout_seconds,
             headers=DEFAULT_HEADERS,
         )
-        end_ts = time.time()
-        latency_ms = (end_ts - start_ts) * 1000.0
+        end_ts = clock.offset()
+        client_http_ms = (end_ts - start_ts) * 1000.0
         response_data: dict[str, Any] | None = None
         error = None
         try:
@@ -134,18 +268,35 @@ def _run_sync_request(
             error = response.text[:500]
 
         if response.ok and response_data is not None:
-            ttft_ms = response_data.get("ttft_ms")
-            total_ms = response_data.get("total_ms", latency_ms)
+            server_ttft_ms = _float_or_none(response_data.get("ttft_ms"))
+            server_total_ms = _float_or_none(response_data.get("total_ms"))
+            server_queue_wait_ms = _float_or_none(response_data.get("queue_wait_ms"))
+            server_execution_ms = _float_or_none(response_data.get("execution_ms"))
             output_tokens = response_data.get("output_tokens")
-            prompt_tokens = response_data.get("prompt_tokens")
-            tokens_per_s = response_data.get("tokens_per_s")
             response_text = response_data.get("text", "")
-            if ttft_ms is not None:
-                first_token_ts = start_ts + (float(ttft_ms) / 1000.0)
-            tpot_ms = None
-            if output_tokens and ttft_ms is not None and output_tokens > 1:
-                tpot_ms = max(float(total_ms) - float(ttft_ms), 0.0) / (
-                    output_tokens - 1
+
+            # The sync endpoint reports no intermediate token timing, so the
+            # only client-observable TTFT is the server's, rebased onto the
+            # client clock.
+            client_ttft_ms = (
+                server_ttft_ms if server_ttft_ms is not None else client_http_ms
+            )
+            first_token_ts = start_ts + (client_ttft_ms / 1000.0)
+            server_decode_start_ms = (
+                server_ttft_ms - server_queue_wait_ms
+                if server_ttft_ms is not None and server_queue_wait_ms is not None
+                else None
+            )
+            tokens_per_s = _float_or_none(response_data.get("tokens_per_s"))
+            if tokens_per_s is None and output_tokens:
+                tokens_per_s = _rate(
+                    output_tokens,
+                    (
+                        server_execution_ms
+                        if server_execution_ms is not None
+                        else client_http_ms
+                    )
+                    / 1000.0,
                 )
             return _make_result(
                 run_id=run_id,
@@ -154,24 +305,23 @@ def _run_sync_request(
                 plan=plan,
                 start_ts=start_ts,
                 end_ts=end_ts,
-                latency_ms=float(total_ms),
+                scheduled_arrival_offset_s=scheduled_arrival_offset_s,
                 first_token_ts=first_token_ts,
-                ttft_ms=float(ttft_ms) if ttft_ms is not None else None,
-                tpot_ms=tpot_ms,
+                ttft_ms=client_ttft_ms,
+                tpot_ms=_tpot_ms(client_http_ms, client_ttft_ms, output_tokens),
                 output_tokens=output_tokens,
-                prompt_tokens=prompt_tokens,
-                tokens_per_s=(
-                    float(tokens_per_s) if tokens_per_s is not None else None
+                prompt_tokens=response_data.get("prompt_tokens"),
+                tokens_per_s=tokens_per_s,
+                server_total_ms=server_total_ms,
+                server_queue_wait_ms=server_queue_wait_ms,
+                server_execution_ms=server_execution_ms,
+                server_ttft_ms=server_ttft_ms,
+                server_tpot_ms=_tpot_ms(
+                    server_execution_ms, server_decode_start_ms, output_tokens
                 ),
-                queue_wait_ms=(
-                    float(response_data["queue_wait_ms"])
-                    if response_data.get("queue_wait_ms") is not None
-                    else None
-                ),
-                execution_ms=(
-                    float(response_data["execution_ms"])
-                    if response_data.get("execution_ms") is not None
-                    else None
+                output_sha256=hashlib.sha256(response_text.encode("utf-8")).hexdigest(),
+                output_tokens_source=(
+                    OUTPUT_TOKENS_FROM_SERVER if output_tokens is not None else None
                 ),
                 http_status=response.status_code,
                 ok=True,
@@ -190,32 +340,32 @@ def _run_sync_request(
             plan=plan,
             start_ts=start_ts,
             end_ts=end_ts,
-            latency_ms=latency_ms,
+            scheduled_arrival_offset_s=scheduled_arrival_offset_s,
             http_status=response.status_code,
             error_type="http_error",
             error=error_message,
         )
     except requests.Timeout as exc:
-        end_ts = time.time()
         return _make_result(
             run_id=run_id,
             endpoint=endpoint,
             mode=mode,
             plan=plan,
             start_ts=start_ts,
-            end_ts=end_ts,
+            end_ts=clock.offset(),
+            scheduled_arrival_offset_s=scheduled_arrival_offset_s,
             error_type="timeout",
             error=str(exc),
         )
     except requests.RequestException as exc:
-        end_ts = time.time()
         return _make_result(
             run_id=run_id,
             endpoint=endpoint,
             mode=mode,
             plan=plan,
             start_ts=start_ts,
-            end_ts=end_ts,
+            end_ts=clock.offset(),
+            scheduled_arrival_offset_s=scheduled_arrival_offset_s,
             error_type="request_exception",
             error=str(exc),
         )
@@ -228,17 +378,17 @@ def _run_stream_request(
     run_id: str,
     mode: str,
     plan: RequestPlan,
+    clock: RunClock,
+    *,
+    scheduled_arrival_offset_s: float | None = None,
 ) -> RequestResult:
-    start_ts = time.time()
-    first_token_ts: float | None = None
-    output_tokens = 0
-    response_text_chars = 0
-    prompt_tokens: int | None = None
-    queue_wait_ms: float | None = None
-    execution_ms: float | None = None
-    total_ms_from_server: float | None = None
-    ttft_ms_from_server: float | None = None
-    tokens_per_s_from_server: float | None = None
+    start_ts = clock.offset()
+    acc = StreamAccumulator(now=clock.offset)
+
+    def _client_ttft_ms() -> float | None:
+        if acc.first_token_offset_s is None:
+            return None
+        return (acc.first_token_offset_s - start_ts) * 1000.0
 
     def _error_result(
         error_type: str,
@@ -246,6 +396,7 @@ def _run_stream_request(
         end_ts: float,
         http_status: int | None,
     ) -> RequestResult:
+        output_tokens, source = acc.resolve_output_tokens()
         return _make_result(
             run_id=run_id,
             endpoint=endpoint,
@@ -253,17 +404,22 @@ def _run_stream_request(
             plan=plan,
             start_ts=start_ts,
             end_ts=end_ts,
-            first_token_ts=first_token_ts,
-            ttft_ms=((first_token_ts - start_ts) * 1000.0 if first_token_ts else None),
+            scheduled_arrival_offset_s=scheduled_arrival_offset_s,
+            first_token_ts=acc.first_token_offset_s,
+            ttft_ms=_client_ttft_ms(),
             output_tokens=output_tokens,
-            prompt_tokens=prompt_tokens,
+            prompt_tokens=acc.server_prompt_tokens,
             tokens_per_s=None,
-            queue_wait_ms=queue_wait_ms,
-            execution_ms=execution_ms,
+            server_total_ms=acc.server_total_ms,
+            server_queue_wait_ms=acc.server_queue_wait_ms,
+            server_execution_ms=acc.server_execution_ms,
+            server_ttft_ms=acc.server_ttft_ms,
+            output_sha256=acc.output_sha256,
+            output_tokens_source=source,
             http_status=http_status,
             error_type=error_type,
             error=error,
-            response_text_chars=response_text_chars,
+            response_text_chars=acc.response_text_chars,
         )
 
     try:
@@ -281,72 +437,32 @@ def _run_stream_request(
                 chunk = _parse_sse_chunk(raw_line)
                 if chunk is None:
                     continue
-                if chunk.get("error"):
-                    end_ts = time.time()
+                acc.feed(chunk)
+                if acc.error is not None:
                     return _error_result(
                         error_type="server_error",
-                        error=str(chunk.get("error")),
-                        end_ts=end_ts,
+                        error=acc.error,
+                        end_ts=clock.offset(),
                         http_status=response.status_code,
                     )
-
-                token_str = chunk.get("token_str", "")
-                if token_str:
-                    output_tokens += 1
-                    response_text_chars += len(token_str)
-                    if first_token_ts is None:
-                        first_token_ts = time.time()
-                if chunk.get("is_first") and first_token_ts is None:
-                    first_token_ts = time.time()
-                if chunk.get("is_done"):
-                    prompt_tokens = chunk.get("prompt_tokens")
-                    queue_wait_ms = (
-                        float(chunk["queue_wait_ms"])
-                        if chunk.get("queue_wait_ms") is not None
-                        else None
-                    )
-                    execution_ms = (
-                        float(chunk["execution_ms"])
-                        if chunk.get("execution_ms") is not None
-                        else None
-                    )
-                    total_ms_from_server = (
-                        float(chunk["total_ms"])
-                        if chunk.get("total_ms") is not None
-                        else None
-                    )
-                    ttft_ms_from_server = (
-                        float(chunk["ttft_ms"])
-                        if chunk.get("ttft_ms") is not None
-                        else None
-                    )
-                    tokens_per_s_from_server = (
-                        float(chunk["tokens_per_s"])
-                        if chunk.get("tokens_per_s") is not None
-                        else None
-                    )
-                    end_ts = time.time()
-                    latency_ms = (end_ts - start_ts) * 1000.0
-                    ttft_ms = (
-                        ttft_ms_from_server
-                        if ttft_ms_from_server is not None
-                        else (
-                            (first_token_ts - start_ts) * 1000.0
-                            if first_token_ts is not None
-                            else latency_ms
+                if acc.done:
+                    end_ts = clock.offset()
+                    client_http_ms = (end_ts - start_ts) * 1000.0
+                    client_ttft_ms = _client_ttft_ms()
+                    output_tokens, source = acc.resolve_output_tokens()
+                    tokens_per_s = acc.server_tokens_per_s
+                    if tokens_per_s is None and output_tokens > 0:
+                        # Match the server's definition: a decode rate over the
+                        # execution span, not one polluted by queue wait.
+                        tokens_per_s = _rate(
+                            output_tokens,
+                            (
+                                acc.server_execution_ms
+                                if acc.server_execution_ms is not None
+                                else client_http_ms
+                            )
+                            / 1000.0,
                         )
-                    )
-                    total_ms = (
-                        total_ms_from_server
-                        if total_ms_from_server is not None
-                        else latency_ms
-                    )
-                    tpot_ms = None
-                    tokens_per_s = tokens_per_s_from_server
-                    if output_tokens > 0 and tokens_per_s is None:
-                        tokens_per_s = _rate(output_tokens, total_ms / 1000.0)
-                    if output_tokens > 1:
-                        tpot_ms = max(total_ms - ttft_ms, 0.0) / (output_tokens - 1)
                     return _make_result(
                         run_id=run_id,
                         endpoint=endpoint,
@@ -354,48 +470,67 @@ def _run_stream_request(
                         plan=plan,
                         start_ts=start_ts,
                         end_ts=end_ts,
-                        latency_ms=total_ms,
-                        first_token_ts=first_token_ts,
-                        ttft_ms=ttft_ms,
-                        tpot_ms=tpot_ms,
+                        scheduled_arrival_offset_s=scheduled_arrival_offset_s,
+                        first_token_ts=acc.first_token_offset_s,
+                        ttft_ms=client_ttft_ms,
+                        tpot_ms=_tpot_ms(client_http_ms, client_ttft_ms, output_tokens),
                         output_tokens=output_tokens,
-                        prompt_tokens=prompt_tokens,
+                        prompt_tokens=acc.server_prompt_tokens,
                         tokens_per_s=tokens_per_s,
-                        queue_wait_ms=queue_wait_ms,
-                        execution_ms=execution_ms,
+                        server_total_ms=acc.server_total_ms,
+                        server_queue_wait_ms=acc.server_queue_wait_ms,
+                        server_execution_ms=acc.server_execution_ms,
+                        server_ttft_ms=acc.server_ttft_ms,
+                        server_tpot_ms=_tpot_ms(
+                            acc.server_execution_ms,
+                            acc.server_decode_start_ms(),
+                            output_tokens,
+                        ),
+                        output_sha256=acc.output_sha256,
+                        output_tokens_source=source,
                         http_status=response.status_code,
                         ok=True,
-                        response_text_chars=response_text_chars,
+                        response_text_chars=acc.response_text_chars,
                     )
 
-        end_ts = time.time()
         return _error_result(
             error_type="stream_ended_without_done",
             error="stream ended before is_done event",
-            end_ts=end_ts,
+            end_ts=clock.offset(),
             http_status=200,
         )
     except requests.Timeout as exc:
-        end_ts = time.time()
         return _error_result(
             error_type="timeout",
             error=str(exc),
-            end_ts=end_ts,
+            end_ts=clock.offset(),
             http_status=None,
         )
     except requests.RequestException as exc:
-        end_ts = time.time()
         return _error_result(
             error_type="request_exception",
             error=str(exc),
-            end_ts=end_ts,
+            end_ts=clock.offset(),
             http_status=None,
         )
 
 
-def _request_runner(
-    endpoint: str,
-) -> Callable[[str, str, float, str, str, RequestPlan], RequestResult]:
+class RequestRunner(Protocol):
+    def __call__(
+        self,
+        base_url: str,
+        endpoint: str,
+        timeout_seconds: float,
+        run_id: str,
+        mode: str,
+        plan: RequestPlan,
+        clock: RunClock,
+        *,
+        scheduled_arrival_offset_s: float | None = None,
+    ) -> RequestResult: ...
+
+
+def _request_runner(endpoint: str) -> RequestRunner:
     if "stream" in endpoint:
         return _run_stream_request
     return _run_sync_request

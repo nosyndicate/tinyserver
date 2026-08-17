@@ -7,13 +7,13 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 
-from .models import RequestPlan, RequestResult, Scenario
+from .models import RequestPlan, RequestResult, RunClock, Scenario
 from .planning import _build_request_plans
 from .runners import _request_runner
 
 
 def _run_warmup(
-    args: argparse.Namespace, plans: list[RequestPlan]
+    args: argparse.Namespace, plans: list[RequestPlan], clock: RunClock
 ) -> list[RequestResult]:
     if args.warmup_requests <= 0:
         return []
@@ -30,13 +30,17 @@ def _run_warmup(
                 "warmup",
                 args.mode,
                 plan,
+                clock,
             )
         )
     return results
 
 
 def _run_closed_loop(
-    args: argparse.Namespace, plans: list[RequestPlan], run_id: str
+    args: argparse.Namespace,
+    plans: list[RequestPlan],
+    run_id: str,
+    clock: RunClock,
 ) -> list[RequestResult]:
     runner = _request_runner(args.endpoint)
     results: list[RequestResult] = []
@@ -60,6 +64,7 @@ def _run_closed_loop(
                     run_id,
                     args.mode,
                     plan,
+                    clock,
                 )
             )
 
@@ -75,6 +80,7 @@ def _run_closed_loop_for_duration(
     scenario: Scenario,
     run_id: str,
     prompt_override: str | None,
+    clock: RunClock,
 ) -> list[RequestResult]:
     # Over-provision plans so workers won't exhaust them before the deadline.
     # _build_request_plans cycles through weighted requests, so extra plans
@@ -117,6 +123,7 @@ def _run_closed_loop_for_duration(
                         run_id,
                         args.mode,
                         plan,
+                        clock,
                     )
                 )
         finally:
@@ -143,7 +150,10 @@ def _run_closed_loop_for_duration(
 
 
 def _run_open_loop(
-    args: argparse.Namespace, plans: list[RequestPlan], run_id: str
+    args: argparse.Namespace,
+    plans: list[RequestPlan],
+    run_id: str,
+    clock: RunClock,
 ) -> list[RequestResult]:
     runner = _request_runner(args.endpoint)
     results: list[RequestResult] = []
@@ -167,6 +177,7 @@ def _run_open_loop(
                     run_id,
                     args.mode,
                     plan,
+                    clock,
                 )
             )
             next_dispatch += interval_seconds
@@ -181,6 +192,7 @@ def _run_open_loop_for_duration(
     scenario: Scenario,
     run_id: str,
     prompt_override: str | None,
+    clock: RunClock,
 ) -> list[RequestResult]:
     total_requests = max(1, math.ceil(args.duration_seconds * args.arrival_rate))
     plans = _build_request_plans(
@@ -219,6 +231,7 @@ def _run_open_loop_for_duration(
                     run_id,
                     args.mode,
                     plan,
+                    clock,
                 )
             )
             next_dispatch += interval_seconds

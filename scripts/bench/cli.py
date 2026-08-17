@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import time
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +14,7 @@ from .execution import (
     _run_warmup,
 )
 from .metrics import _summarize_results
+from .models import SCHEMA_VERSION, RunClock
 from .output import _resolve_output_dir, _write_json, _write_jsonl
 from .planning import _build_request_plans
 from .scenarios import DEFAULT_SCENARIO_FILE, _load_scenarios
@@ -115,32 +115,36 @@ def main(argv: list[str] | None = None) -> int:
         args.seed,
     )
 
-    warmup_results = _run_warmup(args, all_plans)
+    # One clock for the whole run: every recorded timestamp is a monotonic
+    # offset from this epoch, and the wall-clock half is persisted in
+    # config.json so offsets can be mapped back to a real date afterwards.
+    run_clock = RunClock.start()
+    warmup_results = _run_warmup(args, all_plans, run_clock)
     run_id = datetime.now(timezone.utc).strftime("run-%Y%m%dT%H%M%S")
-    run_started_ts = time.time()
+    window_start_s = run_clock.offset()
     if args.requests is not None:
         measurement_plans = all_plans[args.warmup_requests :]
         if args.mode == "closed":
-            results = _run_closed_loop(args, measurement_plans, run_id)
+            results = _run_closed_loop(args, measurement_plans, run_id, run_clock)
         else:
-            results = _run_open_loop(args, measurement_plans, run_id)
+            results = _run_open_loop(args, measurement_plans, run_id, run_clock)
     else:
         if args.mode == "closed":
             results = _run_closed_loop_for_duration(
-                args, scenario, run_id, prompt_override
+                args, scenario, run_id, prompt_override, run_clock
             )
         else:
             results = _run_open_loop_for_duration(
-                args, scenario, run_id, prompt_override
+                args, scenario, run_id, prompt_override, run_clock
             )
-    run_ended_ts = time.time()
+    window_end_s = run_clock.offset()
 
     summary = _summarize_results(
         args,
         scenario,
         run_id,
-        run_started_ts,
-        run_ended_ts,
+        window_start_s,
+        window_end_s,
         results,
         warmup_results,
     )
@@ -155,7 +159,15 @@ def main(argv: list[str] | None = None) -> int:
     _write_json(
         out_dir / "config.json",
         {
+            "schema_version": SCHEMA_VERSION,
             "args": vars(args),
+            "clock": {
+                "wall_epoch_s": run_clock.wall_epoch_s,
+                "wall_epoch_iso": datetime.fromtimestamp(
+                    run_clock.wall_epoch_s, timezone.utc
+                ).isoformat(),
+                "perf_epoch_s": run_clock.perf_epoch_s,
+            },
             "scenario_file": str(
                 Path(args.scenario_file)
                 if args.scenario_file is not None

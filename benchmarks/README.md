@@ -154,8 +154,58 @@ bench-results/
 | File | Contents |
 |---|---|
 | `summary.json` | Aggregate statistics: request counts, success rate, throughput (req/s, tokens/s), and P50/P90/P95/P99 distributions for `latency_ms`, `ttft_ms`, `tpot_ms`, `queue_wait_ms`, `execution_ms` |
-| `config.json` | Exact CLI arguments and the resolved scenario definition; sufficient to reproduce the run |
+| `config.json` | Exact CLI arguments, the run's clock epochs, and the resolved scenario definition; sufficient to reproduce the run |
 | `requests.jsonl` | One JSON object per request (including failures); raw data for post-hoc analysis |
+
+### Artifact schema version 2
+
+`summary.json`, `config.json`, and every `requests.jsonl` row carry
+`schema_version: 2`.
+
+**All timing is monotonic.** A single `perf_counter` epoch is taken at run start;
+every `*_ts` and `*_offset_s` field is seconds relative to that epoch, *not* a
+Unix timestamp. `config.json` records both halves of the epoch
+(`clock.wall_epoch_s`, `clock.wall_epoch_iso`, `clock.perf_epoch_s`) so offsets
+can be mapped back to a real date. Wall clock is never used for a duration, so
+NTP slew cannot corrupt a latency measurement.
+
+**Client and server metrics are kept apart.** The two are measured on different
+clocks from different origins, so combining them in one number is meaningless.
+
+| Field | Meaning |
+|---|---|
+| `latency_ms` | Client: scheduled arrival → completion. The headline end-to-end number |
+| `client_dispatch_lag_ms` | Client: scheduled arrival → HTTP start. `0.0` in closed loop, where arrival *is* the HTTP start |
+| `client_http_ms` | Client: HTTP start → completion |
+| `client_ttft_ms` | Client: HTTP start → first streamed token |
+| `client_tpot_ms` | `(client_http_ms − client_ttft_ms) / (n − 1)`; `null` below two tokens |
+| `server_total_ms` | Server: enqueue → completion |
+| `server_queue_wait_ms` | Server: enqueue → first prefill |
+| `server_execution_ms` | Server: first prefill → completion |
+| `server_ttft_ms` | Server: enqueue → first token. `null` when no token was emitted |
+| `server_tpot_ms` | `(server_execution_ms − (server_ttft_ms − server_queue_wait_ms)) / (n − 1)`; `null` below two tokens |
+| `output_tokens` | The server's authoritative count from the final `is_done` chunk |
+| `output_tokens_source` | `server`, or `client_count` when the endpoint reported none (the v1 stream) |
+| `output_sha256` | SHA-256 over the concatenated streamed tokens |
+| `deterministic_gate` | `true` when `temperature == 0.0` and a `seed` was set |
+
+`ttft_ms`, `tpot_ms`, `queue_wait_ms`, and `execution_ms` are retained as aliases
+of `client_ttft_ms`, `client_tpot_ms`, `server_queue_wait_ms`, and
+`server_execution_ms` so existing analysis scripts keep loading.
+
+**Output tokens come from the server.** Counting non-empty `token_str` chunks
+client-side undercounts, because EOS and byte-fragment BPE pieces legitimately
+decode to `""`. The client keeps its own count only as a fallback, and says so
+via `output_tokens_source`.
+
+**`output_sha256` is only comparable where `deterministic_gate` is true.** At
+`temperature > 0`, v2/v3/v4 will not produce byte-identical text across batch
+shapes, so on ungated rows the digest is informational and only token counts are
+worth sanity-checking.
+
+> **Compatibility:** `latency_ms` was previously overwritten with the server's
+> `total_ms`, and `start_ts` / `first_token_ts` / `end_ts` were wall-clock Unix
+> timestamps. Schema-1 artifacts are **not** comparable with schema-2 artifacts.
 
 ### Server-reported timing semantics
 
