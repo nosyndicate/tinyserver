@@ -106,8 +106,8 @@ def test_summarize_results_reports_failures_and_percentiles() -> None:
         args=args,
         scenario=scenario,
         run_id="run-1",
-        run_started_ts=0.0,
-        run_ended_ts=1.0,
+        window_start_s=0.0,
+        window_end_s=1.0,
         results=results,
         warmup_results=[],
     )
@@ -134,8 +134,8 @@ def test_summarize_results_empty() -> None:
         args=args,
         scenario=scenario,
         run_id="run-empty",
-        run_started_ts=0.0,
-        run_ended_ts=0.0,
+        window_start_s=0.0,
+        window_end_s=0.0,
         results=[],
         warmup_results=[],
     )

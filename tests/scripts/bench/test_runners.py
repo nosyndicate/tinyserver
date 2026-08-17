@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from typing import Any, Generator
 from unittest.mock import patch
 
@@ -7,8 +8,10 @@ import pytest
 import requests as requests_lib
 
 import scripts.bench.runners as bench_runners
-from scripts.bench.models import RequestPlan
+from scripts.bench.models import RequestPlan, RunClock
 from scripts.bench.runners import (
+    StreamAccumulator,
+    _deterministic_gate,
     _endpoint_path,
     _full_url,
     _make_result,
@@ -16,6 +19,7 @@ from scripts.bench.runners import (
     _request_runner,
     _run_stream_request,
     _run_sync_request,
+    _tpot_ms,
 )
 
 # ---------------------------------------------------------------------------
@@ -66,6 +70,44 @@ class _FakeSyncResponse:
         if self._json_data is None:
             raise ValueError("no json")
         return self._json_data
+
+
+def _scripted_clock(*offsets: float) -> RunClock:
+    """A RunClock whose offset() walks a fixed script, then repeats the last."""
+    remaining = list(offsets)
+
+    def counter() -> float:
+        return remaining.pop(0) if len(remaining) > 1 else remaining[0]
+
+    return RunClock(wall_epoch_s=1000.0, perf_epoch_s=0.0, counter=counter)
+
+
+def _feed(acc: StreamAccumulator, *chunks: dict[str, Any]) -> StreamAccumulator:
+    for chunk in chunks:
+        acc.feed(chunk)
+    return acc
+
+
+def _done_chunk(**overrides: Any) -> dict[str, Any]:
+    """A v2/v3/v4-shaped final chunk; pass None to drop a key entirely."""
+    chunk: dict[str, Any] = {
+        "token_str": " world",
+        "is_first": False,
+        "is_done": True,
+        "prompt_tokens": 11,
+        "output_tokens": 2,
+        "ttft_ms": 80.0,
+        "total_ms": 180.0,
+        "tokens_per_s": 11.1,
+        "queue_wait_ms": 25.0,
+        "execution_ms": 155.0,
+    }
+    for key, value in overrides.items():
+        if value is None:
+            chunk.pop(key, None)
+        else:
+            chunk[key] = value
+    return chunk
 
 
 # ---------------------------------------------------------------------------
@@ -261,16 +303,37 @@ def test_run_stream_request_uses_done_chunk_metadata(
         run_id="run-1",
         mode="closed",
         plan=plan,
+        clock=_scripted_clock(0.0, 0.1, 0.4),
     )
 
     assert result.ok is True
     assert result.output_tokens == 2
+    assert result.output_tokens_source == "server"
     assert result.prompt_tokens == 11
-    assert result.ttft_ms == 80.0
-    assert result.latency_ms == 180.0
-    assert result.queue_wait_ms == 25.0
-    assert result.execution_ms == 155.0
     assert result.tokens_per_s == 11.1
+    # Server-reported components stay on the server clock.
+    assert result.server_ttft_ms == 80.0
+    assert result.server_total_ms == 180.0
+    assert result.server_queue_wait_ms == 25.0
+    assert result.server_execution_ms == 155.0
+    # server_tpot = (155 - (80 - 25)) / (2 - 1)
+    assert result.server_tpot_ms == pytest.approx(100.0)
+    # Client components come from the scripted clock: start 0.0, first token
+    # 0.1, completion 0.4.
+    assert result.client_http_ms == pytest.approx(400.0)
+    assert result.client_ttft_ms == pytest.approx(100.0)
+    assert result.client_tpot_ms == pytest.approx(300.0)
+    # Closed loop: no dispatch lag, so latency is the client HTTP duration.
+    assert result.client_dispatch_lag_ms == 0.0
+    assert result.latency_ms == pytest.approx(400.0)
+    # Legacy aliases preserved for existing analysis scripts.
+    assert result.ttft_ms == result.client_ttft_ms
+    assert result.tpot_ms == result.client_tpot_ms
+    assert result.queue_wait_ms == result.server_queue_wait_ms
+    assert result.execution_ms == result.server_execution_ms
+    # temperature 0.0 with no seed in the payload.
+    assert result.deterministic_gate is False
+    assert result.output_sha256 == hashlib.sha256(b"Hello world").hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -301,19 +364,32 @@ class TestRunSyncRequest:
                 run_id="run-1",
                 mode="closed",
                 plan=_DUMMY_PLAN,
+                clock=_scripted_clock(0.0, 0.2),
             )
         assert result.ok is True
         assert result.http_status == 200
-        assert result.ttft_ms == 50.0
-        assert result.latency_ms == 200.0
         assert result.output_tokens == 5
+        assert result.output_tokens_source == "server"
         assert result.prompt_tokens == 10
         assert result.tokens_per_s == 25.0
-        assert result.queue_wait_ms == 15.0
-        assert result.execution_ms == 185.0
+        assert result.server_ttft_ms == 50.0
+        assert result.server_total_ms == 200.0
+        assert result.server_queue_wait_ms == 15.0
+        assert result.server_execution_ms == 185.0
+        # server_tpot = (185 - (50 - 15)) / (5 - 1)
+        assert result.server_tpot_ms == pytest.approx(37.5)
+        # The sync endpoint streams nothing, so there is no client-observable
+        # first token. The server's figure stays in server_ttft_ms.
+        assert result.client_ttft_ms is None
+        assert result.client_tpot_ms is None
+        assert result.first_token_ts is None
+        # Clock scripted 0.0 -> 0.2, so the client observed 200ms end to end.
+        assert result.client_http_ms == pytest.approx(200.0)
+        assert result.latency_ms == pytest.approx(200.0)
         assert result.response_text_chars == len("hello world")
+        assert result.output_sha256 == hashlib.sha256(b"hello world").hexdigest()
 
-    def test_success_computes_tpot(self) -> None:
+    def test_success_computes_server_tpot(self) -> None:
         fake = _FakeSyncResponse(
             200,
             json_data={
@@ -323,6 +399,8 @@ class TestRunSyncRequest:
                 "output_tokens": 5,
                 "prompt_tokens": 8,
                 "tokens_per_s": 25.0,
+                "queue_wait_ms": 20.0,
+                "execution_ms": 180.0,
             },
         )
         with patch("scripts.bench.runners.requests.post", return_value=fake):
@@ -333,9 +411,14 @@ class TestRunSyncRequest:
                 run_id="run-1",
                 mode="closed",
                 plan=_DUMMY_PLAN,
+                clock=_scripted_clock(0.0, 0.2),
             )
-        # tpot = (total_ms - ttft_ms) / (output_tokens - 1) = (200 - 40) / 4 = 40.0
-        assert result.tpot_ms == pytest.approx(40.0)
+        # Entirely on the server clock:
+        # (execution_ms - (ttft_ms - queue_wait_ms)) / (output_tokens - 1)
+        # = (180 - (40 - 20)) / 4 = 40.0
+        assert result.server_tpot_ms == pytest.approx(40.0)
+        # No client-side TPOT for a non-streaming endpoint.
+        assert result.client_tpot_ms is None
 
     def test_http_error_with_json(self) -> None:
         fake = _FakeSyncResponse(500, json_data={"error": "internal failure"})
@@ -347,6 +430,7 @@ class TestRunSyncRequest:
                 run_id="run-1",
                 mode="closed",
                 plan=_DUMMY_PLAN,
+                clock=_scripted_clock(0.0, 0.2),
             )
         assert result.ok is False
         assert result.error_type == "http_error"
@@ -363,6 +447,7 @@ class TestRunSyncRequest:
                 run_id="run-1",
                 mode="closed",
                 plan=_DUMMY_PLAN,
+                clock=_scripted_clock(0.0, 0.2),
             )
         assert result.ok is False
         assert result.error_type == "http_error"
@@ -381,6 +466,7 @@ class TestRunSyncRequest:
                 run_id="run-1",
                 mode="closed",
                 plan=_DUMMY_PLAN,
+                clock=_scripted_clock(0.0, 0.2),
             )
         assert result.ok is False
         assert result.error_type == "timeout"
@@ -398,7 +484,255 @@ class TestRunSyncRequest:
                 run_id="run-1",
                 mode="closed",
                 plan=_DUMMY_PLAN,
+                clock=_scripted_clock(0.0, 0.2),
             )
         assert result.ok is False
         assert result.error_type == "request_exception"
         assert "refused" in result.error  # type: ignore[operator]
+
+
+# ---------------------------------------------------------------------------
+# RunClock
+# ---------------------------------------------------------------------------
+
+
+class TestRunClock:
+    def test_offset_is_relative_to_epoch(self) -> None:
+        clock = RunClock(wall_epoch_s=1000.0, perf_epoch_s=5.0, counter=lambda: 7.25)
+        assert clock.offset() == pytest.approx(2.25)
+
+    def test_scripted_clock_walks_then_holds(self) -> None:
+        clock = _scripted_clock(0.0, 1.0, 4.0)
+        assert [clock.offset(), clock.offset(), clock.offset(), clock.offset()] == [
+            0.0,
+            1.0,
+            4.0,
+            4.0,
+        ]
+
+
+# ---------------------------------------------------------------------------
+# _tpot_ms
+# ---------------------------------------------------------------------------
+
+
+class TestTpotMs:
+    def test_averages_over_inter_token_gaps(self) -> None:
+        # 5 tokens: 200ms span, 40ms to the first token, 4 gaps left.
+        assert _tpot_ms(200.0, 40.0, 5) == pytest.approx(40.0)
+
+    def test_two_tokens_has_one_gap(self) -> None:
+        assert _tpot_ms(180.0, 80.0, 2) == pytest.approx(100.0)
+
+    @pytest.mark.parametrize("num_tokens", [0, 1])
+    def test_below_two_tokens_is_none(self, num_tokens: int) -> None:
+        assert _tpot_ms(200.0, 40.0, num_tokens) is None
+
+    @pytest.mark.parametrize(
+        "span, first, count",
+        [(None, 40.0, 5), (200.0, None, 5), (200.0, 40.0, None)],
+    )
+    def test_missing_input_is_none(
+        self, span: float | None, first: float | None, count: int | None
+    ) -> None:
+        assert _tpot_ms(span, first, count) is None
+
+    def test_negative_span_clamps_to_zero(self) -> None:
+        # Can happen when the first-token stamp lands after the span end
+        # because the two came from different measurement points.
+        assert _tpot_ms(40.0, 200.0, 5) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# _deterministic_gate
+# ---------------------------------------------------------------------------
+
+
+class TestDeterministicGate:
+    def test_greedy_and_seeded_is_gated(self) -> None:
+        assert _deterministic_gate({"temperature": 0.0, "seed": 7}) is True
+
+    def test_greedy_without_seed_is_not_gated(self) -> None:
+        assert _deterministic_gate({"temperature": 0.0}) is False
+
+    def test_sampling_with_seed_is_not_gated(self) -> None:
+        # At temperature > 0 the output varies with batch shape, so the hash
+        # is not comparable across server versions.
+        assert _deterministic_gate({"temperature": 0.8, "seed": 7}) is False
+
+    def test_empty_payload_is_not_gated(self) -> None:
+        assert _deterministic_gate({}) is False
+
+
+# ---------------------------------------------------------------------------
+# StreamAccumulator
+# ---------------------------------------------------------------------------
+
+
+class TestStreamAccumulator:
+    def test_counts_empty_string_tokens(self) -> None:
+        # EOS and byte-fragment BPE pieces decode to "" but are real tokens.
+        acc = _feed(
+            StreamAccumulator(now=_scripted_clock(0.0).offset),
+            {"token_str": "a", "is_first": True, "is_done": False},
+            {"token_str": "", "is_first": False, "is_done": False},
+            _done_chunk(token_str="b", output_tokens=None),
+        )
+        assert acc.client_token_count == 3
+        assert acc.response_text_chars == 2
+
+    def test_server_output_tokens_wins(self) -> None:
+        acc = _feed(
+            StreamAccumulator(now=_scripted_clock(0.0).offset),
+            {"token_str": "a", "is_first": True, "is_done": False},
+            _done_chunk(output_tokens=17),
+        )
+        assert acc.resolve_output_tokens() == (17, "server")
+
+    def test_falls_back_to_client_count_when_server_omits_it(self) -> None:
+        # The v1 stream reports every metric as null, including output_tokens.
+        acc = _feed(
+            StreamAccumulator(now=_scripted_clock(0.0).offset),
+            {"token_str": "a", "is_first": True, "is_done": False},
+            _done_chunk(output_tokens=None),
+        )
+        assert acc.resolve_output_tokens() == (2, "client_count")
+
+    def test_missing_ttft_key_leaves_server_ttft_none(self) -> None:
+        # exclude_none drops ttft_ms when the request emitted no token.
+        acc = _feed(
+            StreamAccumulator(now=_scripted_clock(0.0, 0.5).offset),
+            _done_chunk(ttft_ms=None),
+        )
+        assert acc.server_ttft_ms is None
+        assert acc.server_decode_start_ms() is None
+        # The client still observed a first token, on its own clock.
+        assert acc.first_token_offset_s == 0.0
+        assert acc.done is True
+
+    def test_server_decode_start_rebases_ttft_onto_execution_clock(self) -> None:
+        acc = _feed(
+            StreamAccumulator(now=_scripted_clock(0.0).offset),
+            _done_chunk(ttft_ms=80.0, queue_wait_ms=25.0),
+        )
+        assert acc.server_decode_start_ms() == pytest.approx(55.0)
+
+    def test_first_token_offset_stamped_once(self) -> None:
+        acc = _feed(
+            StreamAccumulator(now=_scripted_clock(0.25, 0.75, 1.5).offset),
+            {"token_str": "a", "is_first": True, "is_done": False},
+            {"token_str": "b", "is_first": False, "is_done": False},
+            _done_chunk(),
+        )
+        assert acc.first_token_offset_s == pytest.approx(0.25)
+
+    def test_error_chunk_stops_stream_and_keeps_partial_counts(self) -> None:
+        acc = _feed(
+            StreamAccumulator(now=_scripted_clock(0.0).offset),
+            {"token_str": "a", "is_first": True, "is_done": False},
+            {
+                "token_str": "",
+                "is_first": False,
+                "is_done": True,
+                "error": "engine exploded",
+            },
+        )
+        assert acc.error == "engine exploded"
+        assert acc.done is True
+        assert acc.client_token_count == 1
+        assert acc.server_output_tokens is None
+
+    def test_identical_streams_hash_identically(self) -> None:
+        def build() -> StreamAccumulator:
+            return _feed(
+                StreamAccumulator(now=_scripted_clock(0.0).offset),
+                {"token_str": "Hello", "is_first": True, "is_done": False},
+                {"token_str": "", "is_first": False, "is_done": False},
+                _done_chunk(token_str=" world"),
+            )
+
+        assert build().output_sha256 == build().output_sha256
+
+    def test_differing_token_changes_hash(self) -> None:
+        base = _feed(
+            StreamAccumulator(now=_scripted_clock(0.0).offset),
+            {"token_str": "Hello", "is_first": True, "is_done": False},
+            _done_chunk(token_str=" world"),
+        )
+        other = _feed(
+            StreamAccumulator(now=_scripted_clock(0.0).offset),
+            {"token_str": "Hello", "is_first": True, "is_done": False},
+            _done_chunk(token_str=" there"),
+        )
+        assert base.output_sha256 != other.output_sha256
+
+    def test_v1_eos_terminal_chunk_is_not_counted(self) -> None:
+        # v1 appends a separate token-less is_done chunk on the EOS path
+        # (server/model/hf_runner.py) instead of holding the last token back,
+        # and reports every metric as null, so the client count is what gets
+        # used. Counting that chunk would overstate the run by one.
+        acc = _feed(
+            StreamAccumulator(now=_scripted_clock(0.0).offset),
+            {"token_str": "a", "is_first": True, "is_done": False},
+            {"token_str": "b", "is_first": False, "is_done": False},
+            {"token_str": "", "is_first": False, "is_done": True},
+        )
+        assert acc.resolve_output_tokens() == (2, "client_count")
+        assert acc.done is True
+
+    def test_zero_token_eos_stamps_no_first_token(self) -> None:
+        acc = _feed(
+            StreamAccumulator(now=_scripted_clock(0.0, 0.5).offset),
+            {"token_str": "", "is_first": True, "is_done": True},
+        )
+        assert acc.resolve_output_tokens() == (0, "client_count")
+        assert acc.first_token_offset_s is None
+        assert acc.done is True
+
+    def test_token_less_terminal_chunk_leaves_hash_unchanged(self) -> None:
+        chunks: list[dict[str, Any]] = [
+            {"token_str": "a", "is_first": True, "is_done": False},
+            {"token_str": "b", "is_first": False, "is_done": False},
+        ]
+        without = _feed(StreamAccumulator(now=_scripted_clock(0.0).offset), *chunks)
+        with_terminal = _feed(
+            StreamAccumulator(now=_scripted_clock(0.0).offset),
+            *chunks,
+            {"token_str": "", "is_first": False, "is_done": True},
+        )
+        assert with_terminal.output_sha256 == without.output_sha256
+        assert with_terminal.response_text_chars == without.response_text_chars
+
+    def test_v2_terminal_chunk_carrying_a_token_is_counted(self) -> None:
+        # v2+ holds the last real token back onto its is_done chunk, so that
+        # chunk must still count.
+        acc = _feed(
+            StreamAccumulator(now=_scripted_clock(0.0).offset),
+            {"token_str": "a", "is_first": True, "is_done": False},
+            _done_chunk(token_str="b", output_tokens=None),
+        )
+        assert acc.resolve_output_tokens() == (2, "client_count")
+
+    def test_mid_stream_empty_token_is_still_counted(self) -> None:
+        # Only a *terminal* token-less chunk is skipped; mid-stream, an empty
+        # token_str is a real byte-fragment token.
+        acc = _feed(
+            StreamAccumulator(now=_scripted_clock(0.0).offset),
+            {"token_str": "a", "is_first": True, "is_done": False},
+            {"token_str": "", "is_first": False, "is_done": False},
+            {"token_str": "", "is_first": False, "is_done": True},
+        )
+        assert acc.resolve_output_tokens() == (2, "client_count")
+
+    def test_hash_is_order_sensitive(self) -> None:
+        forward = _feed(
+            StreamAccumulator(now=_scripted_clock(0.0).offset),
+            {"token_str": "ab", "is_first": True, "is_done": False},
+            _done_chunk(token_str="c"),
+        )
+        reordered = _feed(
+            StreamAccumulator(now=_scripted_clock(0.0).offset),
+            {"token_str": "c", "is_first": True, "is_done": False},
+            _done_chunk(token_str="ab"),
+        )
+        assert forward.output_sha256 != reordered.output_sha256
