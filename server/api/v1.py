@@ -164,6 +164,7 @@ def generate_stream(req: GenerateRequest, request: Request) -> StreamingResponse
                     return
         except Exception as error:
             error_event = StreamErrorEvent(error=str(error))
+            log_event("stream_error", error=str(error))
             yield f"data: {error_event.model_dump_json()}\n\n"
 
     return StreamingResponse(_event_stream(), media_type="text/event-stream")

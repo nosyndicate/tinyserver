@@ -91,15 +91,16 @@ class RequestEventEmitter:
     def on_token(
         self, request_state: GenerationRequestState, result: DecodeResult
     ) -> None:
-        """Handle a decode result: push a TokenEvent and finish if done.
+        """Emit real output tokens and finish terminal decode results.
 
-        On EOS the token text is emitted as an empty string (the model's EOS
-        token itself is not part of the output).  For all other finished
-        reasons (e.g. max length), the final token text is included.
+        EOS is a completion signal, so it emits no ``TokenEvent`` and advances
+        neither the output list nor its count. Every non-EOS result emits one
+        ``TokenEvent``, including a token whose decoded text is ``""``; a
+        max-length result then emits a separate ``DoneEvent``.
 
-        ``first_token_ns`` is stamped only when an output token is actually
-        appended, so TTFT stays null for a request that finishes without
-        emitting one.
+        ``first_token_ns`` is stamped when the first non-EOS token is appended,
+        so TTFT remains null only when generation finishes without an output
+        token.
         """
         is_first = request_state.num_output_tokens == 0
 
