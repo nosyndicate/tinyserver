@@ -307,7 +307,6 @@ def test_run_stream_request_uses_done_chunk_metadata(
     )
 
     assert result.ok is True
-    assert result.schema_version == 2
     assert result.output_tokens == 2
     assert result.output_tokens_source == "server"
     assert result.prompt_tokens == 11

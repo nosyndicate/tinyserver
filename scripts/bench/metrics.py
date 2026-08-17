@@ -6,7 +6,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 
-from .models import SCHEMA_VERSION, RequestResult, Scenario
+from .models import RequestResult, Scenario
 
 
 def _percentiles(values: list[float]) -> dict[str, float | None]:
@@ -72,7 +72,6 @@ def _summarize_results(
     )
 
     summary = {
-        "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "base_url": args.base_url,

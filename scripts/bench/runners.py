@@ -70,7 +70,7 @@ def _tpot_ms(
 
     ``span_ms`` and ``first_token_ms`` must be measured on the *same* clock and
     from the same origin — mixing a server numerator with a client token count
-    (the pre-schema-v2 behaviour) produces a number with no meaning. Returns
+    (the behaviour this corrected) produces a number with no meaning. Returns
     ``None`` below two tokens, where there is no gap to average over.
     """
     if span_ms is None or first_token_ms is None or num_tokens is None:

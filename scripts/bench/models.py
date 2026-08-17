@@ -4,8 +4,6 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
-SCHEMA_VERSION = 2
-
 
 @dataclass(frozen=True)
 class RunClock:
@@ -15,7 +13,7 @@ class RunClock:
     Every duration and per-request timestamp is derived from ``perf_counter``,
     which is monotonic; wall clock is captured once so recorded offsets can be
     mapped back to a real date after the fact. Mixing the two per-request (the
-    pre-schema-v2 behaviour) let NTP slew leak into latency measurements.
+    behaviour this corrected) let NTP slew leak into latency measurements.
 
     ``counter`` is injectable so timing logic is testable without patching.
     """
@@ -64,7 +62,11 @@ class RequestPlan:
 @dataclass
 class RequestResult:
     """
-    One row of ``requests.jsonl``, artifact schema version 2.
+    One row of ``requests.jsonl``, under the corrected measurement semantics.
+
+    Artifacts written before that correction are distinguishable by the absence
+    of the ``client_*`` / ``server_*`` fields below; their numbers are not
+    comparable with these and should not be mixed into one table.
 
     Timestamps (``*_ts``, ``*_offset_s``) are seconds relative to the run's
     ``RunClock`` epoch, not wall clock. Client- and server-sourced metrics are
@@ -104,7 +106,6 @@ class RequestResult:
     error: str | None
     prompt_length_chars: int
     response_text_chars: int | None
-    schema_version: int = SCHEMA_VERSION
     # Scheduled arrival, from the run epoch. Equals start_ts in closed loop.
     scheduled_arrival_offset_s: float = 0.0
     client_dispatch_lag_ms: float = 0.0

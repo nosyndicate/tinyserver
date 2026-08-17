@@ -14,7 +14,7 @@ from .execution import (
     _run_warmup,
 )
 from .metrics import _summarize_results
-from .models import SCHEMA_VERSION, RunClock
+from .models import RunClock
 from .output import _resolve_output_dir, _write_json, _write_jsonl
 from .planning import _build_request_plans
 from .scenarios import DEFAULT_SCENARIO_FILE, _load_scenarios
@@ -159,7 +159,6 @@ def main(argv: list[str] | None = None) -> int:
     _write_json(
         out_dir / "config.json",
         {
-            "schema_version": SCHEMA_VERSION,
             "args": vars(args),
             "clock": {
                 "wall_epoch_s": run_clock.wall_epoch_s,

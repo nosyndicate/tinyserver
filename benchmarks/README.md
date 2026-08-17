@@ -157,10 +157,16 @@ bench-results/
 | `config.json` | Exact CLI arguments, the run's clock epochs, and the resolved scenario definition; sufficient to reproduce the run |
 | `requests.jsonl` | One JSON object per request (including failures); raw data for post-hoc analysis |
 
-### Artifact schema version 2
+### Corrected measurement semantics
 
-`summary.json`, `config.json`, and every `requests.jsonl` row carry
-`schema_version: 2`.
+The definitions below replace measurements that were producing invalid numbers —
+wall-clock timestamps, a client token count that dropped empty decodes, a TPOT
+that divided a server-side numerator by a client-side count, and a `latency_ms`
+overwritten with the server's `total_ms`. They are a correction, not a new
+generation of the format.
+
+Artifacts written before the correction are told apart by what they lack: no
+`client_*` or `server_*` fields, no `output_tokens_source`, no `output_sha256`.
 
 **All timing is monotonic.** A single `perf_counter` epoch is taken at run start;
 every `*_ts` and `*_offset_s` field is seconds relative to that epoch, *not* a
@@ -213,7 +219,8 @@ worth sanity-checking.
 
 > **Compatibility:** `latency_ms` was previously overwritten with the server's
 > `total_ms`, and `start_ts` / `first_token_ts` / `end_ts` were wall-clock Unix
-> timestamps. Schema-1 artifacts are **not** comparable with schema-2 artifacts.
+> timestamps. Artifacts produced before this correction are **not** comparable
+> with those produced after it, and must not be merged into one table.
 
 ### Server-reported timing semantics
 
