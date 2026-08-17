@@ -173,9 +173,9 @@ enqueue ---- queue_wait_ms ----> first prefill ---- execution_ms ----> completio
   deliberately excludes queue wait, so it stays comparable across load levels.
   System-level throughput is a separate figure, computed by the benchmark
   client over its measurement window and reported in `summary.json`.
-- For v4, `execution_ms` includes any time a sequence spent preempted. The
-  start of the *first* prefill is not reset on resume, so preemption cost is
-  accounted as execution rather than as queue wait.
+- When preemption available, `execution_ms` includes any time a sequence spent 
+  preempted. The start of the *first* prefill is not reset on resume, so preemption 
+  cost is accounted as execution rather than as queue wait.
 
 > **Compatibility:** these definitions changed. Previously `total_ms` and
 > `ttft_ms` were measured from the start of prefill rather than from enqueue,
