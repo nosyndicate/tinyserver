@@ -15,12 +15,14 @@ class RunClock:
     mapped back to a real date after the fact. Mixing the two per-request (the
     behaviour this corrected) let NTP slew leak into latency measurements.
 
-    ``counter`` is injectable so timing logic is testable without patching.
+    ``counter`` and ``sleeper`` are injectable so scheduling logic is testable
+    without patching: a fake pair can advance virtual time instantly.
     """
 
     wall_epoch_s: float
     perf_epoch_s: float
     counter: Callable[[], float] = time.perf_counter
+    sleeper: Callable[[float], None] = time.sleep
 
     @classmethod
     def start(cls) -> "RunClock":
@@ -29,6 +31,12 @@ class RunClock:
     def offset(self) -> float:
         """Monotonic seconds elapsed since the run epoch."""
         return self.counter() - self.perf_epoch_s
+
+    def sleep_until(self, offset_s: float) -> None:
+        """Block until ``offset_s`` seconds after the run epoch; no-op if past."""
+        remaining = offset_s - self.offset()
+        if remaining > 0:
+            self.sleeper(remaining)
 
 
 @dataclass(frozen=True)

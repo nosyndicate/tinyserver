@@ -16,6 +16,7 @@ def _make_args(**overrides: Any) -> Namespace:
         "arrival_rate": None,
         "requests": 10,
         "duration_seconds": None,
+        "client_max_in_flight": 256,
     }
     defaults.update(overrides)
     return Namespace(**defaults)
@@ -43,9 +44,16 @@ class TestValidateArgs:
         with pytest.raises(ValueError, match="arrival-rate"):
             _validate_args(_make_args(mode="open", arrival_rate=0))
 
-    def test_open_loop_zero_concurrency(self) -> None:
-        with pytest.raises(ValueError, match="concurrency"):
-            _validate_args(_make_args(mode="open", arrival_rate=5.0, concurrency=0))
+    def test_open_loop_zero_client_max_in_flight(self) -> None:
+        with pytest.raises(ValueError, match="client-max-in-flight"):
+            _validate_args(
+                _make_args(mode="open", arrival_rate=5.0, client_max_in_flight=0)
+            )
+
+    def test_open_loop_ignores_concurrency(self) -> None:
+        # --concurrency is closed-loop only; open loop is bounded by
+        # --client-max-in-flight, so a zero here is irrelevant rather than fatal.
+        _validate_args(_make_args(mode="open", arrival_rate=5.0, concurrency=0))
 
     def test_neither_requests_nor_duration(self) -> None:
         with pytest.raises(ValueError, match="exactly one"):

@@ -46,12 +46,18 @@ def _summarize_results(
     window_end_s: float,
     results: list[RequestResult],
     warmup_results: list[RequestResult],
+    open_loop: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Reduce per-request results to a run summary.
 
     ``window_start_s`` / ``window_end_s`` are monotonic offsets from the run's
     ``RunClock`` epoch, taken around the dispatch loop after warmup.
+
+    ``open_loop`` carries the offer-window report from the open-loop dispatcher
+    (target vs. achieved arrival rate, dispatch lag, ``client_saturated``); its
+    keys are merged in flat. It is ``None`` for closed-loop runs, where arrival
+    rate is not an independent variable.
     """
     completed = [result for result in results if result.ok]
     ttfts = [result.ttft_ms for result in completed if result.ttft_ms is not None]
@@ -71,7 +77,7 @@ def _summarize_results(
         for result in results
     )
 
-    summary = {
+    summary: dict[str, Any] = {
         "run_id": run_id,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "base_url": args.base_url,
@@ -102,4 +108,6 @@ def _summarize_results(
             Counter(result.prompt_source for result in results)
         ),
     }
+    if open_loop is not None:
+        summary.update(open_loop)
     return summary

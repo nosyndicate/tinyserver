@@ -143,3 +143,52 @@ def test_summarize_results_empty() -> None:
     assert summary["failed_requests"] == 0
     assert summary["success_rate"] is None
     assert summary["latency_ms"]["mean"] is None
+
+
+def test_summarize_results_merges_open_loop_stats() -> None:
+    args = Namespace(
+        base_url="http://127.0.0.1:8000",
+        endpoint="stream_v4",
+        mode="open",
+    )
+    scenario = _default_scenarios()["short_short"]
+    summary = _summarize_results(
+        args=args,
+        scenario=scenario,
+        run_id="run-open",
+        window_start_s=0.0,
+        window_end_s=2.0,
+        results=[_make_result("1", output_tokens=4)],
+        warmup_results=[],
+        open_loop={
+            "target_arrival_rate": 8.0,
+            "achieved_arrival_rate": 7.9,
+            "client_saturated": False,
+        },
+    )
+
+    assert summary["target_arrival_rate"] == 8.0
+    assert summary["achieved_arrival_rate"] == 7.9
+    assert summary["client_saturated"] is False
+    # The ordinary summary keys survive the merge.
+    assert summary["completed_requests"] == 1
+
+
+def test_summarize_results_omits_open_loop_keys_when_closed() -> None:
+    args = Namespace(
+        base_url="http://127.0.0.1:8000",
+        endpoint="stream_v4",
+        mode="closed",
+    )
+    scenario = _default_scenarios()["short_short"]
+    summary = _summarize_results(
+        args=args,
+        scenario=scenario,
+        run_id="run-closed",
+        window_start_s=0.0,
+        window_end_s=1.0,
+        results=[_make_result("1")],
+        warmup_results=[],
+    )
+    assert "client_saturated" not in summary
+    assert "achieved_arrival_rate" not in summary
