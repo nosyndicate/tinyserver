@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+
 from server.executor.types import (
     DecodeResult,
     DoneEvent,
@@ -9,6 +11,54 @@ from server.executor.types import (
     TokenEvent,
 )
 from server.metrics.timers import now_ns, ns_to_ms
+
+
+@dataclass(frozen=True)
+class RequestTimings:
+    """The four timing metrics reported for a completed request."""
+
+    total_ms: float
+    queue_wait_ms: float
+    execution_ms: float
+    ttft_ms: float | None
+
+
+def compute_timings(
+    *,
+    enqueued_ns: int,
+    start_ns: int,
+    first_token_ns: int | None,
+    end_ns: int,
+) -> RequestTimings:
+    """Derive the reported timings from the four raw request timestamps.
+
+    Each metric is measured directly between two timestamps rather than derived
+    from the others, so ``total_ms == queue_wait_ms + execution_ms`` holds to
+    floating-point precision::
+
+        enqueued_ns ---- queue_wait ----> start_ns ---- execution ----> end_ns
+        |<------------------------- total ---------------------------->|
+
+    ``start_ns`` is the start of the *first* prefill. v4 deliberately does not
+    reset it when a preempted sequence resumes (see
+    ``ScheduleInferenceEngine._post_prefill``), so time spent preempted is
+    counted as execution rather than as queue wait — preemption is a cost of
+    running, not of waiting to be admitted.
+
+    The ``max(..., 0.0)`` guards are defensive only: ``enqueued_ns`` is stamped
+    in ``Worker.submit`` before the request is queued and ``start_ns`` on the
+    engine thread after it is dequeued, so the timestamps are already ordered.
+    """
+    return RequestTimings(
+        total_ms=max(ns_to_ms(end_ns - enqueued_ns), 0.0),
+        queue_wait_ms=max(ns_to_ms(start_ns - enqueued_ns), 0.0),
+        execution_ms=max(ns_to_ms(end_ns - start_ns), 0.0),
+        ttft_ms=(
+            max(ns_to_ms(first_token_ns - enqueued_ns), 0.0)
+            if first_token_ns is not None
+            else None
+        ),
+    )
 
 
 class RequestEventEmitter:
@@ -46,12 +96,17 @@ class RequestEventEmitter:
         On EOS the token text is emitted as an empty string (the model's EOS
         token itself is not part of the output).  For all other finished
         reasons (e.g. max length), the final token text is included.
+
+        ``first_token_ns`` is stamped only when an output token is actually
+        appended, so TTFT stays null for a request that finishes without
+        emitting one.
         """
         is_first = request_state.num_output_tokens == 0
-        if is_first:
-            request_state.first_token_ns = now_ns()
 
         if result.finish_reason == FinishReason.EOS:
+            # EOS produces no output token, so first_token_ns is deliberately
+            # left unset here. A request whose very first decode step is EOS
+            # finishes with zero output tokens and therefore a null TTFT.
             request_state.sink.emit(
                 TokenEvent(
                     request_id=request_state.request_id,
@@ -64,6 +119,9 @@ class RequestEventEmitter:
             request_state.finished_reason = FinishReason.EOS
             self._finish(request_state)
             return
+
+        if is_first:
+            request_state.first_token_ns = now_ns()
 
         request_state.output_tokens.append(result.token)
         request_state.sink.emit(
@@ -104,20 +162,15 @@ class RequestEventEmitter:
         if request_state.enqueued_ns is None:
             raise RuntimeError("enqueued_ns must be set before _finish()")
 
-        total_ms = ns_to_ms(end_ns - request_state.start_ns)
-        queue_wait_ms = max(
-            ns_to_ms(request_state.start_ns - request_state.enqueued_ns),
-            0.0,
-        )
-        ttft_ms = (
-            ns_to_ms(request_state.first_token_ns - request_state.start_ns)
-            if request_state.first_token_ns is not None
-            else -1.0
-        )
-        execution_ms = max(total_ms - queue_wait_ms, 0.0)
-
         if request_state.num_prompt_tokens is None:
             raise RuntimeError("num_prompt_tokens is required to finish the request")
+
+        timings = compute_timings(
+            enqueued_ns=request_state.enqueued_ns,
+            start_ns=request_state.start_ns,
+            first_token_ns=request_state.first_token_ns,
+            end_ns=end_ns,
+        )
 
         request_state.sink.emit(
             DoneEvent(
@@ -125,9 +178,9 @@ class RequestEventEmitter:
                 text="".join(request_state.output_tokens),
                 num_prompt_tokens=request_state.num_prompt_tokens,
                 num_output_tokens=request_state.num_output_tokens,
-                ttft=ttft_ms,
-                total_ms=total_ms,
-                queue_wait_ms=queue_wait_ms,
-                execution_ms=execution_ms,
+                ttft_ms=timings.ttft_ms,
+                total_ms=timings.total_ms,
+                queue_wait_ms=timings.queue_wait_ms,
+                execution_ms=timings.execution_ms,
             )
         )

@@ -246,7 +246,7 @@ def make_done(request_id: str = "req-1") -> DoneEvent:
         text="hello world",
         num_prompt_tokens=3,
         num_output_tokens=2,
-        ttft=12.5,
+        ttft_ms=12.5,
         total_ms=50.0,
         queue_wait_ms=5.0,
         execution_ms=45.0,
@@ -297,7 +297,9 @@ async def test_await_generation_returns_done_event_metrics() -> None:
     assert response.total_ms == 50.0
     assert response.queue_wait_ms == 5.0
     assert response.execution_ms == 45.0
-    assert response.tokens_per_s == pytest.approx(40.0)
+    # Decode rate is measured over execution_ms (45 ms), not total_ms (50 ms),
+    # so the 5 ms of queue wait does not drag the reported rate down.
+    assert response.tokens_per_s == pytest.approx(2 / 0.045)
     # Terminal event consumed: the handler is gone, so is its mailbox.
     assert len(registry) == 0
 

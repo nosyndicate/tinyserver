@@ -80,6 +80,10 @@ def generate(req: GenerateRequest, request: Request) -> GenerateResponse:
 
     # We don't have streaming right now, so ttft_ms is the same as total_ms.
     ttft_ms = total_ms
+    # v1 runs inline in the HTTP handler with no queue, so enqueue, first prefill
+    # and the timer start all coincide: queue_wait_ms is 0 and execution_ms ==
+    # total_ms. Passing total_ms here is therefore the execution time that
+    # _compute_tokens_per_s expects.
     tokens_per_s = _compute_tokens_per_s(output_tokens, total_ms)
 
     log_event(
