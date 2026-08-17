@@ -5,6 +5,7 @@ from conftest import FakeTokenizer
 
 from server.model.hf_runner import ModelRunner
 from server.model.sampling import SamplingParams
+from server.model.types import FinishReason
 
 
 @dataclass
@@ -101,7 +102,10 @@ def test_decode_loop_stops_immediately_on_eos() -> None:
         )
     )
 
-    assert chunks == [("", True, True)]
+    assert len(chunks) == 1
+    assert chunks[0].is_token is False
+    assert chunks[0].output_tokens == 0
+    assert chunks[0].finish_reason == FinishReason.EOS
 
 
 def test_generate_text_concatenates_and_counts_tokens() -> None:
@@ -118,6 +122,41 @@ def test_generate_text_concatenates_and_counts_tokens() -> None:
 
     assert out_text == "AB"
     assert prompt_tokens == 3
+    assert output_tokens == 2
+
+
+def test_final_empty_decoding_token_is_preserved_and_counted() -> None:
+    runner = build_runner(sequence=[1], decode_map={1: ""})
+    all_logits, past_key_values, prompt_tokens = runner.prefill("hello")
+
+    steps = list(
+        runner.decode_loop(
+            all_logits,
+            past_key_values,
+            SamplingParams(max_new_tokens=1, temperature=0.0, top_p=1.0),
+            prompt_tokens=prompt_tokens,
+        )
+    )
+
+    assert len(steps) == 1
+    assert steps[0].is_token is True
+    assert steps[0].token_str == ""
+    assert steps[0].index == 0
+    assert steps[0].output_tokens == 1
+    assert steps[0].finish_reason == FinishReason.MAX_LENGTH
+
+
+def test_generate_text_uses_sampled_count_without_retokenizing() -> None:
+    # The decoded text deliberately has no entry in text_token_ids. The old
+    # implementation retokenized it as zero tokens; the sampled count is two.
+    runner = build_runner(sequence=[1, 2, 0], decode_map={1: "A", 2: "B"})
+
+    out_text, _, output_tokens = runner.generate_text(
+        "hello",
+        SamplingParams(max_new_tokens=8, temperature=0.0, top_p=1.0),
+    )
+
+    assert out_text == "AB"
     assert output_tokens == 2
 
 

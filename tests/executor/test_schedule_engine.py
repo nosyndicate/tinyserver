@@ -186,14 +186,13 @@ def test_prefill_then_decode_finishes_at_max_length() -> None:
 
     _run_to_completion(engine, req)
 
-    # Event stream: 4 tokens (last is_last) then a DoneEvent.
+    # Event stream: 4 explicit tokens then a separate DoneEvent.
     events = drain_events(req)
     token_events = [e for e in events if isinstance(e, TokenEvent)]
     done = [e for e in events if isinstance(e, DoneEvent)]
     assert len(token_events) == 4
     assert [t.token for t in token_events] == ["<6>", "<7>", "<8>", "<9>"]
-    assert token_events[-1].is_last is True
-    assert token_events[0].is_first is True
+    assert [event.index for event in token_events] == [0, 1, 2, 3]
     assert len(done) == 1
     assert done[0].num_output_tokens == 4
     assert done[0].num_prompt_tokens == 3
@@ -243,9 +242,7 @@ def test_stops_on_eos_during_decode() -> None:
 
     events = drain_events(req)
     token_events = [e for e in events if isinstance(e, TokenEvent)]
-    assert [t.token for t in token_events] == ["<30>", ""]
-    assert token_events[0].is_first is True and token_events[0].is_last is False
-    assert token_events[1].is_last is True  # EOS token
+    assert [t.token for t in token_events] == ["<30>"]
     assert req.num_output_tokens == 1  # EOS token is not counted as output
     assert req.status == RequestStatus.DONE
     assert req.finished_reason is not None

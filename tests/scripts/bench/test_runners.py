@@ -11,6 +11,7 @@ import scripts.bench.runners as bench_runners
 from scripts.bench.models import RequestPlan, RunClock
 from scripts.bench.runners import (
     StreamAccumulator,
+    StreamProtocolError,
     _deterministic_gate,
     _endpoint_path,
     _full_url,
@@ -88,12 +89,14 @@ def _feed(acc: StreamAccumulator, *chunks: dict[str, Any]) -> StreamAccumulator:
     return acc
 
 
-def _done_chunk(**overrides: Any) -> dict[str, Any]:
-    """A v2/v3/v4-shaped final chunk; pass None to drop a key entirely."""
+def _token_event(index: int, token_str: str) -> dict[str, Any]:
+    return {"type": "token", "token_str": token_str, "index": index}
+
+
+def _done_event(**overrides: Any) -> dict[str, Any]:
     chunk: dict[str, Any] = {
-        "token_str": " world",
-        "is_first": False,
-        "is_done": True,
+        "type": "done",
+        "finish_reason": "max_length",
         "prompt_tokens": 11,
         "output_tokens": 2,
         "ttft_ms": 80.0,
@@ -270,9 +273,10 @@ def test_run_stream_request_uses_done_chunk_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     chunks = [
-        'data: {"token_str":"Hello","is_first":true,"is_done":false}\n',
+        'data: {"type":"token","token_str":"Hello","index":0}\n',
+        'data: {"type":"token","token_str":" world","index":1}\n',
         (
-            'data: {"token_str":" world","is_first":false,"is_done":true,'
+            'data: {"type":"done","finish_reason":"max_length",'
             '"prompt_tokens":11,"output_tokens":2,"ttft_ms":80.0,"total_ms":180.0,'
             '"tokens_per_s":11.1,"queue_wait_ms":25.0,"execution_ms":155.0}\n'
         ),
@@ -571,71 +575,61 @@ class TestDeterministicGate:
 
 class TestStreamAccumulator:
     def test_counts_empty_string_tokens(self) -> None:
-        # EOS and byte-fragment BPE pieces decode to "" but are real tokens.
         acc = _feed(
             StreamAccumulator(now=_scripted_clock(0.0).offset),
-            {"token_str": "a", "is_first": True, "is_done": False},
-            {"token_str": "", "is_first": False, "is_done": False},
-            _done_chunk(token_str="b", output_tokens=None),
+            _token_event(0, "a"),
+            _token_event(1, ""),
+            _done_event(output_tokens=2),
         )
-        assert acc.client_token_count == 3
-        assert acc.response_text_chars == 2
+        assert acc.client_token_count == 2
+        assert acc.response_text_chars == 1
+        assert acc.resolve_output_tokens() == (2, "server")
 
-    def test_server_output_tokens_wins(self) -> None:
+    def test_done_supplies_authoritative_count(self) -> None:
         acc = _feed(
             StreamAccumulator(now=_scripted_clock(0.0).offset),
-            {"token_str": "a", "is_first": True, "is_done": False},
-            _done_chunk(output_tokens=17),
+            _token_event(0, "a"),
+            _done_event(output_tokens=1),
         )
-        assert acc.resolve_output_tokens() == (17, "server")
+        assert acc.resolve_output_tokens() == (1, "server")
 
-    def test_falls_back_to_client_count_when_server_omits_it(self) -> None:
-        # The v1 stream reports every metric as null, including output_tokens.
-        acc = _feed(
-            StreamAccumulator(now=_scripted_clock(0.0).offset),
-            {"token_str": "a", "is_first": True, "is_done": False},
-            _done_chunk(output_tokens=None),
-        )
-        assert acc.resolve_output_tokens() == (2, "client_count")
-
-    def test_missing_ttft_key_leaves_server_ttft_none(self) -> None:
-        # exclude_none drops ttft_ms when the request emitted no token.
+    def test_null_ttft_for_zero_token_eos(self) -> None:
         acc = _feed(
             StreamAccumulator(now=_scripted_clock(0.0, 0.5).offset),
-            _done_chunk(ttft_ms=None),
+            _done_event(
+                output_tokens=0,
+                finish_reason="eos",
+                ttft_ms=None,
+            ),
         )
         assert acc.server_ttft_ms is None
         assert acc.server_decode_start_ms() is None
-        # The client still observed a first token, on its own clock.
-        assert acc.first_token_offset_s == 0.0
+        assert acc.first_token_offset_s is None
         assert acc.done is True
 
     def test_server_decode_start_rebases_ttft_onto_execution_clock(self) -> None:
         acc = _feed(
             StreamAccumulator(now=_scripted_clock(0.0).offset),
-            _done_chunk(ttft_ms=80.0, queue_wait_ms=25.0),
+            _token_event(0, "a"),
+            _token_event(1, "b"),
+            _done_event(ttft_ms=80.0, queue_wait_ms=25.0),
         )
         assert acc.server_decode_start_ms() == pytest.approx(55.0)
 
     def test_first_token_offset_stamped_once(self) -> None:
         acc = _feed(
             StreamAccumulator(now=_scripted_clock(0.25, 0.75, 1.5).offset),
-            {"token_str": "a", "is_first": True, "is_done": False},
-            {"token_str": "b", "is_first": False, "is_done": False},
-            _done_chunk(),
+            _token_event(0, "a"),
+            _token_event(1, "b"),
+            _done_event(),
         )
         assert acc.first_token_offset_s == pytest.approx(0.25)
 
-    def test_error_chunk_stops_stream_and_keeps_partial_counts(self) -> None:
+    def test_error_event_stops_stream_and_keeps_partial_counts(self) -> None:
         acc = _feed(
             StreamAccumulator(now=_scripted_clock(0.0).offset),
-            {"token_str": "a", "is_first": True, "is_done": False},
-            {
-                "token_str": "",
-                "is_first": False,
-                "is_done": True,
-                "error": "engine exploded",
-            },
+            _token_event(0, "a"),
+            {"type": "error", "error": "engine exploded"},
         )
         assert acc.error == "engine exploded"
         assert acc.done is True
@@ -646,9 +640,9 @@ class TestStreamAccumulator:
         def build() -> StreamAccumulator:
             return _feed(
                 StreamAccumulator(now=_scripted_clock(0.0).offset),
-                {"token_str": "Hello", "is_first": True, "is_done": False},
-                {"token_str": "", "is_first": False, "is_done": False},
-                _done_chunk(token_str=" world"),
+                _token_event(0, "Hello"),
+                _token_event(1, ""),
+                _done_event(),
             )
 
         assert build().output_sha256 == build().output_sha256
@@ -656,83 +650,55 @@ class TestStreamAccumulator:
     def test_differing_token_changes_hash(self) -> None:
         base = _feed(
             StreamAccumulator(now=_scripted_clock(0.0).offset),
-            {"token_str": "Hello", "is_first": True, "is_done": False},
-            _done_chunk(token_str=" world"),
+            _token_event(0, "Hello"),
+            _token_event(1, " world"),
+            _done_event(),
         )
         other = _feed(
             StreamAccumulator(now=_scripted_clock(0.0).offset),
-            {"token_str": "Hello", "is_first": True, "is_done": False},
-            _done_chunk(token_str=" there"),
+            _token_event(0, "Hello"),
+            _token_event(1, " there"),
+            _done_event(),
         )
         assert base.output_sha256 != other.output_sha256
-
-    def test_v1_eos_terminal_chunk_is_not_counted(self) -> None:
-        # v1 appends a separate token-less is_done chunk on the EOS path
-        # (server/model/hf_runner.py) instead of holding the last token back,
-        # and reports every metric as null, so the client count is what gets
-        # used. Counting that chunk would overstate the run by one.
-        acc = _feed(
-            StreamAccumulator(now=_scripted_clock(0.0).offset),
-            {"token_str": "a", "is_first": True, "is_done": False},
-            {"token_str": "b", "is_first": False, "is_done": False},
-            {"token_str": "", "is_first": False, "is_done": True},
-        )
-        assert acc.resolve_output_tokens() == (2, "client_count")
-        assert acc.done is True
-
-    def test_zero_token_eos_stamps_no_first_token(self) -> None:
-        acc = _feed(
-            StreamAccumulator(now=_scripted_clock(0.0, 0.5).offset),
-            {"token_str": "", "is_first": True, "is_done": True},
-        )
-        assert acc.resolve_output_tokens() == (0, "client_count")
-        assert acc.first_token_offset_s is None
-        assert acc.done is True
-
-    def test_token_less_terminal_chunk_leaves_hash_unchanged(self) -> None:
-        chunks: list[dict[str, Any]] = [
-            {"token_str": "a", "is_first": True, "is_done": False},
-            {"token_str": "b", "is_first": False, "is_done": False},
-        ]
-        without = _feed(StreamAccumulator(now=_scripted_clock(0.0).offset), *chunks)
-        with_terminal = _feed(
-            StreamAccumulator(now=_scripted_clock(0.0).offset),
-            *chunks,
-            {"token_str": "", "is_first": False, "is_done": True},
-        )
-        assert with_terminal.output_sha256 == without.output_sha256
-        assert with_terminal.response_text_chars == without.response_text_chars
-
-    def test_v2_terminal_chunk_carrying_a_token_is_counted(self) -> None:
-        # v2+ holds the last real token back onto its is_done chunk, so that
-        # chunk must still count.
-        acc = _feed(
-            StreamAccumulator(now=_scripted_clock(0.0).offset),
-            {"token_str": "a", "is_first": True, "is_done": False},
-            _done_chunk(token_str="b", output_tokens=None),
-        )
-        assert acc.resolve_output_tokens() == (2, "client_count")
-
-    def test_mid_stream_empty_token_is_still_counted(self) -> None:
-        # Only a *terminal* token-less chunk is skipped; mid-stream, an empty
-        # token_str is a real byte-fragment token.
-        acc = _feed(
-            StreamAccumulator(now=_scripted_clock(0.0).offset),
-            {"token_str": "a", "is_first": True, "is_done": False},
-            {"token_str": "", "is_first": False, "is_done": False},
-            {"token_str": "", "is_first": False, "is_done": True},
-        )
-        assert acc.resolve_output_tokens() == (2, "client_count")
 
     def test_hash_is_order_sensitive(self) -> None:
         forward = _feed(
             StreamAccumulator(now=_scripted_clock(0.0).offset),
-            {"token_str": "ab", "is_first": True, "is_done": False},
-            _done_chunk(token_str="c"),
+            _token_event(0, "ab"),
+            _token_event(1, "c"),
+            _done_event(),
         )
         reordered = _feed(
             StreamAccumulator(now=_scripted_clock(0.0).offset),
-            {"token_str": "c", "is_first": True, "is_done": False},
-            _done_chunk(token_str="ab"),
+            _token_event(0, "c"),
+            _token_event(1, "ab"),
+            _done_event(),
         )
         assert forward.output_sha256 != reordered.output_sha256
+
+    def test_rejects_non_contiguous_index(self) -> None:
+        acc = StreamAccumulator(now=_scripted_clock(0.0).offset)
+        with pytest.raises(StreamProtocolError, match="expected token index 0"):
+            acc.feed(_token_event(1, "a"))
+
+    def test_rejects_done_count_mismatch(self) -> None:
+        acc = _feed(
+            StreamAccumulator(now=_scripted_clock(0.0).offset),
+            _token_event(0, "a"),
+        )
+        with pytest.raises(StreamProtocolError, match="does not match"):
+            acc.feed(_done_event(output_tokens=2))
+
+    def test_rejects_unknown_or_missing_type(self) -> None:
+        acc = StreamAccumulator(now=_scripted_clock(0.0).offset)
+        with pytest.raises(StreamProtocolError, match="unknown or missing"):
+            acc.feed({"token_str": "legacy"})
+
+    def test_rejects_event_after_terminal(self) -> None:
+        acc = _feed(
+            StreamAccumulator(now=_scripted_clock(0.0).offset),
+            _done_event(output_tokens=0, finish_reason="eos"),
+        )
+        with pytest.raises(StreamProtocolError, match="after the terminal"):
+            acc.feed(_token_event(0, "late"))

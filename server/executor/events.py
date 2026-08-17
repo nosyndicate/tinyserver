@@ -104,18 +104,8 @@ class RequestEventEmitter:
         is_first = request_state.num_output_tokens == 0
 
         if result.finish_reason == FinishReason.EOS:
-            # EOS produces no output token, so first_token_ns is deliberately
-            # left unset here. A request whose very first decode step is EOS
-            # finishes with zero output tokens and therefore a null TTFT.
-            request_state.sink.emit(
-                TokenEvent(
-                    request_id=request_state.request_id,
-                    token="",
-                    is_first=is_first,
-                    is_last=True,
-                    index=request_state.num_output_tokens,
-                )
-            )
+            # EOS is a completion signal, not an output token. A request whose
+            # first decode step is EOS therefore finishes with a null TTFT.
             request_state.finished_reason = FinishReason.EOS
             self._finish(request_state)
             return
@@ -128,8 +118,6 @@ class RequestEventEmitter:
             TokenEvent(
                 request_id=request_state.request_id,
                 token=result.token,
-                is_first=is_first,
-                is_last=result.is_finished,
                 index=request_state.num_output_tokens - 1,
             )
         )
@@ -165,6 +153,9 @@ class RequestEventEmitter:
         if request_state.num_prompt_tokens is None:
             raise RuntimeError("num_prompt_tokens is required to finish the request")
 
+        if request_state.finished_reason is None:
+            raise RuntimeError("finish_reason is required to finish the request")
+
         timings = compute_timings(
             enqueued_ns=request_state.enqueued_ns,
             start_ns=request_state.start_ns,
@@ -178,6 +169,7 @@ class RequestEventEmitter:
                 text="".join(request_state.output_tokens),
                 num_prompt_tokens=request_state.num_prompt_tokens,
                 num_output_tokens=request_state.num_output_tokens,
+                finish_reason=request_state.finished_reason,
                 ttft_ms=timings.ttft_ms,
                 total_ms=timings.total_ms,
                 queue_wait_ms=timings.queue_wait_ms,

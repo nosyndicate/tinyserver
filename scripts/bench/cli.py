@@ -24,7 +24,7 @@ DEFAULT_BASE_URL = "http://127.0.0.1:8000"
 DEFAULT_TIMEOUT_SECONDS = 120.0
 
 #  When continuous batching is implemented, the next checkpoint should be:
-#   - add scheduler metadata to worker events and SSE final chunks
+#   - add scheduler metadata to worker events and SSE done events
 #   - benchmark short_short, long_long, and mixed before/after batching
 #   - add batch-size and queue-wait distributions to the saved artifacts
 

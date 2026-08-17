@@ -27,9 +27,9 @@ def test_smoke_decode_loop_kv_cache_path(gpt2_runner: ModelRunner) -> None:
     )
 
     assert 1 <= len(chunks) <= 3
-    assert chunks[0][1] is True  # is_first
-    assert chunks[-1][2] is True  # is_done
-    assert all(isinstance(token_str, str) for token_str, _, _ in chunks)
+    assert chunks[0].index == 0
+    assert chunks[-1].is_done is True
+    assert all(isinstance(step.token_str, str) for step in chunks)
 
 
 @pytest.mark.smoke

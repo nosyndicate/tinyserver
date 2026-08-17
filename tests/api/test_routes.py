@@ -12,12 +12,18 @@ from server.api.routes import (
     _stream_generation,
     _submit_or_fail,
 )
-from server.api.schema import GenerateRequest
+from server.api.schema import (
+    GenerateRequest,
+    StreamDoneEvent,
+    StreamErrorEvent,
+    StreamTokenEvent,
+)
 from server.executor.engine import EngineCallbacks, EngineControl
 from server.executor.sinks import SharedQueueSink
 from server.executor.types import (
     DoneEvent,
     ErrorEvent,
+    FinishReason,
     GenerationRequestState,
     TokenEvent,
 )
@@ -129,6 +135,29 @@ def test_negative_top_k_is_rejected() -> None:
         GenerateRequest(prompt="hi", top_k=-1)
 
 
+def test_explicit_stream_event_schemas() -> None:
+    token = StreamTokenEvent(token_str="", index=0)
+    done = StreamDoneEvent(
+        finish_reason="max_length",
+        prompt_tokens=3,
+        output_tokens=1,
+        ttft_ms=1.0,
+        total_ms=2.0,
+        tokens_per_s=500.0,
+        queue_wait_ms=0.0,
+        execution_ms=2.0,
+    )
+    error = StreamErrorEvent(error="boom")
+
+    assert token.model_dump() == {"type": "token", "token_str": "", "index": 0}
+    assert done.type == "done"
+    assert done.finish_reason == "max_length"
+    assert error.model_dump() == {"type": "error", "error": "boom"}
+
+    with pytest.raises(ValidationError):
+        StreamTokenEvent(token_str="x", index=0, output_tokens=1)  # type: ignore[call-arg]
+
+
 def test_top_k_reaches_sampling_params() -> None:
     req = GenerateRequest(prompt="hi", max_new_tokens=1, top_k=5)
     state = _build_request_state(req, device="cpu", sink=SharedQueueSink())
@@ -143,9 +172,7 @@ def test_build_request_state_uses_the_shared_sink() -> None:
         GenerateRequest(prompt="hi", max_new_tokens=1), device="cpu", sink=sink
     )
 
-    event = TokenEvent(
-        request_id=state.request_id, token="x", is_first=True, is_last=False, index=0
-    )
+    event = TokenEvent(request_id=state.request_id, token="x", index=0)
     state.sink.emit(event)
 
     assert sink.queue.get_nowait() is event
@@ -223,9 +250,7 @@ async def test_submit_or_fail_registers_before_submitting() -> None:
 
     state, collector = _submit_or_fail(request, make_generate_request())
 
-    event = TokenEvent(
-        request_id=state.request_id, token="hi", is_first=True, is_last=False, index=0
-    )
+    event = TokenEvent(request_id=state.request_id, token="hi", index=0)
     registry.dispatch(event)
 
     assert await collector.get(timeout=0.01) is event
@@ -246,6 +271,7 @@ def make_done(request_id: str = "req-1") -> DoneEvent:
         text="hello world",
         num_prompt_tokens=3,
         num_output_tokens=2,
+        finish_reason=FinishReason.MAX_LENGTH,
         ttft_ms=12.5,
         total_ms=50.0,
         queue_wait_ms=5.0,
@@ -281,8 +307,6 @@ async def test_await_generation_returns_done_event_metrics() -> None:
         TokenEvent(
             request_id=state.request_id,
             token="hello",
-            is_first=True,
-            is_last=False,
             index=0,
         )
     )
@@ -331,8 +355,6 @@ async def test_stream_generation_cancels_on_client_disconnect() -> None:
         TokenEvent(
             request_id=state.request_id,
             token="hi",
-            is_first=True,
-            is_last=False,
             index=0,
         )
     )
@@ -349,7 +371,7 @@ async def test_stream_generation_cancels_on_client_disconnect() -> None:
     assert len(registry) == 0
 
 
-async def test_stream_generation_final_chunk_carries_done_metrics() -> None:
+async def test_stream_generation_emits_token_then_done_metrics() -> None:
     worker = make_worker()
     state = make_state()
     registry = CollectorRegistry()
@@ -358,8 +380,6 @@ async def test_stream_generation_final_chunk_carries_done_metrics() -> None:
         TokenEvent(
             request_id=state.request_id,
             token=" world",
-            is_first=False,
-            is_last=True,
             index=1,
         )
     )
@@ -372,7 +392,9 @@ async def test_stream_generation_final_chunk_carries_done_metrics() -> None:
         )
     ]
 
-    assert len(chunks) == 1
-    assert '"is_done":true' in chunks[0]
-    assert '"ttft_ms":12.5' in chunks[0]
+    assert len(chunks) == 2
+    assert chunks[0] == 'data: {"type":"token","token_str":" world","index":1}\n\n'
+    assert '"type":"done"' in chunks[1]
+    assert '"finish_reason":"max_length"' in chunks[1]
+    assert '"ttft_ms":12.5' in chunks[1]
     assert len(registry) == 0

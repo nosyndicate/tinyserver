@@ -244,8 +244,8 @@ clocks from different origins, so combining them in one number is meaningless.
 | `server_execution_ms` | Server: first prefill → completion |
 | `server_ttft_ms` | Server: enqueue → first token. `null` when no token was emitted |
 | `server_tpot_ms` | `(server_execution_ms − (server_ttft_ms − server_queue_wait_ms)) / (n − 1)`; `null` below two tokens |
-| `output_tokens` | The server's authoritative count from the final `is_done` chunk |
-| `output_tokens_source` | `server`, or `client_count` when the endpoint reported none (the v1 stream) |
+| `output_tokens` | The server's authoritative count from the terminal `done` event |
+| `output_tokens_source` | `server` for successful streams; `client_count` only for partial failed streams |
 | `output_sha256` | SHA-256 over the concatenated streamed tokens |
 | `deterministic_gate` | `true` when `temperature == 0.0` and a `seed` was set |
 
@@ -259,12 +259,13 @@ first token; use `server_ttft_ms` / `server_tpot_ms` for those runs. The server'
 figure is not copied into the client field, because it is measured from server
 enqueue on a different clock.
 
-**Output tokens come from the server.** Counting non-empty `token_str` chunks
-client-side undercounts, because byte-fragment BPE pieces legitimately decode to
-`""`. The client keeps its own count only as a fallback, and says so via
-`output_tokens_source`. That fallback counts every chunk *except* a token-less
-terminal one: the v1 stream appends a separate empty `is_done` chunk on the EOS
-path, while v2/v3/v4 instead hold the last real token back onto theirs.
+**Output tokens come from the server's explicit stream protocol.** Each sampled
+non-EOS token produces a `type: "token"` event, even when its decoded
+`token_str` is `""`; EOS produces no token event. A separate `type: "done"`
+event reports the authoritative count, finish reason, and timing metrics. The
+client verifies contiguous zero-based token indices and requires the done count
+to match the number of observed token events, eliminating terminal-chunk
+heuristics across v1/v2/v3/v4.
 
 **`output_sha256` is only comparable where `deterministic_gate` is true.** At
 `temperature > 0`, v2/v3/v4 will not produce byte-identical text across batch

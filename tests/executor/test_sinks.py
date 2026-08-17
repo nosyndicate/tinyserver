@@ -7,8 +7,6 @@ def _token(rid: str, index: int) -> TokenEvent:
     return TokenEvent(
         request_id=rid,
         token=f"t{index}",
-        is_first=index == 0,
-        is_last=False,
         index=index,
     )
 
