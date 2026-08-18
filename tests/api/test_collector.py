@@ -9,15 +9,13 @@ import asyncio
 import pytest
 
 from server.api.collector import CollectorRegistry, OutputCollector
-from server.executor.types import DoneEvent, ErrorEvent, TokenEvent
+from server.executor.types import DoneEvent, ErrorEvent, FinishReason, TokenEvent
 
 
 def make_token(request_id: str, index: int = 0, token: str = "hi") -> TokenEvent:
     return TokenEvent(
         request_id=request_id,
         token=token,
-        is_first=index == 0,
-        is_last=False,
         index=index,
     )
 
@@ -28,6 +26,7 @@ def make_done(request_id: str) -> DoneEvent:
         text="hi",
         num_prompt_tokens=1,
         num_output_tokens=1,
+        finish_reason=FinishReason.MAX_LENGTH,
         ttft_ms=1.0,
         total_ms=2.0,
         queue_wait_ms=0.5,

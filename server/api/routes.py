@@ -6,7 +6,13 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from server.api.collector import CollectorRegistry, OutputCollector
-from server.api.schema import GenerateRequest, GenerateResponse, StreamChunk
+from server.api.schema import (
+    GenerateRequest,
+    GenerateResponse,
+    StreamDoneEvent,
+    StreamErrorEvent,
+    StreamTokenEvent,
+)
 from server.executor.types import (
     DoneEvent,
     ErrorEvent,
@@ -164,9 +170,9 @@ async def _stream_generation(
     timeout: float = _GENERATION_TIMEOUT_S,
 ) -> AsyncGenerator[str, None]:
     """
-    Consume this request's collector and yield SSE chunks. The final token
-    is held until the terminal DoneEvent so the last chunk carries the same
-    timing metadata as the non-streaming endpoint.
+    Consume this request's collector and yield explicit token/done/error SSE
+    events. Every TokenEvent is delivered immediately; DoneEvent is a separate
+    terminal record carrying authoritative counts and timings.
 
     The ``finally`` cancels the request on every exit path — timeout return,
     the ``GeneratorExit``/``CancelledError`` Starlette throws in on a client
@@ -179,84 +185,41 @@ async def _stream_generation(
             try:
                 event: Event = await collector.get(timeout=timeout)
             except TimeoutError:
-                error_chunk = StreamChunk(
-                    token_str="",
-                    is_first=False,
-                    is_done=True,
-                    error="Generation timed out.",
-                )
-                yield f"data: {error_chunk.model_dump_json(exclude_none=True)}\n\n"
+                error_event = StreamErrorEvent(error="Generation timed out.")
+                yield f"data: {error_event.model_dump_json()}\n\n"
                 return
 
             if isinstance(event, TokenEvent):
-                if event.is_last:
-                    try:
-                        done_event = await collector.get(timeout=timeout)
-                    except TimeoutError:
-                        error_chunk = StreamChunk(
-                            token_str="",
-                            is_first=False,
-                            is_done=True,
-                            error="Generation timed out waiting for final event.",
-                        )
-                        yield f"data: {error_chunk.model_dump_json(exclude_none=True)}\n\n"
-                        return
-                    if isinstance(done_event, DoneEvent):
-                        tokens_per_s = _compute_tokens_per_s(
-                            done_event.num_output_tokens, done_event.execution_ms
-                        )
-                        chunk = StreamChunk(
-                            token_str=event.token,
-                            is_first=event.is_first,
-                            is_done=True,
-                            prompt_tokens=done_event.num_prompt_tokens,
-                            output_tokens=done_event.num_output_tokens,
-                            ttft_ms=done_event.ttft_ms,
-                            total_ms=done_event.total_ms,
-                            tokens_per_s=tokens_per_s,
-                            queue_wait_ms=done_event.queue_wait_ms,
-                            execution_ms=done_event.execution_ms,
-                        )
-                        yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
-                        log_event(
-                            "stream_done",
-                            output_tokens=done_event.num_output_tokens,
-                            ttft_ms=done_event.ttft_ms,
-                        )
-                    elif isinstance(done_event, ErrorEvent):
-                        error_chunk = StreamChunk(
-                            token_str="",
-                            is_first=False,
-                            is_done=True,
-                            error=done_event.error,
-                        )
-                        yield f"data: {error_chunk.model_dump_json(exclude_none=True)}\n\n"
-                    else:
-                        # Unexpected event type after last token, yield a generic error
-                        error_chunk = StreamChunk(
-                            token_str="",
-                            is_first=False,
-                            is_done=True,
-                            error="Unexpected event type after last token",
-                        )
-                        yield f"data: {error_chunk.model_dump_json(exclude_none=True)}\n\n"
-
-                    return
-                chunk = StreamChunk(
-                    token_str=event.token,
-                    is_first=event.is_first,
-                    is_done=False,
+                token_stream_event = StreamTokenEvent(
+                    token_str=event.token, index=event.index
                 )
-                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                yield f"data: {token_stream_event.model_dump_json()}\n\n"
+
+            elif isinstance(event, DoneEvent):
+                tokens_per_s = _compute_tokens_per_s(
+                    event.num_output_tokens, event.execution_ms
+                )
+                done_stream_event = StreamDoneEvent(
+                    finish_reason=event.finish_reason.value,
+                    prompt_tokens=event.num_prompt_tokens,
+                    output_tokens=event.num_output_tokens,
+                    ttft_ms=event.ttft_ms,
+                    total_ms=event.total_ms,
+                    tokens_per_s=tokens_per_s,
+                    queue_wait_ms=event.queue_wait_ms,
+                    execution_ms=event.execution_ms,
+                )
+                yield f"data: {done_stream_event.model_dump_json()}\n\n"
+                log_event(
+                    "stream_done",
+                    output_tokens=event.num_output_tokens,
+                    ttft_ms=event.ttft_ms,
+                )
+                return
 
             elif isinstance(event, ErrorEvent):
-                chunk = StreamChunk(
-                    token_str="",
-                    is_first=False,
-                    is_done=True,
-                    error=event.error,
-                )
-                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                error_stream_event = StreamErrorEvent(error=event.error)
+                yield f"data: {error_stream_event.model_dump_json()}\n\n"
                 return
     finally:
         # No matter how we exit the generator:

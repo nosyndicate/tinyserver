@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Generator
 
 import torch
@@ -18,7 +19,26 @@ from server.model.batch_ops import (
 )
 from server.model.determinism import make_generator
 from server.model.sampling import LOWEST_TEMPERATURE, SamplingParams, sample_token
-from server.model.types import ModelConfig
+from server.model.types import FinishReason, ModelConfig
+
+
+@dataclass(frozen=True)
+class GenerationStep:
+    """One decode result with token identity preserved independently of text."""
+
+    token_str: str
+    index: int | None
+    output_tokens: int
+    finish_reason: FinishReason | None = None
+    prompt_tokens: int | None = None
+
+    @property
+    def is_token(self) -> bool:
+        return self.index is not None
+
+    @property
+    def is_done(self) -> bool:
+        return self.finish_reason is not None
 
 
 class ModelRunner:
@@ -44,28 +64,28 @@ class ModelRunner:
 
         all_logits, past_key_values, prompt_tokens = self.prefill(prompt)
 
-        token_counter = 0
-        tokens = []
-        for next_token, _, is_done in self.decode_loop(
-            all_logits, past_key_values, sampling_params, generator=generator
+        output_tokens = 0
+        tokens: list[str] = []
+        for step in self.decode_loop(
+            all_logits,
+            past_key_values,
+            sampling_params,
+            generator=generator,
+            prompt_tokens=prompt_tokens,
         ):
-            if next_token:
-                tokens.append(next_token)
+            if step.is_token:
+                tokens.append(step.token_str)
 
-            if is_done:
+            output_tokens = step.output_tokens
+            if step.is_done:
                 break
 
         out_text = "".join(tokens)
-
-        out_ids = self.tokenizer(
-            [out_text], return_tensors="pt", add_special_tokens=False
-        )["input_ids"]
-        token_counter = int(out_ids.shape[1])
-        return out_text, prompt_tokens, token_counter
+        return out_text, prompt_tokens, output_tokens
 
     def generate_stream(
         self, prompt: str, sampling_params: SamplingParams
-    ) -> Generator[tuple[str, bool, bool], None, None]:
+    ) -> Generator[GenerationStep, None, None]:
         """Generate text as a stream of tokens using the two-stage approach."""
         if (
             sampling_params.temperature is not None
@@ -75,16 +95,19 @@ class ModelRunner:
         else:
             generator = None
 
-        all_logits, past_key_values, _ = self.prefill(prompt)
+        all_logits, past_key_values, prompt_tokens = self.prefill(prompt)
 
         # We cannot use @torch.inference_mode() on this generator function, because a decorator
         # would only wrap creation of the generator object, not the subsequent iteration.
         # Using a context manager here keeps inference_mode active while we iterate and yield tokens.
         with torch.inference_mode():
-            for token_str, is_first, is_done in self.decode_loop(
-                all_logits, past_key_values, sampling_params, generator=generator
-            ):
-                yield token_str, is_first, is_done
+            yield from self.decode_loop(
+                all_logits,
+                past_key_values,
+                sampling_params,
+                generator=generator,
+                prompt_tokens=prompt_tokens,
+            )
 
     @torch.inference_mode()
     def prefill(self, prompt: str) -> tuple[torch.Tensor, DynamicCache, int]:
@@ -136,9 +159,10 @@ class ModelRunner:
         past_key_values: DynamicCache,
         sampling_params: SamplingParams,
         generator: torch.Generator | None = None,
-    ) -> Generator[tuple[str, bool, bool], None, None]:
+        prompt_tokens: int | None = None,
+    ) -> Generator[GenerationStep, None, None]:
         """
-        A generator that yields the next token, whether it's the first token, and whether generation is done.
+        Yield structured decode steps that distinguish tokens from completion.
 
         Args:
             all_logits: Tensor of shape [1, seq_len, vocab_size] containing the logits for the current sequence.
@@ -146,12 +170,8 @@ class ModelRunner:
             sampling_params: SamplingParams object containing the parameters for sampling.
             generator: Optional torch.Generator for reproducible sampling. If None, sampling will be non-deterministic.
 
-        Yields:
-            A tuple of (next_token: str, is_first_token: bool, is_done: bool) where:
-                - next_token is the decoded text of the next token ID. (Maybe empty string if the token
-                  is a special token or if generation is done.)
-                - is_first_token indicates if this is the first generated token (after the prompt).
-                - is_done indicates if generation should stop (either due to EOS token or max tokens reached).
+        A non-EOS sample always has an index, even if it decodes to an empty
+        string. EOS has no index and does not advance ``output_tokens``.
 
         Returns:
             None
@@ -168,7 +188,13 @@ class ModelRunner:
 
             # 2. if the next token is EOS, we stop generation
             if next_token_id == self.eos_token_id:
-                yield "", token_counter == 0, True
+                yield GenerationStep(
+                    token_str="",
+                    index=None,
+                    output_tokens=token_counter,
+                    finish_reason=FinishReason.EOS,
+                    prompt_tokens=prompt_tokens,
+                )
                 return
 
             # 3. decode the next token ID to text
@@ -177,8 +203,16 @@ class ModelRunner:
             )
 
             # 4. yield the next token and continue
-            is_last = token_counter == sampling_params.max_new_tokens - 1
-            yield next_token, token_counter == 0, is_last  # type: ignore[misc]
+            index = token_counter
+            token_counter += 1
+            is_last = token_counter >= sampling_params.max_new_tokens
+            yield GenerationStep(
+                token_str=next_token,
+                index=index,
+                output_tokens=token_counter,
+                finish_reason=FinishReason.MAX_LENGTH if is_last else None,
+                prompt_tokens=prompt_tokens,
+            )
 
             if is_last:
                 return
@@ -193,10 +227,16 @@ class ModelRunner:
             )
             last_logits = output.logits[:, -1, :]  # shape [1, vocab_size]
             past_key_values = output.past_key_values
-            token_counter += 1
 
-        # max tokens reached, we stop generation
-        yield "", token_counter == 0, True
+        # This is reachable only for a direct caller using max_new_tokens=0;
+        # the HTTP schema requires at least one output token.
+        yield GenerationStep(
+            token_str="",
+            index=None,
+            output_tokens=token_counter,
+            finish_reason=FinishReason.MAX_LENGTH,
+            prompt_tokens=prompt_tokens,
+        )
 
     @property
     def eos_token_id(self) -> int:

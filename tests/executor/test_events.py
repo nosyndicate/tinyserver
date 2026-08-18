@@ -85,12 +85,10 @@ def test_first_token_emits_token_event_and_updates_decode_state() -> None:
     assert req.all_logits is logits
     assert req.past_key_values is cache
     assert isinstance(events[0], TokenEvent)
-    assert events[0].is_first is True
-    assert events[0].is_last is False
     assert events[0].index == 0
 
 
-def test_second_token_is_not_first() -> None:
+def test_second_token_has_next_index() -> None:
     req = make_req()
     req.status = RequestStatus.DECODING
     req.start_ns = 0
@@ -104,11 +102,10 @@ def test_second_token_is_not_first() -> None:
 
     event = drain_events(req)[0]
     assert isinstance(event, TokenEvent)
-    assert event.is_first is False
     assert event.index == 1
 
 
-def test_eos_emits_final_empty_token_and_done_event() -> None:
+def test_eos_emits_done_without_a_token_event() -> None:
     req = make_req()
     req.status = RequestStatus.DECODING
     req.start_ns = 0
@@ -127,14 +124,12 @@ def test_eos_emits_final_empty_token_and_done_event() -> None:
     events = drain_events(req)
     assert req.status == RequestStatus.DONE
     assert req.finished_reason == FinishReason.EOS
-    assert isinstance(events[0], TokenEvent)
-    assert events[0].token == ""
-    assert events[0].is_last is True
+    assert len(events) == 1
+    assert isinstance(events[0], DoneEvent)
+    assert events[0].text == "a"
+    assert events[0].num_output_tokens == 1
+    assert events[0].finish_reason == FinishReason.EOS
     assert events[0].request_id == req.request_id
-    assert isinstance(events[1], DoneEvent)
-    assert events[1].text == "a"
-    assert events[1].num_output_tokens == 1
-    assert events[1].request_id == req.request_id
 
 
 def test_max_length_emits_final_token_and_done_event() -> None:
@@ -158,9 +153,9 @@ def test_max_length_emits_final_token_and_done_event() -> None:
     assert req.output_tokens == ["a"]
     assert isinstance(events[0], TokenEvent)
     assert events[0].token == "a"
-    assert events[0].is_last is True
     assert isinstance(events[1], DoneEvent)
     assert events[1].text == "a"
+    assert events[1].finish_reason == FinishReason.MAX_LENGTH
 
 
 def test_failure_emits_error_event() -> None:
@@ -302,7 +297,7 @@ def test_immediate_eos_reports_null_ttft() -> None:
     )
 
     assert req.first_token_ns is None
-    done = drain_events(req)[1]
+    done = drain_events(req)[0]
     assert isinstance(done, DoneEvent)
     assert done.num_output_tokens == 0
     assert done.ttft_ms is None

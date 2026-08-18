@@ -23,7 +23,13 @@ from typing import Generator
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
-from server.api.schema import GenerateRequest, GenerateResponse, StreamChunk
+from server.api.schema import (
+    GenerateRequest,
+    GenerateResponse,
+    StreamDoneEvent,
+    StreamErrorEvent,
+    StreamTokenEvent,
+)
 from server.metrics.logging import log_event
 from server.metrics.timers import now_ns, ns_to_ms, timed
 from server.model.hf_runner import ModelRunner
@@ -120,27 +126,45 @@ def generate_stream(req: GenerateRequest, request: Request) -> StreamingResponse
     def _event_stream() -> Generator[str, None, None]:
         start_ns = now_ns()
         ttft_ms = None
-        index = 0
 
-        for token_str, is_first_token, is_done in runner.generate_stream(
-            req.prompt, sampling_params
-        ):
-            if is_first_token:
-                ttft_ms = ns_to_ms(now_ns() - start_ns)
+        try:
+            for step in runner.generate_stream(req.prompt, sampling_params):
+                if step.is_token:
+                    if ttft_ms is None:
+                        ttft_ms = ns_to_ms(now_ns() - start_ns)
+                    assert step.index is not None
+                    token_event = StreamTokenEvent(
+                        token_str=step.token_str,
+                        index=step.index,
+                    )
+                    yield f"data: {token_event.model_dump_json()}\n\n"
 
-            if token_str:
-                index += 1
-
-            chunk = StreamChunk(
-                token_str=token_str,
-                is_first=is_first_token,
-                is_done=is_done,
-            )
-
-            yield f"data: {chunk.model_dump_json()}\n\n"
-
-            if is_done:
-                log_event("stream_done", output_tokens=index, ttft_ms=ttft_ms)
-                return
+                if step.is_done:
+                    if step.prompt_tokens is None or step.finish_reason is None:
+                        raise RuntimeError("terminal generation step lacks metadata")
+                    total_ms = ns_to_ms(now_ns() - start_ns)
+                    done_event = StreamDoneEvent(
+                        finish_reason=step.finish_reason.value,
+                        prompt_tokens=step.prompt_tokens,
+                        output_tokens=step.output_tokens,
+                        ttft_ms=ttft_ms,
+                        total_ms=total_ms,
+                        tokens_per_s=_compute_tokens_per_s(
+                            step.output_tokens, total_ms
+                        ),
+                        queue_wait_ms=0.0,
+                        execution_ms=total_ms,
+                    )
+                    yield f"data: {done_event.model_dump_json()}\n\n"
+                    log_event(
+                        "stream_done",
+                        output_tokens=step.output_tokens,
+                        ttft_ms=ttft_ms,
+                    )
+                    return
+        except Exception as error:
+            error_event = StreamErrorEvent(error=str(error))
+            log_event("stream_error", error=str(error))
+            yield f"data: {error_event.model_dump_json()}\n\n"
 
     return StreamingResponse(_event_stream(), media_type="text/event-stream")

@@ -1,4 +1,6 @@
-from pydantic import BaseModel, Field
+from typing import Annotated, Literal
+
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class GenerateRequest(BaseModel):
@@ -60,47 +62,62 @@ class GenerateResponse(BaseModel):
     )
 
 
-class StreamChunk(BaseModel):
-    """A chunk of generated text for streaming responses."""
+class StreamTokenEvent(BaseModel):
+    """One sampled non-EOS output token, even when its text is empty."""
 
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["token"] = "token"
     token_str: str = Field(..., description="The generated token string")
-    is_first: bool = Field(
-        ..., description="Whether this is the first token in the output"
-    )
-    is_done: bool = Field(
-        ..., description="Whether this is the last token in the output"
-    )
-    error: str | None = Field(
-        default=None, description="Error message if generation failed, otherwise None"
-    )
-    prompt_tokens: int | None = Field(
-        default=None, ge=0, description="Prompt token count when known"
-    )
-    output_tokens: int | None = Field(
-        default=None, ge=0, description="Output token count when known"
-    )
+    index: int = Field(..., ge=0, description="Zero-based output-token index")
+
+
+class StreamDoneEvent(BaseModel):
+    """Successful terminal event with authoritative counts and timings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["done"] = "done"
+    finish_reason: Literal["eos", "max_length"]
+    prompt_tokens: int = Field(..., ge=0, description="Prompt token count")
+    output_tokens: int = Field(..., ge=0, description="Output token count")
     ttft_ms: float | None = Field(
         default=None,
         ge=0.0,
         description="Time from enqueue to the first token, in milliseconds",
     )
-    total_ms: float | None = Field(
-        default=None,
+    total_ms: float = Field(
+        ...,
         ge=0.0,
         description="Time from enqueue to completion, in milliseconds",
     )
-    tokens_per_s: float | None = Field(
-        default=None,
+    tokens_per_s: float = Field(
+        ...,
         ge=0.0,
         description="Decode rate: output tokens divided by execution_ms",
     )
-    queue_wait_ms: float | None = Field(
-        default=None,
+    queue_wait_ms: float = Field(
+        ...,
         ge=0.0,
         description="Time from enqueue to the start of the first prefill",
     )
-    execution_ms: float | None = Field(
-        default=None,
+    execution_ms: float = Field(
+        ...,
         ge=0.0,
         description="Time from the start of the first prefill to completion",
     )
+
+
+class StreamErrorEvent(BaseModel):
+    """Terminal stream failure."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["error"] = "error"
+    error: str
+
+
+StreamEvent = Annotated[
+    StreamTokenEvent | StreamDoneEvent | StreamErrorEvent,
+    Field(discriminator="type"),
+]

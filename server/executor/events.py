@@ -91,31 +91,22 @@ class RequestEventEmitter:
     def on_token(
         self, request_state: GenerationRequestState, result: DecodeResult
     ) -> None:
-        """Handle a decode result: push a TokenEvent and finish if done.
+        """Emit real output tokens and finish terminal decode results.
 
-        On EOS the token text is emitted as an empty string (the model's EOS
-        token itself is not part of the output).  For all other finished
-        reasons (e.g. max length), the final token text is included.
+        EOS is a completion signal, so it emits no ``TokenEvent`` and advances
+        neither the output list nor its count. Every non-EOS result emits one
+        ``TokenEvent``, including a token whose decoded text is ``""``; a
+        max-length result then emits a separate ``DoneEvent``.
 
-        ``first_token_ns`` is stamped only when an output token is actually
-        appended, so TTFT stays null for a request that finishes without
-        emitting one.
+        ``first_token_ns`` is stamped when the first non-EOS token is appended,
+        so TTFT remains null only when generation finishes without an output
+        token.
         """
         is_first = request_state.num_output_tokens == 0
 
         if result.finish_reason == FinishReason.EOS:
-            # EOS produces no output token, so first_token_ns is deliberately
-            # left unset here. A request whose very first decode step is EOS
-            # finishes with zero output tokens and therefore a null TTFT.
-            request_state.sink.emit(
-                TokenEvent(
-                    request_id=request_state.request_id,
-                    token="",
-                    is_first=is_first,
-                    is_last=True,
-                    index=request_state.num_output_tokens,
-                )
-            )
+            # EOS is a completion signal, not an output token. A request whose
+            # first decode step is EOS therefore finishes with a null TTFT.
             request_state.finished_reason = FinishReason.EOS
             self._finish(request_state)
             return
@@ -128,8 +119,6 @@ class RequestEventEmitter:
             TokenEvent(
                 request_id=request_state.request_id,
                 token=result.token,
-                is_first=is_first,
-                is_last=result.is_finished,
                 index=request_state.num_output_tokens - 1,
             )
         )
@@ -165,6 +154,9 @@ class RequestEventEmitter:
         if request_state.num_prompt_tokens is None:
             raise RuntimeError("num_prompt_tokens is required to finish the request")
 
+        if request_state.finished_reason is None:
+            raise RuntimeError("finish_reason is required to finish the request")
+
         timings = compute_timings(
             enqueued_ns=request_state.enqueued_ns,
             start_ns=request_state.start_ns,
@@ -178,6 +170,7 @@ class RequestEventEmitter:
                 text="".join(request_state.output_tokens),
                 num_prompt_tokens=request_state.num_prompt_tokens,
                 num_output_tokens=request_state.num_output_tokens,
+                finish_reason=request_state.finished_reason,
                 ttft_ms=timings.ttft_ms,
                 total_ms=timings.total_ms,
                 queue_wait_ms=timings.queue_wait_ms,

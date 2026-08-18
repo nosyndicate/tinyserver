@@ -18,6 +18,10 @@ OUTPUT_TOKENS_FROM_SERVER = "server"
 OUTPUT_TOKENS_FROM_CLIENT_COUNT = "client_count"
 
 
+class StreamProtocolError(ValueError):
+    """The server emitted an invalid explicit streaming-event sequence."""
+
+
 def _endpoint_path(endpoint: str) -> str:
     if endpoint in {"generate", "generate_v2", "generate_v3", "generate_v4"}:
         return endpoint if endpoint.startswith("/") else f"/{endpoint}"
@@ -98,23 +102,9 @@ class StreamAccumulator:
     Pure apart from the injected ``now`` (monotonic offsets in seconds), so the
     whole streaming measurement path is testable by feeding dicts.
 
-    A chunk carries a token when it has no ``error`` and is not a token-less
-    terminal chunk. Mid-stream, an empty ``token_str`` *is* a real token —
-    byte-fragment BPE pieces decode to ``""`` — so it is counted, not skipped.
-
-    The two server shapes differ at the end of the stream:
-
-    - v2/v3/v4 (``server/api/routes.py``) hold the last real token back so it
-      rides along with the final ``is_done`` chunk. That terminal chunk does
-      carry a token.
-    - v1 (``server/model/hf_runner.py``, EOS path) appends a *separate*
-      token-less ``is_done`` chunk after the real tokens. Counting it would
-      overstate the generation by one.
-
-    Excluding token-less terminal chunks is right for v1 and harmless for v2+:
-    it can undercount by one there when the final real token decodes to ``""``,
-    but v2+ always reports ``output_tokens``, so ``resolve_output_tokens`` uses
-    the server's count and this tally is never consulted.
+    Every payload has an explicit ``type`` discriminator. Token events always
+    represent sampled non-EOS tokens, including tokens whose decoded text is
+    empty. A separate done event carries authoritative counts and metrics.
     """
 
     now: Callable[[], float]
@@ -133,31 +123,63 @@ class StreamAccumulator:
     _hasher: Any = field(default_factory=hashlib.sha256)
 
     def feed(self, chunk: dict[str, Any]) -> None:
-        if chunk.get("error"):
-            self.error = str(chunk["error"])
+        if self.done:
+            raise StreamProtocolError("received an event after the terminal event")
+
+        event_type = chunk.get("type")
+        if event_type == "error":
+            error = chunk.get("error")
+            if not isinstance(error, str) or not error:
+                raise StreamProtocolError("error event requires a non-empty error")
+            self.error = error
             self.done = True
             return
 
-        token_str = chunk.get("token_str", "")
-        is_done = bool(chunk.get("is_done"))
-        if token_str or not is_done:
+        if event_type == "token":
+            token_str = chunk.get("token_str")
+            index = chunk.get("index")
+            if not isinstance(token_str, str):
+                raise StreamProtocolError("token event requires token_str")
+            if index != self.client_token_count:
+                raise StreamProtocolError(
+                    f"expected token index {self.client_token_count}, got {index!r}"
+                )
             if self.first_token_offset_s is None:
                 self.first_token_offset_s = self.now()
             self.client_token_count += 1
             self.response_text_chars += len(token_str)
             self._hasher.update(token_str.encode("utf-8"))
+            return
 
-        if is_done:
-            self.server_prompt_tokens = chunk.get("prompt_tokens")
-            self.server_output_tokens = chunk.get("output_tokens")
-            # Every metric key may be absent: v2+ serializes with
-            # exclude_none, and the v1 stream sends them all as null.
+        if event_type == "done":
+            output_tokens = chunk.get("output_tokens")
+            if not isinstance(output_tokens, int) or isinstance(output_tokens, bool):
+                raise StreamProtocolError("done event requires integer output_tokens")
+            if output_tokens != self.client_token_count:
+                raise StreamProtocolError(
+                    "done output_tokens does not match observed token events: "
+                    f"{output_tokens} != {self.client_token_count}"
+                )
+            finish_reason = chunk.get("finish_reason")
+            if finish_reason not in {"eos", "max_length"}:
+                raise StreamProtocolError("done event has invalid finish_reason")
+            prompt_tokens = chunk.get("prompt_tokens")
+            if not isinstance(prompt_tokens, int) or isinstance(prompt_tokens, bool):
+                raise StreamProtocolError("done event requires integer prompt_tokens")
+
+            self.server_prompt_tokens = prompt_tokens
+            self.server_output_tokens = output_tokens
             self.server_ttft_ms = _float_or_none(chunk.get("ttft_ms"))
             self.server_total_ms = _float_or_none(chunk.get("total_ms"))
             self.server_queue_wait_ms = _float_or_none(chunk.get("queue_wait_ms"))
             self.server_execution_ms = _float_or_none(chunk.get("execution_ms"))
             self.server_tokens_per_s = _float_or_none(chunk.get("tokens_per_s"))
             self.done = True
+            return
+
+        raise StreamProtocolError(
+            f"unknown or missing stream event type: {event_type!r}"
+        )
 
     @property
     def output_sha256(self) -> str:
@@ -511,10 +533,17 @@ def _run_stream_request(
                     )
 
         return _error_result(
-            error_type="stream_ended_without_done",
-            error="stream ended before is_done event",
+            error_type="protocol_error",
+            error="stream ended before terminal event",
             end_ts=clock.offset(),
             http_status=200,
+        )
+    except StreamProtocolError as exc:
+        return _error_result(
+            error_type="protocol_error",
+            error=str(exc),
+            end_ts=clock.offset(),
+            http_status=None,
         )
     except requests.Timeout as exc:
         return _error_result(

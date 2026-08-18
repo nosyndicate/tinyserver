@@ -81,8 +81,7 @@ class RequestResult:
     kept in separate fields so the two clocks are never mixed in one number:
 
     - ``client_*`` is measured by this process.
-    - ``server_*`` is reported by the server's final ``is_done`` SSE chunk, and
-      is ``None`` for endpoints that do not report it (the v1 stream).
+    - ``server_*`` is reported by the server's terminal ``done`` SSE event.
 
     ``ttft_ms`` / ``tpot_ms`` / ``queue_wait_ms`` / ``execution_ms`` are retained
     as aliases of ``client_ttft_ms`` / ``client_tpot_ms`` /

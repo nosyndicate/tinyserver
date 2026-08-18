@@ -10,6 +10,7 @@ from torch import Tensor
 from transformers import DynamicCache
 
 from server.model.sampling import SamplingParams
+from server.model.types import FinishReason
 
 
 @dataclass(frozen=True)
@@ -20,16 +21,13 @@ class TokenEvent:
     Attributes:
         request_id: The unique identifier for the request this token belongs to.
             Lets a single shared transport route the event to the right consumer.
-        token: The decoded text for this token, might be an empty string for special tokens like EOS.
-        is_first: Whether this token is the first token in the sequence.
-        is_last: Whether this token is the last token in the sequence. This can be true when the generation is stopped by max_new_tokens limit.
+        token: The decoded text for this non-EOS token. It may be empty because
+            decoding a single token is lossy.
         index: The index of the token in the sequence, starting from 0.
     """
 
     request_id: str
     token: str
-    is_first: bool
-    is_last: bool
     index: int
 
 
@@ -65,6 +63,7 @@ class DoneEvent:
     text: str
     num_prompt_tokens: int
     num_output_tokens: int
+    finish_reason: FinishReason
 
     ttft_ms: float | None
     total_ms: float
@@ -162,11 +161,6 @@ class RequestStatus(Enum):
     DONE = auto()
     FAILED = auto()
     CANCELLED = auto()
-
-
-class FinishReason(Enum):
-    EOS = auto()
-    MAX_LENGTH = auto()
 
 
 @dataclass
