@@ -14,7 +14,7 @@ part of the exhibit, not defects to fix:
 
 The later versions (v2+) exist precisely because of these limitations.
 
-Served only when the server is started with ``--api-version v1``; the
+Served only when the server is started as ``python -m server.main v1``; the
 queue-based versions never mount this router (see ``server/main.py``).
 """
 

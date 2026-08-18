@@ -206,6 +206,30 @@ class SimpleInferenceEngine:
             callbacks.handle_fatal_error(e, None)
 
 
+def validate_batch_engine_config(config: BatchEngineConfig) -> None:
+    """
+    Raise ``ValueError`` if a batch engine configuration is unusable.
+
+    Kept separate from ``BatchInferenceEngine.__init__`` so the same checks can
+    run at argument-parse time, before a model is loaded: an impossible batch
+    combination should fail immediately rather than after the GPU load.
+    """
+    if config.max_active_requests <= 0:
+        raise ValueError("max_active_requests must be positive")
+    if config.max_prefill_batch_size <= 0:
+        raise ValueError("max_prefill_batch_size must be positive")
+    if config.max_decode_batch_size <= 0:
+        raise ValueError("max_decode_batch_size must be positive")
+    if config.max_prefill_batch_size > config.max_active_requests:
+        raise ValueError(
+            "max_prefill_batch_size cannot be greater than max_active_requests"
+        )
+    if config.max_decode_batch_size > config.max_active_requests:
+        raise ValueError(
+            "max_decode_batch_size cannot be greater than max_active_requests"
+        )
+
+
 class BatchInferenceEngine:
     """Process requests in batches for both prefill and decode phases.
 
@@ -216,20 +240,7 @@ class BatchInferenceEngine:
     """
 
     def __init__(self, executor: BaseBatchExecutor, config: BatchEngineConfig) -> None:
-        if config.max_active_requests <= 0:
-            raise ValueError("max_active_requests must be positive")
-        if config.max_prefill_batch_size <= 0:
-            raise ValueError("max_prefill_batch_size must be positive")
-        if config.max_decode_batch_size <= 0:
-            raise ValueError("max_decode_batch_size must be positive")
-        if config.max_prefill_batch_size > config.max_active_requests:
-            raise ValueError(
-                "max_prefill_batch_size cannot be greater than max_active_requests"
-            )
-        if config.max_decode_batch_size > config.max_active_requests:
-            raise ValueError(
-                "max_decode_batch_size cannot be greater than max_active_requests"
-            )
+        validate_batch_engine_config(config)
         self._executor = executor
         self._config = config
         self._waiting: list[GenerationRequestState] = []
