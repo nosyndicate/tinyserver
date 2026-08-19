@@ -38,14 +38,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments for the inference server.
 
     Each API version is its own subcommand, so a version can only be given the
-    flags it actually reads. Previously every flag lived on one flat parser and
-    a version that ignored one accepted it silently — for a benchmark server
-    that means a sweep can appear to vary a knob the running version never
-    consults. ``dest="api_version"`` keeps the parsed attribute name unchanged
-    for ``create_app`` and ``lifespan``.
-
-    ``argv`` defaults to ``sys.argv[1:]``; it is a parameter so the parser and
-    its validation can be exercised without a subprocess.
+    flags it actually reads.
     """
     # Shared flags live on parent parsers so they may follow the subcommand
     # (``server.main v4 --host …``) rather than having to precede it.

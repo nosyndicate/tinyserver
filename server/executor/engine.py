@@ -211,8 +211,7 @@ def validate_batch_engine_config(config: BatchEngineConfig) -> None:
     Raise ``ValueError`` if a batch engine configuration is unusable.
 
     Kept separate from ``BatchInferenceEngine.__init__`` so the same checks can
-    run at argument-parse time, before a model is loaded: an impossible batch
-    combination should fail immediately rather than after the GPU load.
+    run at argument-parse time, before a model is loaded.
     """
     if config.max_active_requests <= 0:
         raise ValueError("max_active_requests must be positive")
