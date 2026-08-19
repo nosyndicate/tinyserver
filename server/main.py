@@ -22,6 +22,7 @@ from server.executor.engine import (
     BatchInferenceEngine,
     ScheduleInferenceEngine,
     SimpleInferenceEngine,
+    validate_batch_engine_config,
 )
 from server.executor.executor import BatchExecutor, Executor
 from server.executor.scheduler import Scheduler
@@ -33,51 +34,167 @@ from server.model.hf_backend import HFBackend
 from server.model.hf_runner import ModelConfig, load_hf_model
 
 
-def parse_args() -> argparse.Namespace:
-    """Parse command-line arguments for the inference server."""
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments for the inference server.
+
+    Each API version is its own subcommand, so a version can only be given the
+    flags it actually reads.
+    """
+    # Shared flags live on parent parsers so they may follow the subcommand
+    # (``server.main v4 --host …``) rather than having to precede it.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="Address to bind the server to (default: 0.0.0.0)",
+    )
+    common.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Port to bind the server to (default: 8000)",
+    )
+
+    # v1 is direct and unqueued, so it has no worker to size.
+    worker = argparse.ArgumentParser(add_help=False)
+    worker.add_argument(
+        "--worker-queue-size",
+        type=int,
+        default=64,
+        help="Max requests buffered in the worker's inbound queue (default: 64)",
+    )
+
     parser = argparse.ArgumentParser(description="LLM Inference Server")
-    parser.add_argument(
+    versions = parser.add_subparsers(
+        dest="api_version",
+        required=True,
+        metavar="{v1,v2,v3,v4}",
+        help="Which endpoint version to expose. Each serves only its own "
+        "endpoints, plus /health.",
+    )
+
+    versions.add_parser(
+        "v1",
+        parents=[common],
+        help="Preserved phase-1 baseline: direct and unqueued, no worker.",
+    )
+
+    v2 = versions.add_parser(
+        "v2",
+        parents=[common, worker],
+        help="Queue-backed worker, one request at a time per slot.",
+    )
+    v2.add_argument(
+        "--max-active-requests",
+        type=int,
+        default=16,
+        help="Max requests the engine processes concurrently (default: 16)",
+    )
+
+    v3 = versions.add_parser(
+        "v3",
+        parents=[common, worker],
+        help="Batched prefill and decode.",
+    )
+    v3.add_argument(
+        "--max-active-requests",
+        type=int,
+        default=16,
+        help="Max requests the engine processes concurrently (default: 16)",
+    )
+    v3.add_argument(
+        "--max-prefill-batch-size",
+        type=int,
+        default=8,
+        help="Max requests per prefill batch (default: 8)",
+    )
+    v3.add_argument(
+        "--max-decode-batch-size",
+        type=int,
+        default=8,
+        help="Max requests per decode batch (default: 8)",
+    )
+
+    v4 = versions.add_parser(
+        "v4",
+        parents=[common, worker],
+        help="Continuous batching over a paged KV cache.",
+    )
+    # The KV-pool knobs are v4's alone: it is the only version with a paged
+    # pool (see model/hf_backend.py).
+    v4.add_argument(
         "--block-size",
         type=int,
         default=256,
         help="Size of each KV cache block in tokens (default: 256)",
     )
-    parser.add_argument(
+    v4.add_argument(
         "--memory-utilization",
         type=float,
         default=0.2,
         help="Fraction of free GPU memory to use for KV cache (default: 0.2)",
     )
-    parser.add_argument(
-        "--api-version",
-        choices=["v1", "v2", "v3", "v4"],
-        default="v3",
-        help=(
-            "Which endpoint version to expose (default: v3). Each mode serves "
-            "only its own endpoints (plus /health). v1 is the preserved "
-            "phase-1 baseline (direct, unqueued) and is only available in v1 "
-            "mode."
-        ),
-    )
-    parser.add_argument(
+    v4.add_argument(
         "--max-waiting",
         type=int,
         default=64,
-        help="v4 only: max sequences in the scheduler's waiting queue (default: 64)",
+        help="Max sequences in the scheduler's waiting queue (default: 64)",
     )
-    parser.add_argument(
+    v4.add_argument(
         "--max-num-sequences",
         type=int,
         default=8,
-        help="v4 only: max sequences per scheduled batch (default: 8)",
+        help="Max sequences per scheduled batch (default: 8)",
     )
-    parser.add_argument(
+    v4.add_argument(
         "--max-num-tokens",
         type=int,
         default=4096,
-        help="v4 only: max total tokens per scheduled batch (default: 4096)",
+        help="Max total tokens per scheduled batch (default: 4096)",
     )
-    return parser.parse_args()
+
+    args = parser.parse_args(argv)
+    # Checked here rather than at worker construction so an impossible batch
+    # combination fails before the model is loaded, not several seconds into
+    # startup. Each branch validates exactly the flags its version accepts.
+    try:
+        if args.api_version == "v3":
+            validate_batch_engine_config(_batch_engine_config(args))
+        elif args.api_version == "v2" and args.max_active_requests <= 0:
+            raise ValueError("max_active_requests must be positive")
+    except ValueError as exc:
+        parser.error(str(exc))
+    return args
+
+
+def _model_config(args: argparse.Namespace) -> ModelConfig:
+    """The model configuration implied by the parsed arguments.
+
+    The KV-pool knobs exist only under v4, the only version with a paged pool;
+    the others take the dataclass defaults, which are the same values their
+    flags used to default to.
+    """
+    if args.api_version == "v4":
+        return ModelConfig(
+            device="cuda",
+            block_size=args.block_size,
+            memory_utilization=args.memory_utilization,
+        )
+    return ModelConfig(device="cuda")
+
+
+def _engine_config(args: argparse.Namespace) -> EngineConfig:
+    """The v2 engine configuration implied by the parsed arguments."""
+    return EngineConfig(max_active_requests=args.max_active_requests)
+
+
+def _batch_engine_config(args: argparse.Namespace) -> BatchEngineConfig:
+    """The v3 engine configuration implied by the parsed arguments."""
+    return BatchEngineConfig(
+        max_active_requests=args.max_active_requests,
+        max_prefill_batch_size=args.max_prefill_batch_size,
+        max_decode_batch_size=args.max_decode_batch_size,
+    )
 
 
 def _build_worker(
@@ -100,19 +217,19 @@ def _build_worker(
         )
         return Worker(
             ScheduleInferenceEngine(scheduler, backend),
-            max_queue_size=64,  # TODO: revisit if this make sense
+            max_queue_size=args.worker_queue_size,
         )
 
     runner = load_hf_model(config)
     if version == "v2":
         return Worker(
-            SimpleInferenceEngine(Executor(runner), EngineConfig()),
-            max_queue_size=64,
+            SimpleInferenceEngine(Executor(runner), _engine_config(args)),
+            max_queue_size=args.worker_queue_size,
         )
     if version == "v3":
         return Worker(
-            BatchInferenceEngine(BatchExecutor(runner), BatchEngineConfig()),
-            max_queue_size=64,
+            BatchInferenceEngine(BatchExecutor(runner), _batch_engine_config(args)),
+            max_queue_size=args.worker_queue_size,
         )
     raise ValueError(f"No queue-backed worker for api version {version!r}")
 
@@ -129,11 +246,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Everything before the yield runs on startup
     args = app.state.cli_args
-    config = ModelConfig(
-        device="cuda",
-        block_size=args.block_size,
-        memory_utilization=args.memory_utilization,
-    )
+    config = _model_config(args)
 
     version = args.api_version
 
@@ -199,7 +312,7 @@ def main() -> None:
     """Main entry point for the inference server."""
     args = parse_args()
     app = create_app(args)
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
