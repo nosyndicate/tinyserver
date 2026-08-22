@@ -111,7 +111,7 @@ Every open-loop run reports its offer window in `summary.json`:
 | `offer_window_seconds` | First arrival → one interval past the last one, or the wall time taken if that was longer |
 | `requested_duration_seconds` | What `--duration-seconds` asked for; `null` in `--requests` mode |
 | `client_max_in_flight` | The capacity bound in force |
-| `client_dispatch_lag_ms` | Percentiles (`mean`, `p50`, `p90`, `p95`, `p99`) over scheduled arrival → HTTP start |
+| `client_dispatch_lag_ms` | Percentiles over scheduled arrival → HTTP start (`count`, `min`, `max`, `mean`, `p50`, `p90`, `p95`, `p99`) |
 | `completions_in_offer_window` | Requests that also *finished* before the window closed |
 | `drain_seconds` | How long the tail of in-flight requests took after it closed |
 | `client_saturated` | See below |
@@ -206,9 +206,26 @@ bench-results/
 
 | File | Contents |
 |---|---|
-| `summary.json` | Aggregate statistics: request counts, success rate, throughput (req/s, tokens/s), and P50/P90/P95/P99 distributions for `latency_ms`, `ttft_ms`, `tpot_ms`, `queue_wait_ms`, `execution_ms` |
+| `summary.json` | Aggregate statistics: request counts, success rate, throughput (req/s, tokens/s), the run's shape, and percentile distributions (`count`, `min`, `max`, `mean`, `p50`, `p90`, `p95`, `p99`) for `latency_ms`, `ttft_ms`, `tpot_ms`, `queue_wait_ms`, `execution_ms`, `server_ttft_ms`, `server_tpot_ms` — plus a `by_prompt_source` per-class breakdown. See below |
 | `config.json` | Exact CLI arguments, the run's clock epochs, and the resolved scenario definition; sufficient to reproduce the run |
 | `requests.jsonl` | One JSON object per request (including failures); raw data for post-hoc analysis |
+
+### Summary shape and per-class breakdown
+
+`summary.json` always carries the run's shape so it can be read without
+`config.json`: `concurrency`, `arrival_rate`, `client_max_in_flight`, and
+`client_saturated`. A knob the mode does not read is `null` rather than its
+default value — a default would read as a load setting that was in effect.
+`client_saturated` is `false` in closed loop, which has no arrival schedule to
+fall behind; in open loop the dispatcher's measured verdict replaces it, along
+with the rest of the offer-window report.
+
+`by_prompt_source` repeats the reduction per prompt class (`short`, `long`, …):
+request counts, success/rejection rates, and the `latency_ms`, `ttft_ms`,
+`tpot_ms`, `queue_wait_ms`, `execution_ms`, and `tokens_per_s` (per-request
+decode rate) distributions. A class whose requests all failed keeps its block
+shapes with `count: 0` distributions, so mixed-scenario runs can be read per
+class without re-walking `requests.jsonl`.
 
 ### Corrected measurement semantics (PR 94)
 
