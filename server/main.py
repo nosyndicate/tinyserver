@@ -25,7 +25,7 @@ from server.executor.engine import (
     validate_batch_engine_config,
 )
 from server.executor.executor import BatchExecutor, Executor
-from server.executor.scheduler import Scheduler
+from server.executor.scheduler import Scheduler, validate_scheduler_config
 from server.executor.sinks import SharedQueueSink
 from server.executor.types import BatchEngineConfig, EngineConfig
 from server.executor.worker import Worker
@@ -60,8 +60,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     worker.add_argument(
         "--worker-queue-size",
         type=int,
-        default=64,
-        help="Max requests buffered in the worker's inbound queue (default: 64)",
+        default=128,
+        help="Max requests waiting to enter the engine (default: 128)",
     )
 
     parser = argparse.ArgumentParser(description="LLM Inference Server")
@@ -135,16 +135,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Fraction of free GPU memory to use for KV cache (default: 0.2)",
     )
     v4.add_argument(
-        "--max-waiting",
-        type=int,
-        default=64,
-        help="Max sequences in the scheduler's waiting queue (default: 64)",
-    )
-    v4.add_argument(
         "--max-num-sequences",
         type=int,
         default=8,
-        help="Max sequences per scheduled batch (default: 8)",
+        help="Max sequences owned by the engine (default: 8)",
     )
     v4.add_argument(
         "--max-num-tokens",
@@ -162,6 +156,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             validate_batch_engine_config(_batch_engine_config(args))
         elif args.api_version == "v2" and args.max_active_requests <= 0:
             raise ValueError("max_active_requests must be positive")
+        elif args.api_version == "v4":
+            validate_scheduler_config(args.max_num_sequences, args.max_num_tokens)
     except ValueError as exc:
         parser.error(str(exc))
     return args
@@ -211,7 +207,6 @@ def _build_worker(
         )
         scheduler = Scheduler(
             block_manager,
-            max_waiting=args.max_waiting,
             max_num_sequences=args.max_num_sequences,
             max_num_tokens=args.max_num_tokens,
         )

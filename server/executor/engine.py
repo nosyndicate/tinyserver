@@ -1,7 +1,6 @@
 import logging
 import random
 import uuid
-from collections import deque
 from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import Callable, Protocol, runtime_checkable
@@ -361,17 +360,6 @@ class ScheduleInferenceEngine:
         # ``Sequence`` objects and post-processing needs the request (for
         # sampling params, generator, and event emission).
         self._seq_to_request: dict[str, GenerationRequestState] = {}
-        # Requests that were built (tokenized) but couldn't be admitted yet.
-        # Engine-thread-private, so no locking is needed. Retried oldest-first
-        # on every iteration, with new arrivals appended behind them, which
-        # both avoids re-tokenizing (we keep the already-built Sequence) and
-        # preserves FIFO fairness. Never re-enter the shared inbound queue:
-        # the engine is its only consumer, so a blocking put-back would
-        # deadlock against the HTTP handlers that produce into it. Bounded:
-        # _drain_inbound only pulls new arrivals while pending + the
-        # scheduler's waiting queue have headroom, so len(_pending) never
-        # exceeds the scheduler's max_waiting.
-        self._pending: deque[tuple[GenerationRequestState, Sequence]] = deque()
         self._emitter = RequestEventEmitter()
 
     def _admit(self, req: GenerationRequestState, seq: Sequence) -> None:
@@ -399,37 +387,21 @@ class ScheduleInferenceEngine:
             request_state.noise_salt = random.getrandbits(63)
         return request_state.noise_salt
 
-    def _try_admit(
-        self, candidates: deque[tuple[GenerationRequestState, Sequence]]
-    ) -> deque[tuple[GenerationRequestState, Sequence]]:
-        """Admit what fits (in arrival order); return the rest, order preserved.
-
-        Once a candidate is deferred, every later candidate is deferred too, so
-        arrival order is never violated (a big-but-feasible request is admitted
-        before a smaller newer one rather than being overtaken and starved).
-        """
-        deferred: deque[tuple[GenerationRequestState, Sequence]] = deque()
-        for req, seq in candidates:
-            if not deferred and self._scheduler.can_add_new_sequence(seq):
-                self._admit(req, seq)
-            else:
-                deferred.append((req, seq))
-        return deferred
-
     def _drain_inbound(self, inbound: Queue[GenerationRequestState]) -> None:
-        """
-        Move requests from the inbound queue to the scheduler's waiting list.
-        Convert the GenerationRequestState to Sequence and add to the scheduler.
-        """
-        # Pull new arrivals only while the TOTAL deferred population
-        # (engine-private pending + scheduler waiting) has headroom. This helps
-        # us to keep the backpressure.
-        budget = self._scheduler.admission_headroom() - len(self._pending)
-        while budget > 0:
+        """Admit inbound requests while the scheduler has logical slots."""
+        while self._scheduler.has_sequence_capacity():
             try:
                 req = inbound.get_nowait()
             except Empty:
                 break
+
+            # Cancellation is initiated by a timed-out/disconnected handler,
+            # so there is no consumer left to receive an event for this queued
+            # request. It never enters scheduler ownership.
+            if req.cancelled.is_set():
+                req.status = RequestStatus.CANCELLED
+                continue
+
             seq = self._make_sequence(req)
             if not self._scheduler.block_manager.can_ever_allocate(seq):
                 # The prompt can never fit in the KV cache, no matter how many
@@ -445,14 +417,7 @@ class ScheduleInferenceEngine:
                     f"{self._scheduler.block_manager.total_blocks * self._scheduler.block_manager.block_size} tokens",
                 )
                 continue
-            self._pending.append((req, seq))
-            budget -= 1
-
-        # Single admission pass over old + new together. One call means one
-        # shared "deferred" latch inside _try_admit, so a newly-arrived small
-        # request can never overtake an older deferred large one.
-        if self._pending:
-            self._pending = self._try_admit(self._pending)
+            self._admit(req, seq)
 
     def _make_sequence(self, req: GenerationRequestState) -> Sequence:
         token_ids = self._backend.tokenize(req.prompt)
@@ -479,12 +444,8 @@ class ScheduleInferenceEngine:
         the supplied ``cancel_request`` callback.
         """
         self._scheduler.clear()
-        # Deferred (not-yet-admitted) requests live only in `self._pending`,
-        # never in the scheduler or `_all_requests`, so they must be cancelled
-        # too or they would be silently dropped on shutdown/fatal error.
         tracked = [context.request for context in self._all_requests.values()]
-        deferred = [req for req, _seq in self._pending]
-        for req in tracked + deferred:
+        for req in tracked:
             try:
                 cancel_request(req, message)
             except Exception:
@@ -492,30 +453,15 @@ class ScheduleInferenceEngine:
                     "Failed to emit error event for request %s",
                     req.request_id,
                 )
-        self._pending.clear()
         self._all_requests.clear()
         self._seq_to_request.clear()
 
     def _reap_cancelled(self) -> None:
         """Honor per-request cancellation flags set by the HTTP thread.
 
-        Runs on the engine thread (right after ``_drain_inbound``, before
-        ``schedule()``), so mutating tracking dicts and ``seq.finished`` is
-        safe. Two populations can hold a cancelled request:
-
-        - Deferred (in ``self._pending``, not yet admitted): the handler has
-          already gone, so just discard the ``(req, seq)`` tuples.
-          They hold no blocks.
-        - Admitted (tracked in ``self._all_requests``): mark the sequence
-          finished and drop it from engine tracking. The scheduler's
-          ``_reap_finished`` frees its blocks on the next ``schedule()`` (the
-          existing reclamation path — no new one is added).
+        Runs on the engine thread before scheduler reaping and inbound drain,
+        so cancelled sequences release logical slots in the same iteration.
         """
-        if self._pending:
-            self._pending = deque(
-                (req, seq) for (req, seq) in self._pending if not req.cancelled.is_set()
-            )
-
         # Snapshot: _cleanup_request mutates _all_requests during iteration.
         for context in list(self._all_requests.values()):
             if context.request.cancelled.is_set():
@@ -590,14 +536,11 @@ class ScheduleInferenceEngine:
     ) -> None:
         try:
             while not control.should_stop():
-                # Move new requests from the inbound queue to the waiting list of scheduler
-                # and let scheduler decide which sequences to run next.
-                self._drain_inbound(inbound)
-
-                # Honor cancellation requests before scheduling so cancelled
-                # sequences stop occupying blocks/batch slots within one
-                # iteration (blocks reclaimed by the scheduler's reap path).
+                # Release cancelled/completed logical slots before admitting
+                # new work, so replacements can enter in this same iteration.
                 self._reap_cancelled()
+                self._scheduler.reap_finished()
+                self._drain_inbound(inbound)
 
                 if not control.should_stop():
                     batch = self._scheduler.schedule()
@@ -839,7 +782,7 @@ class ScheduleInferenceEngine:
     def _cleanup_request(self, sequence_id: str, request_id: str) -> None:
         """Drop a finished request from the engine's tracking.
 
-        Does not free blocks: the scheduler's ``_reap_finished`` reclaims them
+        Does not free blocks: the scheduler's ``reap_finished`` reclaims them
         for any sequence with ``finished=True`` at the top of the next
         ``schedule()``.
         """

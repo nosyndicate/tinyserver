@@ -1,3 +1,5 @@
+import pytest
+
 from server.executor.scheduler import Scheduler
 from server.executor.types import (
     Sequence,
@@ -16,7 +18,7 @@ def make_sequence(
     """Minimal Sequence factory mirroring tests/model/test_block_manager.py."""
     return Sequence(
         sequence_id=sequence_id,
-        prompt_token_ids=[],
+        prompt_token_ids=list(range(num_tokens)),
         generated_token_ids=[],
         num_prompt_tokens=num_tokens,
         num_tokens=num_tokens,
@@ -28,67 +30,50 @@ def make_sequence(
 def make_scheduler(
     total_blocks: int = 16,
     block_size: int = 4,
-    max_waiting: int = 8,
     max_num_sequences: int = 8,
     max_num_tokens: int = 1024,
 ) -> Scheduler:
     bm = BlockManager(total_blocks=total_blocks, block_size=block_size)
     return Scheduler(
         block_manager=bm,
-        max_waiting=max_waiting,
         max_num_sequences=max_num_sequences,
         max_num_tokens=max_num_tokens,
     )
 
 
-# --- can_add_new_sequence --------------------------------------------------
+# --- logical sequence capacity --------------------------------------------
 
 
-def test_can_add_new_sequence_true_when_capacity_available() -> None:
+def test_has_sequence_capacity_counts_waiting_and_running() -> None:
     sched = make_scheduler()
-    assert sched.can_add_new_sequence(make_sequence(num_tokens=1)) is True
+    assert sched.has_sequence_capacity() is True
+    for i in range(sched.max_num_sequences):
+        sched.add(make_sequence(sequence_id=str(i)))
+    assert sched.has_sequence_capacity() is False
 
 
-def test_can_add_new_sequence_false_when_waiting_full() -> None:
-    sched = make_scheduler(max_waiting=1)
+def test_add_at_capacity_is_an_invariant_violation() -> None:
+    sched = make_scheduler(max_num_sequences=1)
     sched.add(make_sequence())
-    assert sched.can_add_new_sequence(make_sequence(num_tokens=1)) is False
+    with pytest.raises(RuntimeError, match="capacity exceeded"):
+        sched.add(make_sequence(sequence_id="overflow"))
 
 
-def test_can_add_new_sequence_false_when_blocks_exhausted() -> None:
-    sched = make_scheduler(total_blocks=1, block_size=4)
-    # Drain the single free block via a running sequence.
-    seq = make_sequence(num_tokens=1)
-    sched.block_manager.allocate(seq)
-    assert sched.can_add_new_sequence(make_sequence(num_tokens=1)) is False
-
-
-def test_can_add_new_sequence_false_when_prompt_exceeds_free_blocks() -> None:
-    # Regression: previously used has_free_blocks_for(1), which admitted a
-    # sequence as long as ONE token fit, ignoring that the full prompt needed
-    # more blocks than were free. can_allocate must reject it.
-    sched = make_scheduler(total_blocks=4, block_size=4)  # 4 blocks = 16 tokens
-    holder = make_sequence(sequence_id="holder", num_tokens=12)  # 3 blocks
-    sched.block_manager.allocate(holder)
-    assert len(sched.block_manager.free_blocks) == 1  # one 4-token block free
-
-    big = make_sequence(sequence_id="big", num_tokens=8)  # needs 2 blocks
-    assert sched.can_add_new_sequence(big) is False
-
-
-def test_can_add_new_sequence_rejects_when_no_headroom() -> None:
-    # Watermark thrash guard: even when the prompt fits, admission requires a
-    # small free-block headroom left over so a fresh sequence doesn't force a
-    # preemption on its first decode step. total_blocks=2 -> headroom
-    # max(1, int(0.02)) = 1.
-    sched = make_scheduler(total_blocks=2, block_size=4)
-
-    full = make_sequence(sequence_id="full", num_tokens=8)  # needs both blocks
-    assert sched.block_manager.can_allocate(full) is True  # would fit...
-    assert sched.can_add_new_sequence(full) is False  # ...but leaves 0 headroom
-
-    fits = make_sequence(sequence_id="fits", num_tokens=4)  # needs 1, leaves 1
-    assert sched.can_add_new_sequence(fits) is True
+@pytest.mark.parametrize(
+    ("max_num_sequences", "max_num_tokens", "message"),
+    [
+        (0, 8, "max_num_sequences must be positive"),
+        (4, 3, "max_num_tokens must be greater than or equal"),
+    ],
+)
+def test_scheduler_rejects_invalid_capacity_configuration(
+    max_num_sequences: int, max_num_tokens: int, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        make_scheduler(
+            max_num_sequences=max_num_sequences,
+            max_num_tokens=max_num_tokens,
+        )
 
 
 # --- schedule(): prefill ---------------------------------------------------
@@ -112,7 +97,7 @@ def test_schedule_prefill_moves_waiting_to_running() -> None:
 
 def test_schedule_prefill_respects_max_num_sequences() -> None:
     sched = make_scheduler(max_num_sequences=2)
-    for i in range(3):
+    for i in range(2):
         sched.add(make_sequence(sequence_id=f"s{i}", num_tokens=4))
 
     batch = sched.schedule()
@@ -120,7 +105,8 @@ def test_schedule_prefill_respects_max_num_sequences() -> None:
     assert batch is not None
     assert batch.kind is SequenceBatchTask.PREFILL
     assert len(batch.sequences) == 2
-    assert len(sched.waiting) == 1
+    assert len(sched.running) == 2
+    assert not sched.waiting
 
 
 def test_schedule_prefill_respects_token_budget() -> None:
@@ -133,12 +119,13 @@ def test_schedule_prefill_respects_token_budget() -> None:
     assert batch is not None
     assert [s.sequence_id for s in batch.sequences] == ["a"]
     assert len(sched.waiting) == 1
+    assert sched.reservation_blocked_count == 0
 
 
 def test_schedule_prefill_allows_single_oversized_sequence() -> None:
     # Regression for head-of-line blocking: a sequence larger than the per-batch
     # token budget must still be scheduled on its own rather than stalling.
-    sched = make_scheduler(max_num_tokens=4)
+    sched = make_scheduler(max_num_sequences=4, max_num_tokens=4)
     seq = make_sequence(sequence_id="big", num_tokens=8)
     sched.add(seq)
 
@@ -146,6 +133,95 @@ def test_schedule_prefill_allows_single_oversized_sequence() -> None:
 
     assert batch is not None
     assert batch.sequences == [seq]
+
+
+def test_terminal_prefill_may_use_the_entire_cache() -> None:
+    sched = make_scheduler(
+        block_size=4,
+        total_blocks=2,
+        max_num_sequences=1,
+        max_num_tokens=8,
+    )
+    terminal = make_sequence(num_tokens=8, max_new_tokens=1)
+    sched.add(terminal)
+
+    batch = sched.schedule()
+
+    assert batch is not None
+    assert batch.sequences == [terminal]
+    assert sched.reservation_blocked_count == 0
+    assert sched.block_manager.num_free_blocks == 0
+
+
+def test_prefill_requiring_decode_is_blocked_without_next_kv_position() -> None:
+    sched = make_scheduler(
+        block_size=4,
+        total_blocks=2,
+        max_num_sequences=1,
+        max_num_tokens=8,
+    )
+    needs_decode = make_sequence(num_tokens=8, max_new_tokens=2)
+    sched.add(needs_decode)
+
+    batch = sched.schedule()
+
+    assert batch is None
+    assert list(sched.waiting) == [needs_decode]
+    assert not sched.running
+    assert sched.reservation_blocked_count == 1
+    assert needs_decode.block_table == []
+
+
+def test_prefill_preserves_running_population_next_decode() -> None:
+    sched = make_scheduler(
+        block_size=4,
+        total_blocks=2,
+        max_num_sequences=2,
+        max_num_tokens=8,
+    )
+    running = make_sequence(sequence_id="running", num_tokens=4, max_new_tokens=2)
+    running.generated_token_ids.append(9)
+    running.state = SequenceState.RUNNING
+    sched.block_manager.allocate(running)
+    sched.running.append(running)
+    candidate = make_sequence(sequence_id="candidate", num_tokens=4, max_new_tokens=1)
+    sched.add(candidate)
+
+    batch = sched.schedule()
+
+    # Candidate promotion would consume the only free block needed by the
+    # running sequence, so prefill is blocked and decode advances instead.
+    assert batch is not None
+    assert batch.kind is SequenceBatchTask.DECODE
+    assert batch.sequences == [running]
+    assert list(sched.waiting) == [candidate]
+    assert sched.reservation_blocked_count == 1
+
+
+def test_prefill_reservation_updates_after_each_selected_candidate() -> None:
+    sched = make_scheduler(
+        block_size=4,
+        total_blocks=3,
+        max_num_sequences=3,
+        max_num_tokens=8,
+    )
+    running = make_sequence(sequence_id="running", num_tokens=4, max_new_tokens=3)
+    running.generated_token_ids.append(9)
+    running.state = SequenceState.RUNNING
+    sched.block_manager.allocate(running)
+    sched.running.append(running)
+    first = make_sequence(sequence_id="first", num_tokens=4, max_new_tokens=1)
+    second = make_sequence(sequence_id="second", num_tokens=4, max_new_tokens=1)
+    sched.add(first)
+    sched.add(second)
+
+    batch = sched.schedule()
+
+    assert batch is not None
+    assert batch.kind is SequenceBatchTask.PREFILL
+    assert batch.sequences == [first]
+    assert list(sched.waiting) == [second]
+    assert sched.reservation_blocked_count == 1
 
 
 # --- schedule(): decode ----------------------------------------------------
