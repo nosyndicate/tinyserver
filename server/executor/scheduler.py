@@ -12,56 +12,59 @@ from server.model.block_manager import BlockManager
 logger = logging.getLogger(__name__)
 
 
+def validate_scheduler_config(max_num_sequences: int, max_num_tokens: int) -> None:
+    """Validate the coupled sequence and token budgets."""
+    if max_num_sequences <= 0:
+        raise ValueError("max_num_sequences must be positive")
+    if max_num_tokens < max_num_sequences:
+        raise ValueError(
+            "max_num_tokens must be greater than or equal to max_num_sequences"
+        )
+
+
 class Scheduler:
     def __init__(
         self,
         block_manager: BlockManager,
-        max_waiting: int,
         max_num_sequences: int,
         max_num_tokens: int,
     ) -> None:
+        validate_scheduler_config(max_num_sequences, max_num_tokens)
+
         self.block_manager = block_manager
-        self.max_waiting = max_waiting
         self.max_num_sequences = max_num_sequences
         self.max_num_tokens = max_num_tokens
 
+        # the scheduler's population consists of sequences in either the waiting
+        # queue or the running list. The total number of sequences in both should
+        # never exceed max_num_sequences.
         # The waiting queue holds sequences that are waiting to be scheduled.
         self.waiting: deque[Sequence] = deque()
         # The running list holds sequences that are currently running.
         self.running: list[Sequence] = []
 
-        # Number of preemptions performed over the scheduler's lifetime. A high
-        # rate signals the watermark is too small or the pool too tight; full
-        # observability (logging/metrics) is a separate piece of work.
+        # Scheduling-decision counters used to distinguish memory pressure from
+        # logical-slot exhaustion under load.
         self.preemption_count = 0
+        self.reservation_blocked_count = 0
 
-    def can_add_new_sequence(self, sequence: Sequence) -> bool:
-        """
-        Check if we can add ``sequence`` to the scheduler: room in the waiting
-        queue AND the block manager can allocate the sequence's prompt while
-        leaving a small free-block headroom. The headroom is a thrash guard.
-
-        Feasibility (worst-case prompt + max_new_tokens fitting the cache at all)
-        is rejected earlier, in the engine's fail-fast on ``can_ever_allocate``.
-        """
-        if len(self.waiting) >= self.max_waiting:
-            return False
-
-        headroom = max(1, int(0.01 * self.block_manager.total_blocks))
-        return self.block_manager.can_allocate_with_headroom(sequence, headroom)
-
-    def admission_headroom(self) -> int:
-        """Number of free slots in the waiting queue.
-
-        Used by the engine to bound how many not-yet-admitted requests it
-        holds in total (its private pending buffer plus this waiting queue),
-        so that overload backs up into the bounded inbound queue and surfaces
-        as 503s instead of growing an unbounded buffer.
-        """
-        return max(0, self.max_waiting - len(self.waiting))
+    def has_sequence_capacity(self) -> bool:
+        """Whether a new request can enter the scheduler-owned population."""
+        return len(self.waiting) + len(self.running) < self.max_num_sequences
 
     def add(self, sequence: Sequence) -> None:
+        """Admit a new sequence from the worker queue."""
+        if not self.has_sequence_capacity():
+            raise RuntimeError("scheduler sequence capacity exceeded")
         self.waiting.append(sequence)
+
+    def _assert_population_invariant(self) -> None:
+        population = len(self.waiting) + len(self.running)
+        if population > self.max_num_sequences:
+            raise RuntimeError(
+                "scheduler population exceeds max_num_sequences: "
+                f"{population} > {self.max_num_sequences}"
+            )
 
     def clear(self) -> None:
         """
@@ -73,13 +76,14 @@ class Scheduler:
         self.running.clear()
         self.waiting.clear()
 
-    def _reap_finished(self) -> None:
+    def reap_finished(self) -> None:
         """Free blocks of finished sequences and drop them from running.
 
         Finished sequences are detected by the engine (EOS / max-len), which
         sets ``seq.finished = True``. Freeing their blocks is the scheduler's
-        job, so it lives here. Called at the top of every ``schedule()`` so
-        blocks are reclaimed promptly regardless of which phase runs next.
+        job, so it lives here. Public and idempotent so the engine can expose
+        released slots before draining inbound work; ``schedule()`` also calls
+        it defensively for direct scheduler users.
         """
         remain_running = []
         for seq in self.running:
@@ -112,6 +116,7 @@ class Scheduler:
         must ensure the youngest sequence is a valid victim (not one already
         scheduled this round).
         """
+        population_before = len(self.waiting) + len(self.running)
         victim = self.running.pop()  # youngest == last appended
         self.block_manager.free(victim)
         victim.state = SequenceState.PREEMPTED
@@ -119,11 +124,28 @@ class Scheduler:
             victim.generated_token_ids
         )
         self.waiting.appendleft(victim)
+        population_after = len(self.waiting) + len(self.running)
+        if population_after != population_before:
+            raise RuntimeError("preemption changed scheduler population")
         self.preemption_count += 1
         logger.debug(
             "preempted %s (count=%d)", victim.sequence_id, self.preemption_count
         )
         return victim
+
+    @staticmethod
+    def _needs_decode_after_prefill(sequence: Sequence) -> bool:
+        """Whether a full prefill/recompute can be followed by decode."""
+        outputs_after_prefill = len(sequence.generated_token_ids) + 1
+        return outputs_after_prefill < sequence.max_new_tokens
+
+    @staticmethod
+    def _needs_next_decode(sequence: Sequence) -> bool:
+        """Whether an already-running sequence still needs a decode call."""
+        return (
+            not sequence.finished
+            and len(sequence.generated_token_ids) < sequence.max_new_tokens
+        )
 
     def schedule(self) -> ScheduledBatch | None:
         """
@@ -139,14 +161,22 @@ class Scheduler:
         advance ``num_tokens`` — the engine does that after producing each
         token, and sets ``finished`` when generation ends.
         """
-        self._reap_finished()
+        self.reap_finished()
+        self._assert_population_invariant()
 
         scheduled: list[Sequence] = []
         resumed_ids: set[str] = set()
         total_tokens = 0
-        while self.waiting and len(scheduled) < self.max_num_sequences:
+        decode_reserve = sum(
+            self.block_manager.additional_blocks_required(seq, extra_tokens=1)
+            for seq in self.running
+            if self._needs_next_decode(seq)
+        )
+        # No separate batch-width bound is needed: every scheduled sequence
+        # moves from ``waiting`` into ``running``, so the population cap below
+        # already bounds how wide this batch can get.
+        while self.waiting and len(self.running) < self.max_num_sequences:
             seq_to_add = self.waiting[0]
-            enough_memory = self.block_manager.can_allocate(seq_to_add)
             # Allow a single oversized sequence through when the batch is still
             # empty; otherwise it would block the whole queue forever.
             enough_budget = (
@@ -154,7 +184,19 @@ class Scheduler:
                 or seq_to_add.num_tokens + total_tokens <= self.max_num_tokens
             )
 
-            if enough_memory and enough_budget:
+            if enough_budget:
+                candidate_extra = (
+                    1 if self._needs_decode_after_prefill(seq_to_add) else 0
+                )
+                candidate_total = self.block_manager.blocks_required_to_allocate(
+                    seq_to_add, extra_tokens=candidate_extra
+                )
+                required = candidate_total + decode_reserve
+                enough_memory = required <= self.block_manager.num_free_blocks
+            else:
+                enough_memory = False
+
+            if enough_memory:
                 seq = self.waiting.popleft()
                 # If this is a resumed sequence, mark it
                 if seq.state == SequenceState.PREEMPTED:
@@ -164,10 +206,26 @@ class Scheduler:
                 self.running.append(seq)
                 scheduled.append(seq)
                 total_tokens += seq.num_tokens
+                if candidate_extra:
+                    decode_reserve += self.block_manager.additional_blocks_required(
+                        seq, extra_tokens=1
+                    )
             else:
+                if enough_budget:
+                    self.reservation_blocked_count += 1
+                    logger.debug(
+                        "prefill reservation blocked %s "
+                        "(required=%d free=%d decode_reserve=%d count=%d)",
+                        seq_to_add.sequence_id,
+                        required,
+                        self.block_manager.num_free_blocks,
+                        decode_reserve,
+                        self.reservation_blocked_count,
+                    )
                 break
 
         if scheduled:
+            self._assert_population_invariant()
             return ScheduledBatch(
                 kind=SequenceBatchTask.PREFILL,
                 sequences=scheduled,
@@ -182,10 +240,9 @@ class Scheduler:
         # the tail while a younger sequence remains, so the current sequence is
         # never popped and ``i`` stays valid as the tail shrinks.
         idx = 0
+        # As in the prefill pass, batch width needs no bound of its own: the
+        # population invariant caps ``running``, and this walks it at most once.
         while idx < len(self.running):
-            if len(scheduled) >= self.max_num_sequences:
-                break
-
             seq_to_add = self.running[idx]
 
             # See if we can at least decode one more token for this sequence.
@@ -222,6 +279,8 @@ class Scheduler:
             idx += 1
 
         if scheduled:
+            self._assert_population_invariant()
             return ScheduledBatch(kind=SequenceBatchTask.DECODE, sequences=scheduled)
 
+        self._assert_population_invariant()
         return None

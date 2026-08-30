@@ -29,16 +29,31 @@ def make_sequence(
     )
 
 
-# --- _num_blocks_needed ----------------------------------------------------
+# --- block requirement queries --------------------------------------------
 
 
 def test_num_blocks_needed_ceiling() -> None:
     bm = BlockManager(total_blocks=8, block_size=4)
-    assert bm._num_blocks_needed(0) == 0
-    assert bm._num_blocks_needed(1) == 1
-    assert bm._num_blocks_needed(4) == 1
-    assert bm._num_blocks_needed(5) == 2
-    assert bm._num_blocks_needed(8) == 2
+    assert bm.num_blocks_needed(0) == 0
+    assert bm.num_blocks_needed(1) == 1
+    assert bm.num_blocks_needed(4) == 1
+    assert bm.num_blocks_needed(5) == 2
+    assert bm.num_blocks_needed(8) == 2
+
+
+def test_public_block_queries_distinguish_total_and_additional() -> None:
+    bm = BlockManager(total_blocks=8, block_size=4)
+    seq = make_sequence(num_tokens=4)
+
+    assert bm.blocks_required_to_allocate(seq) == 1
+    assert bm.blocks_required_to_allocate(seq, extra_tokens=1) == 2
+    assert bm.num_free_blocks == 8
+
+    bm.allocate(seq)
+
+    assert bm.additional_blocks_required(seq) == 0
+    assert bm.additional_blocks_required(seq, extra_tokens=1) == 1
+    assert bm.num_free_blocks == 7
 
 
 # --- can_allocate / allocate ----------------------------------------------
@@ -105,33 +120,6 @@ def test_allocate_preserves_block_order() -> None:
     bm.allocate(seq)
 
     assert seq.block_table == [7, 8]
-
-
-# --- can_allocate_with_headroom (admission watermark) -----------------------
-
-
-def test_can_allocate_with_headroom_requires_free_after_alloc() -> None:
-    bm = BlockManager(total_blocks=4, block_size=4)
-    holder = make_sequence(sequence_id="holder", num_tokens=8)  # 2 blocks
-    bm.allocate(holder)
-    assert len(bm.free_blocks) == 2
-
-    seq = make_sequence(sequence_id="seq", num_tokens=4)  # needs 1 block
-    # can_allocate accepts it outright (1 block free is enough).
-    assert bm.can_allocate(seq) is True
-    # With headroom=1 it still fits (leaves 2 - 1 = 1 >= 1).
-    assert bm.can_allocate_with_headroom(seq, headroom=1) is True
-    # With headroom=2 it does not (leaves 1 < 2).
-    assert bm.can_allocate_with_headroom(seq, headroom=2) is False
-
-
-def test_can_allocate_with_headroom_clamps_nonpositive() -> None:
-    bm = BlockManager(total_blocks=2, block_size=4)
-    seq = make_sequence(num_tokens=8)  # needs both blocks, leaves 0 free
-    # Non-positive headroom is clamped to 0, so it behaves like can_allocate:
-    # a sequence that exactly fills the pool is still admissible.
-    assert bm.can_allocate_with_headroom(seq, headroom=0) is True
-    assert bm.can_allocate_with_headroom(seq, headroom=-5) is True
 
 
 # --- can_ever_allocate (worst-case budget) ----------------------------------

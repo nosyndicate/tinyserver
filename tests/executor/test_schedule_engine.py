@@ -24,6 +24,7 @@ from server.executor.types import (
     GenerationRequestState,
     RequestStatus,
     Sequence,
+    SequenceBatchTask,
     SequenceState,
     TokenEvent,
 )
@@ -96,7 +97,6 @@ def _make_engine(
     block_manager = BlockManager(total_blocks=8, block_size=4)
     scheduler = Scheduler(
         block_manager=block_manager,
-        max_waiting=4,
         max_num_sequences=4,
         max_num_tokens=64,
     )
@@ -372,38 +372,6 @@ def test_oversized_prompt_is_failed_not_requeued() -> None:
     assert any(isinstance(e, ErrorEvent) for e in events)
 
 
-class _RejectAllScheduler:
-    """Scheduler stub that never admits a sequence.
-
-    Lets us exercise `_drain_inbound`'s deferral path without a real block
-    manager. `can_add_new_sequence` always False (nothing is admittable) and
-    `admission_headroom` is a settable budget (default 8, so small tests can
-    pull everything from inbound). The block manager stub accepts every
-    prompt as feasible.
-    """
-
-    class _BlockManager:
-        def can_ever_allocate(self, seq) -> bool:
-            return True
-
-    def __init__(self) -> None:
-        self.block_manager = self._BlockManager()
-        self.added: list = []
-        self.headroom = 8
-
-    def can_add_new_sequence(self, seq) -> bool:
-        return False
-
-    def waiting_queue_is_full(self) -> bool:
-        return False
-
-    def admission_headroom(self) -> int:
-        return self.headroom
-
-    def add(self, seq) -> None:
-        self.added.append(seq)
-
-
 def _counting_backend(prompt_tokens: list[int]) -> _FakeBackend:
     backend = _FakeBackend(prompt_tokens)
     backend.tokenize_calls = 0
@@ -417,31 +385,74 @@ def _counting_backend(prompt_tokens: list[int]) -> _FakeBackend:
     return backend
 
 
-def test_retry_does_not_retokenize_and_holds_in_pending() -> None:
-    # A request that can never be admitted is tokenized exactly once and then
-    # lives in the engine's private pending buffer across many drain calls.
+def test_drain_stops_at_scheduler_capacity_and_leaves_backlog_inbound() -> None:
     backend = _counting_backend(prompt_tokens=[3, 4, 5])
-    scheduler = _RejectAllScheduler()
+    block_manager = BlockManager(total_blocks=32, block_size=4)
+    scheduler = Scheduler(
+        block_manager=block_manager,
+        max_num_sequences=2,
+        max_num_tokens=64,
+    )
     engine = ScheduleInferenceEngine(scheduler=scheduler, backend=backend)
 
     inbound: Queue = Queue()
-    inbound.put(_make_req(max_new_tokens=4))
+    requests = [_make_req(max_new_tokens=4) for _ in range(4)]
+    for i, req in enumerate(requests):
+        req.request_id = f"req-{i}"
+        inbound.put(req)
 
-    for _ in range(5):
-        engine._drain_inbound(inbound)
+    engine._drain_inbound(inbound)
 
-    assert backend.tokenize_calls == 1
-    assert len(engine._pending) == 1
-    assert inbound.empty()  # never re-queued into the shared inbound queue
-    assert scheduler.added == []  # never admitted
+    assert backend.tokenize_calls == 2
+    assert len(scheduler.waiting) == 2
+    assert not scheduler.running
+    assert inbound.qsize() == 2
+    assert len(engine._all_requests) == 2
+
+
+def test_over_capacity_load_never_creates_prefilled_starved_tail() -> None:
+    backend = _FakeBackend(prompt_tokens=[3, 4, 5])
+    scheduler = Scheduler(
+        block_manager=BlockManager(total_blocks=1024, block_size=4),
+        max_num_sequences=16,
+        max_num_tokens=64,
+    )
+    engine = ScheduleInferenceEngine(scheduler=scheduler, backend=backend)
+    inbound: Queue = Queue()
+    for i in range(64):
+        req = _make_req(max_new_tokens=4)
+        req.request_id = f"req-{i}"
+        inbound.put(req)
+
+    engine._drain_inbound(inbound)
+
+    assert len(scheduler.waiting) == 16
+    assert not scheduler.running
+    assert inbound.qsize() == 48
+    assert all(not seq.block_table for seq in scheduler.waiting)
+
+    prefill = scheduler.schedule()
+    assert prefill is not None
+    assert prefill.kind is SequenceBatchTask.PREFILL
+    assert len(prefill.sequences) == 16
+    assert len(scheduler.running) == 16
+    assert not scheduler.waiting
+
+    decode = scheduler.schedule()
+    assert decode is not None
+    assert decode.kind is SequenceBatchTask.DECODE
+    assert decode.sequences == scheduler.running
 
 
 def test_drain_never_reenters_inbound_and_returns() -> None:
-    # Regression for the deadlock: even with a bounded inbound queue kept full
-    # by a concurrent producer, the engine must not block on a put-back. It
-    # defers into its private buffer and returns promptly.
+    # The engine consumes only available logical slots and never puts a request
+    # back into the shared queue.
     backend = _FakeBackend(prompt_tokens=[3, 4, 5])
-    scheduler = _RejectAllScheduler()
+    scheduler = Scheduler(
+        block_manager=BlockManager(total_blocks=32, block_size=4),
+        max_num_sequences=1,
+        max_num_tokens=64,
+    )
     engine = ScheduleInferenceEngine(scheduler=scheduler, backend=backend)
 
     inbound: Queue = Queue(maxsize=2)
@@ -450,186 +461,113 @@ def test_drain_never_reenters_inbound_and_returns() -> None:
 
     engine._drain_inbound(inbound)
 
-    # Both drained into the private buffer; the engine put nothing back, so the
-    # (still-full-capacity) inbound is now empty and a producer could refill it.
-    assert len(engine._pending) == 2
-    assert inbound.empty()
-    inbound.put_nowait(_make_req(max_new_tokens=4))  # would raise Full if not drained
+    assert len(scheduler.waiting) == 1
     assert inbound.qsize() == 1
 
 
-def test_pending_preserves_fifo_across_drains() -> None:
-    # A big request A submitted before a small request B must be admitted first
-    # once capacity frees, even though B arrives while A is still deferred.
+def test_drain_drops_cancelled_inbound_without_emitting_or_consuming_slot() -> None:
     backend = _FakeBackend(prompt_tokens=[3, 4, 5])
-
-    class _GatedScheduler(_RejectAllScheduler):
-        admit = False
-
-        def can_add_new_sequence(self, seq) -> bool:
-            return self.admit
-
-    scheduler = _GatedScheduler()
+    scheduler = Scheduler(
+        block_manager=BlockManager(total_blocks=32, block_size=4),
+        max_num_sequences=1,
+        max_num_tokens=64,
+    )
     engine = ScheduleInferenceEngine(scheduler=scheduler, backend=backend)
 
-    req_a = _make_req(max_new_tokens=4)
-    req_a.request_id = "A"
-    req_b = _make_req(max_new_tokens=4)
-    req_b.request_id = "B"
-
+    cancelled = _make_req(max_new_tokens=4)
+    cancelled.cancelled.set()
+    feasible = _make_req(max_new_tokens=4)
     inbound: Queue = Queue()
-    inbound.put(req_a)
-    engine._drain_inbound(inbound)  # A deferred
-    inbound.put(req_b)
-    engine._drain_inbound(inbound)  # B deferred behind A
-    assert [r.request_id for r, _ in engine._pending] == ["A", "B"]
-
-    scheduler.admit = True
+    inbound.put(cancelled)
+    inbound.put(feasible)
     engine._drain_inbound(inbound)
 
-    assert [seq for seq in scheduler.added]  # something admitted
-    assert engine._seq_to_request[scheduler.added[0].sequence_id].request_id == "A"
-    assert scheduler.added[1] is engine._all_requests["B"].sequence
+    assert cancelled.status is RequestStatus.CANCELLED
+    assert cancelled.sink.queue.empty()
+    assert len(scheduler.waiting) == 1
+    assert engine._all_requests[feasible.request_id].request is feasible
 
 
-def test_reap_cancelled_drops_deferred_request_without_emitting() -> None:
-    # A request parked in `_pending` (deferred, never admitted) that gets
-    # cancelled is simply discarded: the handler has already gone,
-    # so no event is emitted.
+def test_cancelled_slot_is_reaped_before_next_inbound_drain() -> None:
     backend = _FakeBackend(prompt_tokens=[3, 4, 5])
-    scheduler = _RejectAllScheduler()
+    scheduler = Scheduler(
+        block_manager=BlockManager(total_blocks=32, block_size=4),
+        max_num_sequences=1,
+        max_num_tokens=64,
+    )
     engine = ScheduleInferenceEngine(scheduler=scheduler, backend=backend)
-
-    req = _make_req(max_new_tokens=4)
+    first = _make_req(max_new_tokens=4)
+    first.request_id = "first"
+    replacement = _make_req(max_new_tokens=4)
+    replacement.request_id = "replacement"
     inbound: Queue = Queue()
-    inbound.put(req)
+    inbound.put(first)
     engine._drain_inbound(inbound)
-    assert len(engine._pending) == 1
+    assert not scheduler.has_sequence_capacity()
 
-    req.cancelled.set()
+    first.cancelled.set()
+    inbound.put(replacement)
+    # This is the ordering used at the head of each engine-loop iteration.
     engine._reap_cancelled()
-
-    assert len(engine._pending) == 0
-    assert scheduler.added == []  # never admitted
-    assert req.sink.queue.empty()  # no event emitted for an abandoned request
-
-
-def test_new_small_request_cannot_overtake_deferred_large() -> None:
-    # FIFO must hold ACROSS drain calls, not just within one: a large deferred
-    # request at the head of pending must not be overtaken by a smaller new
-    # arrival that would fit on its own. (Regression: the old two-phase drain
-    # ran _try_admit separately on pending and on new arrivals, so the
-    # "once deferred, defer all later" latch reset between the two calls and
-    # a small newcomer could be admitted ahead of a starved large request.)
-    class _SizeGatedScheduler(_RejectAllScheduler):
-        def can_add_new_sequence(self, seq) -> bool:
-            return seq.num_tokens <= 3
-
-    backend = _FakeBackend(prompt_tokens=[])
-    # Tokenize by prompt length so the two requests get different sizes.
-    backend.tokenize = lambda prompt: list(range(len(prompt)))
-    scheduler = _SizeGatedScheduler()
-    engine = ScheduleInferenceEngine(scheduler=scheduler, backend=backend)
-
-    req_large = _make_req(max_new_tokens=4)
-    req_large.request_id = "large"
-    req_large.prompt = "0123456789"  # 10 tokens -> never admittable here
-    req_small = _make_req(max_new_tokens=4)
-    req_small.request_id = "small"
-    req_small.prompt = "01"  # 2 tokens -> admittable in isolation
-
-    inbound: Queue = Queue()
-    inbound.put(req_large)
-    engine._drain_inbound(inbound)  # large is deferred
-    inbound.put(req_small)
-    engine._drain_inbound(inbound)  # small must queue BEHIND large
-
-    assert scheduler.added == []  # nothing admitted: large blocks the line
-    assert [r.request_id for r, _ in engine._pending] == ["large", "small"]
-
-
-def test_pending_is_bounded_by_admission_headroom() -> None:
-    # Backpressure regression: when the block manager (not the waiting queue)
-    # is the bottleneck, the engine must stop pulling from inbound once the
-    # pending buffer fills the admission budget. The surplus stays in the
-    # bounded inbound queue, so submit() eventually raises Full -> 503 instead
-    # of _pending growing without bound.
-    backend = _FakeBackend(prompt_tokens=[3, 4, 5])
-    scheduler = _RejectAllScheduler()
-    scheduler.headroom = 2
-    engine = ScheduleInferenceEngine(scheduler=scheduler, backend=backend)
-
-    inbound: Queue = Queue(maxsize=8)
-    for _ in range(5):
-        inbound.put_nowait(_make_req(max_new_tokens=4))
-
-    engine._drain_inbound(inbound)
-    assert len(engine._pending) == 2  # capped at the admission budget
-    assert inbound.qsize() == 3  # the rest stays put as backpressure
-
-    engine._drain_inbound(inbound)  # nothing was admitted -> no new headroom
-    assert len(engine._pending) == 2
-    assert inbound.qsize() == 3
-
-
-def test_oversized_prompt_does_not_consume_budget() -> None:
-    # A never-fits prompt is failed immediately; it must not eat an admission
-    # slot that a feasible request behind it could use in the same drain.
-    class _TinyBlockManager:
-        total_blocks = 2
-        block_size = 4
-
-        def can_ever_allocate(self, seq) -> bool:
-            return seq.num_tokens <= 8
-
-    backend = _FakeBackend(prompt_tokens=[])
-    backend.tokenize = lambda prompt: list(range(len(prompt)))
-    scheduler = _RejectAllScheduler()
-    scheduler.block_manager = _TinyBlockManager()
-    scheduler.headroom = 1
-    engine = ScheduleInferenceEngine(scheduler=scheduler, backend=backend)
-
-    oversized = _make_req(max_new_tokens=4)
-    oversized.request_id = "oversized"
-    oversized.prompt = "0123456789"  # 10 tokens > 8-token capacity
-    normal = _make_req(max_new_tokens=4)
-    normal.request_id = "normal"
-    normal.prompt = "012"
-
-    inbound: Queue = Queue()
-    inbound.put(oversized)
-    inbound.put(normal)
+    scheduler.reap_finished()
     engine._drain_inbound(inbound)
 
-    assert oversized.status == RequestStatus.FAILED
-    assert any(isinstance(e, ErrorEvent) for e in drain_events(oversized))
-    # The single admission slot went to the feasible request behind it.
-    assert [r.request_id for r, _ in engine._pending] == ["normal"]
+    assert first.status is RequestStatus.CANCELLED
+    assert [engine._seq_to_request[s.sequence_id] for s in scheduler.waiting] == [
+        replacement
+    ]
     assert inbound.empty()
 
 
-def test_cancel_inflight_fails_pending_requests() -> None:
-    backend = _FakeBackend(prompt_tokens=[3, 4, 5])
-    scheduler = _RejectAllScheduler()
+def test_infeasible_requests_do_not_consume_sequence_slots() -> None:
+    backend = _FakeBackend(prompt_tokens=[])
+    backend.tokenize = lambda prompt: list(range(len(prompt)))
+    scheduler = Scheduler(
+        block_manager=BlockManager(total_blocks=2, block_size=4),
+        max_num_sequences=2,
+        max_num_tokens=8,
+    )
     engine = ScheduleInferenceEngine(scheduler=scheduler, backend=backend)
+
+    infeasible = [_make_req(max_new_tokens=4) for _ in range(3)]
+    for i, req in enumerate(infeasible):
+        req.request_id = f"infeasible-{i}"
+        req.prompt = "0123456789"
+    feasible = [_make_req(max_new_tokens=2) for _ in range(2)]
+    for i, req in enumerate(feasible):
+        req.request_id = f"feasible-{i}"
+        req.prompt = "01"
+
+    inbound: Queue = Queue()
+    for req in infeasible + feasible:
+        inbound.put(req)
+    engine._drain_inbound(inbound)
+
+    assert all(req.status is RequestStatus.FAILED for req in infeasible)
+    assert len(scheduler.waiting) == 2
+    assert set(engine._all_requests) == {req.request_id for req in feasible}
+    assert inbound.empty()
+
+
+def test_cancel_inflight_fails_scheduler_waiting_requests() -> None:
+    engine, scheduler, *_ = _make_engine(prompt_tokens=[3, 4, 5])
 
     req = _make_req(max_new_tokens=4)
     inbound: Queue = Queue()
     inbound.put(req)
     engine._drain_inbound(inbound)
-    assert len(engine._pending) == 1
+    assert len(scheduler.waiting) == 1
 
     cancelled: list = []
 
     def cancel_request(r: GenerationRequestState, message: str) -> None:
         cancelled.append((r.request_id, message))
 
-    # Real scheduler.clear() isn't available on the stub; provide a no-op.
-    scheduler.clear = lambda: None  # type: ignore[attr-defined]
     engine.cancel_inflight("boom", cancel_request)
 
     assert cancelled == [(req.request_id, "boom")]
-    assert len(engine._pending) == 0
+    assert not scheduler.waiting
+    assert engine._all_requests == {}
 
 
 def test_post_decode_isolates_sampling_failure() -> None:
@@ -935,7 +873,6 @@ def test_forced_preemption_matches_uninterrupted_solo_run() -> None:
     block_manager = BlockManager(total_blocks=6, block_size=1)
     scheduler = Scheduler(
         block_manager=block_manager,
-        max_waiting=4,
         max_num_sequences=4,
         max_num_tokens=1024,
     )
@@ -971,7 +908,7 @@ def test_forced_preemption_matches_uninterrupted_solo_run() -> None:
 
 def test_preemption_does_not_retokenize_resumed_request() -> None:
     """A preempted request must resume via scheduler.waiting, not
-    through the engine's _pending/_make_sequence path. Across a real
+    through the inbound admission/_make_sequence path. Across a real
     preemption, each request is tokenized exactly once."""
     prompt_tokens = [3, 4]
     max_new_tokens = 4
@@ -980,7 +917,6 @@ def test_preemption_does_not_retokenize_resumed_request() -> None:
     block_manager = BlockManager(total_blocks=6, block_size=1)
     scheduler = Scheduler(
         block_manager=block_manager,
-        max_waiting=4,
         max_num_sequences=4,
         max_num_tokens=1024,
     )
@@ -1017,7 +953,6 @@ def test_shutdown_mid_preemption_cancels_and_frees_preempted_request() -> None:
     block_manager = BlockManager(total_blocks=6, block_size=1)
     scheduler = Scheduler(
         block_manager=block_manager,
-        max_waiting=4,
         max_num_sequences=4,
         max_num_tokens=1024,
     )

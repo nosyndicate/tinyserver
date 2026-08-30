@@ -28,27 +28,28 @@ class BlockManager:
             str, set[int]
         ] = {}  # sequence_id -> set of block_ids
 
-    def _num_blocks_needed(self, num_tokens: int) -> int:
+    def num_blocks_needed(self, num_tokens: int) -> int:
+        """Return the physical blocks required for ``num_tokens``."""
         return (num_tokens + self.block_size - 1) // self.block_size  # Ceiling division
+
+    @property
+    def num_free_blocks(self) -> int:
+        """Number of currently unallocated physical blocks."""
+        return len(self.free_blocks)
+
+    def blocks_required_to_allocate(
+        self, sequence: Sequence, *, extra_tokens: int = 0
+    ) -> int:
+        """Total blocks needed by an unallocated sequence."""
+        return self.num_blocks_needed(sequence.num_tokens + extra_tokens)
 
     def has_free_blocks_for(self, num_tokens: int) -> bool:
         """Checks if there are enough free blocks to hold num_tokens tokens."""
-        return len(self.free_blocks) >= self._num_blocks_needed(num_tokens)
+        return self.num_free_blocks >= self.num_blocks_needed(num_tokens)
 
     def can_allocate(self, sequence: Sequence) -> bool:
         """Checks if the requested sequence can be allocated given the current free blocks."""
         return self.has_free_blocks_for(sequence.num_tokens)
-
-    def can_allocate_with_headroom(self, sequence: Sequence, headroom: int) -> bool:
-        """Like ``can_allocate``, but require ``headroom`` blocks still free
-        AFTER the prompt is allocated.
-
-        The scheduler uses this as an admission watermark so a fresh admission
-        doesn't immediately consume the last free block and force a preemption
-        on the very next decode step (thrash guard).
-        """
-        needed = self._num_blocks_needed(sequence.num_tokens)
-        return len(self.free_blocks) >= needed + max(0, headroom)
 
     def worst_case_blocks(self, sequence: Sequence) -> int:
         """Blocks needed if the sequence generates its full ``max_new_tokens``.
@@ -59,7 +60,7 @@ class BlockManager:
         generation immediately, so its KV is never written to the cache. The
         max(0, ...) keeps max_new_tokens=0 sequences prompt-only.
         """
-        return self._num_blocks_needed(
+        return self.num_blocks_needed(
             sequence.num_tokens + max(0, sequence.max_new_tokens - 1)
         )
 
@@ -73,12 +74,12 @@ class BlockManager:
         """
         return self.worst_case_blocks(sequence) <= self.total_blocks
 
-    def _additional_blocks_needed(
+    def additional_blocks_required(
         self, sequence: Sequence, extra_tokens: int = 0
     ) -> int:
         """Number of extra blocks needed to hold num_tokens + extra_tokens tokens."""
-        needed = self._num_blocks_needed(sequence.num_tokens + extra_tokens)
-        return needed - len(sequence.block_table)
+        needed = self.num_blocks_needed(sequence.num_tokens + extra_tokens)
+        return max(0, needed - len(sequence.block_table))
 
     def can_append(self, sequence: Sequence, extra_tokens: int = 0) -> bool:
         """Checks if the sequence has (or can obtain) enough blocks for num_tokens.
@@ -87,8 +88,8 @@ class BlockManager:
         e.g. reserving a block for a token the engine is about to generate
         without having advanced num_tokens yet.
         """
-        additional = self._additional_blocks_needed(sequence, extra_tokens)
-        return len(self.free_blocks) >= max(0, additional)
+        additional = self.additional_blocks_required(sequence, extra_tokens)
+        return self.num_free_blocks >= additional
 
     def allocate(self, sequence: Sequence) -> None:
         if sequence.sequence_id in self.allocated_blocks:
@@ -99,7 +100,7 @@ class BlockManager:
         if not self.can_allocate(sequence):
             raise MemoryError("Not enough free blocks to allocate")
 
-        num_blocks_needed = self._num_blocks_needed(sequence.num_tokens)
+        num_blocks_needed = self.blocks_required_to_allocate(sequence)
         # Pop into an ordered list: logical block order in block_table is
         # significant for paged attention. The set is only for free bookkeeping.
         block_ids = [heapq.heappop(self.free_blocks) for _ in range(num_blocks_needed)]
@@ -121,7 +122,7 @@ class BlockManager:
                 "call allocate() first"
             )
 
-        additional = self._additional_blocks_needed(sequence, extra_tokens)
+        additional = self.additional_blocks_required(sequence, extra_tokens)
         if additional <= 0:
             # Already has enough capacity for num_tokens.
             return
