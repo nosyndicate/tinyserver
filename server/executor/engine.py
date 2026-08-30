@@ -8,6 +8,7 @@ from typing import Callable, Protocol, runtime_checkable
 import torch
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from server.executor.errors import classify_exception
 from server.executor.events import RequestEventEmitter
 from server.executor.scheduler import Scheduler
 from server.executor.types import (
@@ -16,6 +17,7 @@ from server.executor.types import (
     BatchEngineConfig,
     DecodeResult,
     EngineConfig,
+    FailurePhase,
     FinishReason,
     GenerationRequestState,
     PrefillResult,
@@ -25,6 +27,7 @@ from server.executor.types import (
     Sequence,
     SequenceBatchTask,
 )
+from server.metrics.logging import log_event
 from server.metrics.timers import now_ns
 from server.model.determinism import uniforms_from_seeds
 from server.model.inference_context import InferenceContext, inference_context
@@ -170,7 +173,9 @@ class SimpleInferenceEngine:
                         callbacks.handle_fatal_error(e, new_requests[i:])
                         return
                     if isinstance(result, RequestFailure):
-                        self._emitter.on_failed(req, result.error)
+                        self._emitter.on_failed(
+                            req, result.error, result.code, result.phase
+                        )
                     elif isinstance(result, PrefillResult):
                         self._emitter.on_prefill_started(req, result.start_ns)
                         self._emitter.on_prefill_succeeded(req, result)
@@ -191,7 +196,9 @@ class SimpleInferenceEngine:
                     if req.status == RequestStatus.DECODING:
                         result = self._executor.decode(req)
                         if isinstance(result, RequestFailure):
-                            self._emitter.on_failed(req, result.error)
+                            self._emitter.on_failed(
+                                req, result.error, result.code, result.phase
+                            )
                         elif isinstance(result, DecodeResult):
                             self._emitter.on_token(req, result)
 
@@ -305,7 +312,9 @@ class BatchInferenceEngine:
                             )
                         for req, result in zip(prefill_batch, results):
                             if isinstance(result, RequestFailure):
-                                self._emitter.on_failed(req, result.error)
+                                self._emitter.on_failed(
+                                    req, result.error, result.code, result.phase
+                                )
                             elif isinstance(result, PrefillResult):
                                 self._emitter.on_prefill_started(req, result.start_ns)
                                 self._emitter.on_prefill_succeeded(req, result)
@@ -326,7 +335,9 @@ class BatchInferenceEngine:
                             )
                         for req, result in zip(decoding_batch, results):
                             if isinstance(result, RequestFailure):
-                                self._emitter.on_failed(req, result.error)
+                                self._emitter.on_failed(
+                                    req, result.error, result.code, result.phase
+                                )
                             elif isinstance(result, DecodeResult):
                                 self._emitter.on_token(req, result)
 
@@ -686,16 +697,28 @@ class ScheduleInferenceEngine:
                 if result.is_finished:
                     seq.finished = True
                     self._cleanup_request(seq.sequence_id, request_state.request_id)
-            except Exception:
+            except Exception as error:
                 # Fail just this request instead of letting the exception
                 # propagate to run()'s fatal handler and tear down the worker
                 # along with every other in-flight request.
-                logger.exception(
-                    "Failed to sample first token for request %s",
-                    request_state.request_id,
+                code = classify_exception(error)
+                log_event(
+                    "generation_exception",
+                    log_level=logging.ERROR,
+                    exc_info=True,
+                    request_id=request_state.request_id,
+                    code=code.value,
+                    phase=FailurePhase.SAMPLING.value,
+                    affected_requests=1,
+                    error=str(error),
                 )
                 seq.finished = True
-                self._emitter.on_failed(request_state, "sampling failed during prefill")
+                self._emitter.on_failed(
+                    request_state,
+                    "sampling failed during prefill",
+                    code=code,
+                    phase=FailurePhase.SAMPLING,
+                )
                 self._cleanup_request(seq.sequence_id, request_state.request_id)
 
     def _post_decode(
@@ -769,14 +792,26 @@ class ScheduleInferenceEngine:
                 if result.is_finished:
                     seq.finished = True
                     self._cleanup_request(seq.sequence_id, request_state.request_id)
-            except Exception:
+            except Exception as error:
                 # Fail just this request instead of tearing down the worker.
-                logger.exception(
-                    "Failed to finalize token for request %s",
-                    request_state.request_id,
+                code = classify_exception(error)
+                log_event(
+                    "generation_exception",
+                    log_level=logging.ERROR,
+                    exc_info=True,
+                    request_id=request_state.request_id,
+                    code=code.value,
+                    phase=FailurePhase.SAMPLING.value,
+                    affected_requests=1,
+                    error=str(error),
                 )
                 seq.finished = True
-                self._emitter.on_failed(request_state, "sampling failed during decode")
+                self._emitter.on_failed(
+                    request_state,
+                    "sampling failed during decode",
+                    code=code,
+                    phase=FailurePhase.SAMPLING,
+                )
                 self._cleanup_request(seq.sequence_id, request_state.request_id)
 
     def _cleanup_request(self, sequence_id: str, request_id: str) -> None:

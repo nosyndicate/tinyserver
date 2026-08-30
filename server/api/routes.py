@@ -1,3 +1,4 @@
+import logging
 import uuid
 from queue import Full
 from typing import AsyncGenerator
@@ -18,6 +19,8 @@ from server.executor.types import (
     ErrorEvent,
     Event,
     EventSink,
+    FailureCode,
+    FailurePhase,
     GenerationRequestState,
     TokenEvent,
 )
@@ -27,6 +30,26 @@ from server.model.determinism import make_generator
 from server.model.sampling import build_sampling_params
 
 _GENERATION_TIMEOUT_S = 300  # 5 minutes
+
+
+def _log_request_failed(
+    state: GenerationRequestState,
+    *,
+    code: FailureCode,
+    phase: FailurePhase | None,
+    transport: str,
+    error: str,
+) -> None:
+    """Emit one flat terminal failure record without a traceback."""
+    log_event(
+        "request_failed",
+        log_level=logging.WARNING,
+        request_id=state.request_id,
+        code=code.value,
+        phase=phase.value if phase is not None else None,
+        transport=transport,
+        error=error,
+    )
 
 
 def _compute_tokens_per_s(num_output_tokens: int, execution_ms: float) -> float:
@@ -123,6 +146,13 @@ async def _await_generation(
                 # request and free its KV blocks instead of running to
                 # max_new_tokens.
                 worker.cancel(state)
+                _log_request_failed(
+                    state,
+                    code=FailureCode.GENERATION_TIMEOUT,
+                    phase=None,
+                    transport="json",
+                    error="Generation timed out.",
+                )
                 raise HTTPException(
                     status_code=504,
                     detail="Generation timed out.",
@@ -146,6 +176,13 @@ async def _await_generation(
                     execution_ms=event.execution_ms,
                 )
             elif isinstance(event, ErrorEvent):
+                _log_request_failed(
+                    state,
+                    code=event.code,
+                    phase=event.phase,
+                    transport="json",
+                    error=event.error,
+                )
                 raise HTTPException(
                     status_code=500,
                     detail=f"Generation failed: {event.error}",
@@ -185,7 +222,17 @@ async def _stream_generation(
             try:
                 event: Event = await collector.get(timeout=timeout)
             except TimeoutError:
-                error_event = StreamErrorEvent(error="Generation timed out.")
+                error_event = StreamErrorEvent(
+                    error="Generation timed out.",
+                    code=FailureCode.GENERATION_TIMEOUT,
+                )
+                _log_request_failed(
+                    state,
+                    code=error_event.code,
+                    phase=error_event.phase,
+                    transport="sse",
+                    error=error_event.error,
+                )
                 yield f"data: {error_event.model_dump_json()}\n\n"
                 return
 
@@ -218,7 +265,18 @@ async def _stream_generation(
                 return
 
             elif isinstance(event, ErrorEvent):
-                error_stream_event = StreamErrorEvent(error=event.error)
+                error_stream_event = StreamErrorEvent(
+                    error=event.error,
+                    code=event.code,
+                    phase=event.phase,
+                )
+                _log_request_failed(
+                    state,
+                    code=event.code,
+                    phase=event.phase,
+                    transport="sse",
+                    error=event.error,
+                )
                 yield f"data: {error_stream_event.model_dump_json()}\n\n"
                 return
     finally:

@@ -340,6 +340,38 @@ def test_run_stream_request_uses_done_chunk_metadata(
     assert result.output_sha256 == hashlib.sha256(b"Hello world").hexdigest()
 
 
+def test_run_stream_request_retains_typed_server_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chunks = [
+        (
+            'data: {"type":"error","error":"CUDA out of memory",'
+            '"code":"cuda_out_of_memory","phase":"decode"}\n'
+        )
+    ]
+    monkeypatch.setattr(
+        bench_runners.requests,
+        "post",
+        lambda *args, **kwargs: _FakeStreamResponse(chunks),
+    )
+
+    result = _run_stream_request(
+        base_url="http://127.0.0.1:8000",
+        endpoint="stream_v3",
+        timeout_seconds=5.0,
+        run_id="run-1",
+        mode="closed",
+        plan=_DUMMY_PLAN,
+        clock=_scripted_clock(0.0, 0.2),
+    )
+
+    assert result.ok is False
+    assert result.http_status == 200
+    assert result.error_type == "server_error"
+    assert result.server_error_code == "cuda_out_of_memory"
+    assert result.server_error_phase == "decode"
+
+
 # ---------------------------------------------------------------------------
 # _run_sync_request
 # ---------------------------------------------------------------------------
@@ -635,6 +667,19 @@ class TestStreamAccumulator:
         assert acc.done is True
         assert acc.client_token_count == 1
         assert acc.server_output_tokens is None
+
+    def test_error_event_retains_optional_code_and_phase(self) -> None:
+        acc = _feed(
+            StreamAccumulator(now=_scripted_clock(0.0).offset),
+            {
+                "type": "error",
+                "error": "CUDA out of memory",
+                "code": "cuda_out_of_memory",
+                "phase": "decode",
+            },
+        )
+        assert acc.server_error_code == "cuda_out_of_memory"
+        assert acc.server_error_phase == "decode"
 
     def test_identical_streams_hash_identically(self) -> None:
         def build() -> StreamAccumulator:

@@ -7,11 +7,15 @@ from server.executor.engine import (
     EngineControl,
     InferenceEngine,
 )
+from server.executor.errors import classify_exception
 from server.executor.types import (
     ErrorEvent,
+    FailureCode,
+    FailurePhase,
     GenerationRequestState,
     RequestStatus,
 )
+from server.metrics.logging import log_event
 from server.metrics.timers import now_ns
 
 logger = logging.getLogger(__name__)
@@ -60,7 +64,11 @@ class Worker:
         self._engine = engine
 
     def _cancel_request(
-        self, request_state: GenerationRequestState, error_message: str
+        self,
+        request_state: GenerationRequestState,
+        error_message: str,
+        code: FailureCode = FailureCode.WORKER_ERROR,
+        phase: FailurePhase | None = FailurePhase.WORKER,
     ) -> None:
         """Mark a request as failed and emit an ErrorEvent to its sink."""
         request_state.status = RequestStatus.FAILED
@@ -69,6 +77,8 @@ class Worker:
             ErrorEvent(
                 request_id=request_state.request_id,
                 error=request_state.error,
+                code=code,
+                phase=phase,
             )
         )
 
@@ -82,24 +92,43 @@ class Worker:
         extra_requests: list[GenerationRequestState] | None = None,
     ) -> None:
         """Handle an irrecoverable engine error: cancel everything and drain the queue."""
-        logger.exception("Worker thread crashed with unexpected exception: %s", error)
+        code = classify_exception(error)
+        log_event(
+            "generation_exception",
+            log_level=logging.ERROR,
+            exc_info=True,
+            code=code.value,
+            phase=FailurePhase.WORKER.value,
+            affected_requests=(
+                len(extra_requests) if extra_requests is not None else None
+            ),
+            error=str(error),
+        )
         error_message = f"Worker encountered an unexpected error: {error}"
         for pending in extra_requests or []:
             try:
-                self._cancel_request(pending, error_message)
+                self._cancel_request(
+                    pending, error_message, code=code, phase=FailurePhase.WORKER
+                )
             except Exception:
                 logger.exception(
                     "Failed to emit error event for extra request %s",
                     pending.request_id,
                 )
-        self._cancel_inflight(error_message)
+
+        def cancel_fatal(request: GenerationRequestState, message: str) -> None:
+            self._cancel_request(request, message, code=code, phase=FailurePhase.WORKER)
+
+        self._engine.cancel_inflight(error_message, cancel_fatal)
         while True:
             try:
                 pending = self._inbound.get_nowait()
             except Empty:
                 break
             try:
-                self._cancel_request(pending, error_message)
+                self._cancel_request(
+                    pending, error_message, code=code, phase=FailurePhase.WORKER
+                )
             except Exception:
                 logger.exception(
                     "Failed to emit error event for pending request %s",

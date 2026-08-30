@@ -162,6 +162,42 @@ def test_summarize_results_empty() -> None:
     assert summary["by_prompt_source"] == {}
 
 
+def test_summarize_results_counts_typed_and_legacy_server_errors() -> None:
+    scenario = _default_scenarios()["short_short"]
+    results = [
+        _make_result(
+            "1",
+            ok=False,
+            error_type="server_error",
+            error="CUDA out of memory",
+            server_error_code="cuda_out_of_memory",
+            server_error_phase="decode",
+        ),
+        _make_result(
+            "2",
+            ok=False,
+            error_type="server_error",
+            error="legacy failure",
+        ),
+    ]
+
+    summary = _summarize_results(
+        args=_make_args(),
+        scenario=scenario,
+        run_id="run-1",
+        window_start_s=0.0,
+        window_end_s=1.0,
+        results=results,
+        warmup_results=[],
+    )
+
+    assert summary["error_counts"] == {"server_error": 2}
+    assert summary["server_error_code_counts"] == {
+        "cuda_out_of_memory": 1,
+        "unknown": 1,
+    }
+
+
 def test_summarize_results_reports_server_ttft_and_tpot() -> None:
     scenario = _default_scenarios()["short_short"]
     results = [

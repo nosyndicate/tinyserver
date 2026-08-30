@@ -4,6 +4,8 @@ from server.executor.types import (
     DecodeResult,
     DoneEvent,
     ErrorEvent,
+    FailureCode,
+    FailurePhase,
     FinishReason,
     GenerationRequestState,
     PrefillResult,
@@ -132,12 +134,23 @@ class RequestEventEmitter:
         request_state.past_key_values = result.past_key_values
         request_state.status = RequestStatus.DECODING
 
-    def on_failed(self, request_state: GenerationRequestState, error: str) -> None:
+    def on_failed(
+        self,
+        request_state: GenerationRequestState,
+        error: str,
+        code: FailureCode = FailureCode.GENERATION_ERROR,
+        phase: FailurePhase | None = None,
+    ) -> None:
         """Mark the request as failed and push an ErrorEvent."""
         request_state.status = RequestStatus.FAILED
         request_state.error = error
         request_state.sink.emit(
-            ErrorEvent(request_id=request_state.request_id, error=error)
+            ErrorEvent(
+                request_id=request_state.request_id,
+                error=error,
+                code=code,
+                phase=phase,
+            )
         )
 
     def _finish(self, request_state: GenerationRequestState) -> None:

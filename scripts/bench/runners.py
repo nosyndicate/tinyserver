@@ -113,6 +113,8 @@ class StreamAccumulator:
     response_text_chars: int = 0
     done: bool = False
     error: str | None = None
+    server_error_code: str | None = None
+    server_error_phase: str | None = None
     server_prompt_tokens: int | None = None
     server_output_tokens: int | None = None
     server_ttft_ms: float | None = None
@@ -131,7 +133,17 @@ class StreamAccumulator:
             error = chunk.get("error")
             if not isinstance(error, str) or not error:
                 raise StreamProtocolError("error event requires a non-empty error")
+            code = chunk.get("code")
+            if code is not None and (not isinstance(code, str) or not code):
+                raise StreamProtocolError("error event code must be a non-empty string")
+            phase = chunk.get("phase")
+            if phase is not None and (not isinstance(phase, str) or not phase):
+                raise StreamProtocolError(
+                    "error event phase must be a non-empty string"
+                )
             self.error = error
+            self.server_error_code = code
+            self.server_error_phase = phase
             self.done = True
             return
 
@@ -225,6 +237,8 @@ def _make_result(
     ok: bool = False,
     error_type: str | None = None,
     error: str | None = None,
+    server_error_code: str | None = None,
+    server_error_phase: str | None = None,
     response_text_chars: int | None = None,
 ) -> RequestResult:
     if scheduled_arrival_offset_s is None:
@@ -270,6 +284,8 @@ def _make_result(
         server_tpot_ms=server_tpot_ms,
         output_sha256=output_sha256,
         output_tokens_source=output_tokens_source,
+        server_error_code=server_error_code,
+        server_error_phase=server_error_phase,
         deterministic_gate=_deterministic_gate(plan.payload),
         metadata=dict(plan.metadata),
     )
@@ -458,6 +474,8 @@ def _run_stream_request(
             http_status=http_status,
             error_type=error_type,
             error=error,
+            server_error_code=acc.server_error_code,
+            server_error_phase=acc.server_error_phase,
             response_text_chars=acc.response_text_chars,
         )
 

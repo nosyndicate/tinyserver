@@ -13,6 +13,24 @@ from server.model.sampling import SamplingParams
 from server.model.types import FinishReason
 
 
+class FailureCode(str, Enum):
+    """Stable, low-cardinality generation failure categories."""
+
+    CUDA_OUT_OF_MEMORY = "cuda_out_of_memory"
+    GENERATION_ERROR = "generation_error"
+    WORKER_ERROR = "worker_error"
+    GENERATION_TIMEOUT = "generation_timeout"
+
+
+class FailurePhase(str, Enum):
+    """Generation stage in which a failure was observed."""
+
+    PREFILL = "prefill"
+    DECODE = "decode"
+    SAMPLING = "sampling"
+    WORKER = "worker"
+
+
 @dataclass(frozen=True)
 class TokenEvent:
     """
@@ -83,6 +101,8 @@ class ErrorEvent:
 
     request_id: str
     error: str
+    code: FailureCode = FailureCode.GENERATION_ERROR
+    phase: FailurePhase | None = None
 
 
 Event = TokenEvent | DoneEvent | ErrorEvent
@@ -125,6 +145,8 @@ class DecodeResult:
 @dataclass(frozen=True)
 class RequestFailure:
     error: str
+    code: FailureCode = FailureCode.GENERATION_ERROR
+    phase: FailurePhase | None = None
 
 
 @dataclass(frozen=True)

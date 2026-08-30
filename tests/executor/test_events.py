@@ -10,6 +10,8 @@ from server.executor.types import (
     DecodeResult,
     DoneEvent,
     ErrorEvent,
+    FailureCode,
+    FailurePhase,
     FinishReason,
     GenerationRequestState,
     PrefillResult,
@@ -169,6 +171,22 @@ def test_failure_emits_error_event() -> None:
     assert isinstance(events[0], ErrorEvent)
     assert events[0].request_id == "r0"
     assert events[0].error == "model error"
+
+
+def test_failure_preserves_code_and_phase() -> None:
+    req = make_req()
+
+    RequestEventEmitter().on_failed(
+        req,
+        "CUDA out of memory",
+        code=FailureCode.CUDA_OUT_OF_MEMORY,
+        phase=FailurePhase.DECODE,
+    )
+
+    event = drain_events(req)[0]
+    assert isinstance(event, ErrorEvent)
+    assert event.code == FailureCode.CUDA_OUT_OF_MEMORY
+    assert event.phase == FailurePhase.DECODE
 
 
 # --- timing arithmetic -------------------------------------------------------
