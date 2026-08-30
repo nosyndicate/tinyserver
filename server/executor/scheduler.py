@@ -35,6 +35,9 @@ class Scheduler:
         self.max_num_sequences = max_num_sequences
         self.max_num_tokens = max_num_tokens
 
+        # the scheduler's population consists of sequences in either the waiting
+        # queue or the running list. The total number of sequences in both should
+        # never exceed max_num_sequences.
         # The waiting queue holds sequences that are waiting to be scheduled.
         self.waiting: deque[Sequence] = deque()
         # The running list holds sequences that are currently running.
@@ -169,11 +172,10 @@ class Scheduler:
             for seq in self.running
             if self._needs_next_decode(seq)
         )
-        while (
-            self.waiting
-            and len(self.running) < self.max_num_sequences
-            and len(scheduled) < self.max_num_sequences
-        ):
+        # No separate batch-width bound is needed: every scheduled sequence
+        # moves from ``waiting`` into ``running``, so the population cap below
+        # already bounds how wide this batch can get.
+        while self.waiting and len(self.running) < self.max_num_sequences:
             seq_to_add = self.waiting[0]
             # Allow a single oversized sequence through when the batch is still
             # empty; otherwise it would block the whole queue forever.
@@ -238,10 +240,9 @@ class Scheduler:
         # the tail while a younger sequence remains, so the current sequence is
         # never popped and ``i`` stays valid as the tail shrinks.
         idx = 0
+        # As in the prefill pass, batch width needs no bound of its own: the
+        # population invariant caps ``running``, and this walks it at most once.
         while idx < len(self.running):
-            if len(scheduled) >= self.max_num_sequences:
-                break
-
             seq_to_add = self.running[idx]
 
             # See if we can at least decode one more token for this sequence.
