@@ -2,6 +2,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from server.executor.types import FailureCode, FailurePhase
+
 
 class GenerateRequest(BaseModel):
     prompt: str = Field(..., description="The input prompt for text generation")
@@ -115,6 +117,8 @@ class StreamErrorEvent(BaseModel):
 
     type: Literal["error"] = "error"
     error: str
+    code: FailureCode = FailureCode.GENERATION_ERROR
+    phase: FailurePhase | None = None
 
 
 StreamEvent = Annotated[

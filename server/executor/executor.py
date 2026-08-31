@@ -1,21 +1,51 @@
+import logging
 from typing import TypeVar
 
 import torch
 
+from server.executor.errors import classify_exception
 from server.executor.types import (
     BaseBatchExecutor,
     BaseExecutor,
     DecodeResult,
+    FailurePhase,
     FinishReason,
     GenerationRequestState,
     PrefillResult,
     RequestFailure,
 )
+from server.metrics.logging import log_event
 from server.metrics.timers import now_ns
 from server.model.hf_runner import ModelRunner
 from server.model.sampling import sample_token
 
 T = TypeVar("T")
+
+
+def _failure_from_exception(
+    error: Exception,
+    *,
+    phase: FailurePhase,
+    affected_requests: int,
+    request_id: str | None = None,
+) -> RequestFailure:
+    """Log one root exception and return its client-facing typed failure."""
+    code = classify_exception(error)
+    fields: dict[str, object] = {
+        "code": code.value,
+        "phase": phase.value,
+        "affected_requests": affected_requests,
+        "error": str(error),
+    }
+    if request_id is not None:
+        fields["request_id"] = request_id
+    log_event(
+        "generation_exception",
+        log_level=logging.ERROR,
+        exc_info=True,
+        **fields,
+    )
+    return RequestFailure(error=str(error), code=code, phase=phase)
 
 
 def assert_not_none(value: T | None) -> T:
@@ -72,7 +102,12 @@ class Executor(BaseExecutor):
                 start_ns=start_ns,
             )
         except Exception as e:
-            return RequestFailure(error=str(e))
+            return _failure_from_exception(
+                e,
+                phase=FailurePhase.PREFILL,
+                affected_requests=1,
+                request_id=request_state.request_id,
+            )
 
     @torch.inference_mode()
     def decode(
@@ -102,7 +137,12 @@ class Executor(BaseExecutor):
                 past_key_values=output.past_key_values,
             )
         except Exception as e:
-            return RequestFailure(error=str(e))
+            return _failure_from_exception(
+                e,
+                phase=FailurePhase.DECODE,
+                affected_requests=1,
+                request_id=request_state.request_id,
+            )
 
 
 class BatchExecutor(BaseBatchExecutor):
@@ -135,7 +175,12 @@ class BatchExecutor(BaseBatchExecutor):
             ]
 
         except Exception as e:
-            return [RequestFailure(error=str(e)) for _ in request_states]
+            failure = _failure_from_exception(
+                e,
+                phase=FailurePhase.PREFILL,
+                affected_requests=len(request_states),
+            )
+            return [failure for _ in request_states]
 
     @torch.inference_mode()
     def batched_decode(
@@ -161,7 +206,12 @@ class BatchExecutor(BaseBatchExecutor):
                     )
                     results[i] = result
             except Exception as e:
-                results[i] = RequestFailure(error=str(e))
+                results[i] = _failure_from_exception(
+                    e,
+                    phase=FailurePhase.SAMPLING,
+                    affected_requests=1,
+                    request_id=request_state.request_id,
+                )
 
         if not unfinished_request_states:
             return [assert_not_none(result) for result in results]
@@ -198,7 +248,12 @@ class BatchExecutor(BaseBatchExecutor):
                 )
 
         except Exception as e:
+            failure = _failure_from_exception(
+                e,
+                phase=FailurePhase.DECODE,
+                affected_requests=len(unfinished_request_states),
+            )
             for index, _, _ in unfinished_request_states:
-                results[index] = RequestFailure(error=str(e))
+                results[index] = failure
 
         return [assert_not_none(result) for result in results]

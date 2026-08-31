@@ -10,7 +10,13 @@ logging.basicConfig(
 )
 
 
-def log_event(event: str, **fields: Any) -> None:
+def log_event(
+    event: str,
+    *,
+    log_level: int = logging.INFO,
+    exc_info: bool = False,
+    **fields: Any,
+) -> None:
     """
     Log an event with structured fields as a JSON object.
 
@@ -19,4 +25,8 @@ def log_event(event: str, **fields: Any) -> None:
         **fields: Additional key-value pairs to include in the log entry.
     """
     log_entry = {"event": event, **fields}
-    logger.info(json.dumps(log_entry, ensure_ascii=False))
+    logger.log(
+        log_level,
+        json.dumps(log_entry, ensure_ascii=False),
+        exc_info=exc_info,
+    )

@@ -1,6 +1,8 @@
 import itertools
+import logging
 from unittest.mock import patch
 
+import pytest
 import torch
 from transformers import DynamicCache
 
@@ -8,6 +10,8 @@ from server.executor.executor import BatchExecutor
 from server.executor.sinks import SharedQueueSink
 from server.executor.types import (
     DecodeResult,
+    FailureCode,
+    FailurePhase,
     FinishReason,
     GenerationRequestState,
     PrefillResult,
@@ -298,6 +302,37 @@ def test_batched_decode_decode_batch_exception_fails_unfinished_requests_only() 
     assert isinstance(results[1], RequestFailure)
     assert "batch decode crash" in results[1].error
     assert runner.decode_batch_calls == [([42], [unfinished.past_key_values])]
+
+
+def test_batched_decode_oom_logs_once_then_fans_out_typed_failures(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    requests = [make_decode_req("r0"), make_decode_req("r1")]
+    runner = FakeModelRunner(token_map={42: "a"})
+    oom_type = getattr(torch, "OutOfMemoryError", torch.cuda.OutOfMemoryError)
+
+    def raise_decode(
+        token_ids: list[int], past_key_values: list[DynamicCache]
+    ) -> list[DecodeBatchOutput]:
+        raise oom_type("allocation failed")
+
+    runner.decode_batch = raise_decode
+    caplog.set_level(logging.ERROR, logger="server.metrics.logging")
+
+    with patch("server.executor.executor.sample_token", return_value=42):
+        results = BatchExecutor(runner).batched_decode(requests)
+
+    failures = [result for result in results if isinstance(result, RequestFailure)]
+    assert len(failures) == 2
+    assert all(result.code == FailureCode.CUDA_OUT_OF_MEMORY for result in failures)
+    assert all(result.phase == FailurePhase.DECODE for result in failures)
+    root_logs = [
+        record
+        for record in caplog.records
+        if '"event": "generation_exception"' in record.getMessage()
+    ]
+    assert len(root_logs) == 1
+    assert '"affected_requests": 2' in root_logs[0].getMessage()
 
 
 def test_batched_decode_output_count_mismatch_fails_unfinished_requests_only() -> None:

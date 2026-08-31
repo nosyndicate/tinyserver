@@ -23,6 +23,8 @@ from server.executor.sinks import SharedQueueSink
 from server.executor.types import (
     DoneEvent,
     ErrorEvent,
+    FailureCode,
+    FailurePhase,
     FinishReason,
     GenerationRequestState,
     TokenEvent,
@@ -147,12 +149,21 @@ def test_explicit_stream_event_schemas() -> None:
         queue_wait_ms=0.0,
         execution_ms=2.0,
     )
-    error = StreamErrorEvent(error="boom")
+    error = StreamErrorEvent(
+        error="boom",
+        code=FailureCode.CUDA_OUT_OF_MEMORY,
+        phase=FailurePhase.DECODE,
+    )
 
     assert token.model_dump() == {"type": "token", "token_str": "", "index": 0}
     assert done.type == "done"
     assert done.finish_reason == "max_length"
-    assert error.model_dump() == {"type": "error", "error": "boom"}
+    assert error.model_dump() == {
+        "type": "error",
+        "error": "boom",
+        "code": FailureCode.CUDA_OUT_OF_MEMORY,
+        "phase": FailurePhase.DECODE,
+    }
 
     with pytest.raises(ValidationError):
         StreamTokenEvent(token_str="x", index=0, output_tokens=1)  # type: ignore[call-arg]
@@ -279,7 +290,9 @@ def make_done(request_id: str = "req-1") -> DoneEvent:
     )
 
 
-async def test_await_generation_cancels_on_timeout() -> None:
+async def test_await_generation_cancels_on_timeout(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     # When the client's wait times out (nothing is ever dispatched), the handler
     # must tell the worker to cancel before raising the 504, so the engine stops
     # decoding and frees the request's KV blocks.
@@ -292,6 +305,33 @@ async def test_await_generation_cancels_on_timeout() -> None:
         await _await_generation(state, worker, collector, registry, timeout=0.01)
 
     assert excinfo.value.status_code == 504
+    assert state.cancelled.is_set()
+    assert len(registry) == 0
+    assert '"code": "generation_timeout"' in caplog.text
+    assert '"transport": "json"' in caplog.text
+
+
+async def test_stream_generation_emits_typed_timeout(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    worker = make_worker()
+    state = make_state()
+    registry = CollectorRegistry()
+    collector = registry.register(state.request_id)
+
+    chunks = [
+        chunk
+        async for chunk in _stream_generation(
+            state, worker, collector, registry, timeout=0.0
+        )
+    ]
+
+    assert chunks == [
+        'data: {"type":"error","error":"Generation timed out.",'
+        '"code":"generation_timeout","phase":null}\n\n'
+    ]
+    assert '"code": "generation_timeout"' in caplog.text
+    assert '"transport": "sse"' in caplog.text
     assert state.cancelled.is_set()
     assert len(registry) == 0
 
@@ -328,18 +368,62 @@ async def test_await_generation_returns_done_event_metrics() -> None:
     assert len(registry) == 0
 
 
-async def test_await_generation_maps_error_event_to_500() -> None:
+async def test_await_generation_maps_error_event_to_500(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     worker = make_worker()
     state = make_state()
     registry = CollectorRegistry()
     collector = registry.register(state.request_id)
-    registry.dispatch(ErrorEvent(request_id=state.request_id, error="boom"))
+    registry.dispatch(
+        ErrorEvent(
+            request_id=state.request_id,
+            error="boom",
+            code=FailureCode.CUDA_OUT_OF_MEMORY,
+            phase=FailurePhase.DECODE,
+        )
+    )
 
     with pytest.raises(HTTPException) as excinfo:
         await _await_generation(state, worker, collector, registry, timeout=1.0)
 
     assert excinfo.value.status_code == 500
     assert "boom" in excinfo.value.detail
+    assert len(registry) == 0
+    assert '"event": "request_failed"' in caplog.text
+    assert '"code": "cuda_out_of_memory"' in caplog.text
+    assert '"transport": "json"' in caplog.text
+
+
+async def test_stream_generation_emits_typed_error_and_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    worker = make_worker()
+    state = make_state()
+    registry = CollectorRegistry()
+    collector = registry.register(state.request_id)
+    registry.dispatch(
+        ErrorEvent(
+            request_id=state.request_id,
+            error="CUDA out of memory",
+            code=FailureCode.CUDA_OUT_OF_MEMORY,
+            phase=FailurePhase.DECODE,
+        )
+    )
+
+    chunks = [
+        chunk
+        async for chunk in _stream_generation(
+            state, worker, collector, registry, timeout=1.0
+        )
+    ]
+
+    assert chunks == [
+        'data: {"type":"error","error":"CUDA out of memory",'
+        '"code":"cuda_out_of_memory","phase":"decode"}\n\n'
+    ]
+    assert '"event": "request_failed"' in caplog.text
+    assert '"transport": "sse"' in caplog.text
     assert len(registry) == 0
 
 

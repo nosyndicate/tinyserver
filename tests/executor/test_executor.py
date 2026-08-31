@@ -7,6 +7,8 @@ from server.executor.executor import Executor
 from server.executor.sinks import SharedQueueSink
 from server.executor.types import (
     DecodeResult,
+    FailureCode,
+    FailurePhase,
     FinishReason,
     GenerationRequestState,
     PrefillResult,
@@ -197,3 +199,20 @@ def test_decode_returns_request_failure_when_model_decode_raises() -> None:
     assert "decode boom" in result.error
     assert req.status == RequestStatus.QUEUED
     assert req.sink.queue.empty()
+
+
+def test_decode_classifies_cuda_oom() -> None:
+    runner = FakeRunner()
+    oom_type = getattr(torch, "OutOfMemoryError", torch.cuda.OutOfMemoryError)
+    runner.model.exception = oom_type("allocation failed")
+    executor = Executor(runner)
+    req = make_req()
+    req.all_logits = torch.randn(1, 3, VOCAB)
+    req.past_key_values = DynamicCache()
+
+    with patch("server.executor.executor.sample_token", return_value=42):
+        result = executor.decode(req)
+
+    assert isinstance(result, RequestFailure)
+    assert result.code == FailureCode.CUDA_OUT_OF_MEMORY
+    assert result.phase == FailurePhase.DECODE

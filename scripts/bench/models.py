@@ -126,6 +126,8 @@ class RequestResult:
     server_tpot_ms: float | None = None
     output_sha256: str | None = None
     output_tokens_source: str | None = None
+    server_error_code: str | None = None
+    server_error_phase: str | None = None
     deterministic_gate: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 

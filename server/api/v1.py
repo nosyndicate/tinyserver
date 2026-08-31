@@ -18,6 +18,7 @@ Served only when the server is started as ``python -m server.main v1``; the
 queue-based versions never mount this router (see ``server/main.py``).
 """
 
+import logging
 from typing import Generator
 
 from fastapi import APIRouter, Request
@@ -30,6 +31,7 @@ from server.api.schema import (
     StreamErrorEvent,
     StreamTokenEvent,
 )
+from server.executor.errors import classify_exception
 from server.metrics.logging import log_event
 from server.metrics.timers import now_ns, ns_to_ms, timed
 from server.model.hf_runner import ModelRunner
@@ -163,8 +165,16 @@ def generate_stream(req: GenerateRequest, request: Request) -> StreamingResponse
                     )
                     return
         except Exception as error:
-            error_event = StreamErrorEvent(error=str(error))
-            log_event("stream_error", error=str(error))
+            code = classify_exception(error)
+            error_event = StreamErrorEvent(error=str(error), code=code)
+            log_event(
+                "request_failed",
+                log_level=logging.WARNING,
+                code=code.value,
+                phase=None,
+                transport="sse",
+                error=str(error),
+            )
             yield f"data: {error_event.model_dump_json()}\n\n"
 
     return StreamingResponse(_event_stream(), media_type="text/event-stream")

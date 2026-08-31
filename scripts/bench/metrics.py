@@ -151,6 +151,11 @@ def _summarize_results(
     output_tokens = [result.output_tokens or 0 for result in completed]
     throughput_window_seconds = max(window_end_s - window_start_s, 0.0)
     error_counts = Counter(result.error_type or "ok" for result in results)
+    server_error_code_counts = Counter(
+        result.server_error_code or "unknown"
+        for result in results
+        if result.error_type == "server_error"
+    )
     status_counts = Counter(
         str(result.http_status) if result.http_status is not None else "none"
         for result in results
@@ -191,6 +196,7 @@ def _summarize_results(
         **_distribution_blocks(completed, _OVERALL_METRICS),
         "by_prompt_source": _class_summaries(results),
         "error_counts": dict(error_counts),
+        "server_error_code_counts": dict(server_error_code_counts),
         "http_status_counts": dict(status_counts),
         "scenario_mix_counts": dict(
             Counter(result.prompt_source for result in results)

@@ -3,6 +3,7 @@ import threading
 import time
 
 import pytest
+import torch
 
 from server.executor.engine import BatchInferenceEngine, SimpleInferenceEngine
 from server.executor.types import (
@@ -12,6 +13,8 @@ from server.executor.types import (
     DecodeResult,
     EngineConfig,
     ErrorEvent,
+    FailureCode,
+    FailurePhase,
     GenerationRequestState,
     PrefillResult,
     RequestFailure,
@@ -247,6 +250,27 @@ def test_fatal_engine_callback_cancels_inbound_requests() -> None:
     _assert_error_event(r1)
     _assert_error_event(r2)
     _assert_error_event(r3)
+
+
+def test_fatal_engine_callback_classifies_cuda_oom() -> None:
+    oom_type = getattr(torch, "OutOfMemoryError", torch.cuda.OutOfMemoryError)
+    worker = make_worker(
+        FakeExecutor(prefill_results={"r0": oom_type("allocation failed")}),
+        max_active_requests=1,
+    )
+    req = make_req("r0")
+    worker.submit(req)
+
+    worker.start()
+    _wait_for_worker_to_die(worker)
+    worker.stop()
+
+    events = drain_events(req)
+    assert len(events) == 1
+    event = events[0]
+    assert isinstance(event, ErrorEvent)
+    assert event.code == FailureCode.CUDA_OUT_OF_MEMORY
+    assert event.phase == FailurePhase.WORKER
 
 
 def test_stop_cancels_active_request_blocked_in_decode() -> None:
